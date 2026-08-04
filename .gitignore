@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 环境与密钥
+.env
+*.local
+
+# 运行产物（报告、图表、日志不入库）
+outputs/
+output/
+artifacts/
+
+# IDE 与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
