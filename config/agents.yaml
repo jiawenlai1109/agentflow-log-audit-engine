@@ -1,0 +1,39 @@
+llm:
+  model: gpt-4o-mini
+  temperature: 0.2
+
+execution:
+  max_concurrency: 3
+  task_timeout_seconds: 30
+  total_budget_seconds: 120
+  max_llm_calls: 30
+
+agents:
+  explorer:
+    tools: [profile_csv]
+    temperature: 0.2
+    max_tokens: 800
+  planner:
+    tools: []
+    temperature: 0.2
+    max_tokens: 1500
+  executor:
+    tools: [execute_python, read_artifact]
+    temperature: 0.1
+    max_tokens: 2000
+  inspector:
+    tools: [validate_rules]
+    temperature: 0.2
+    max_tokens: 500
+  visualizer:
+    tools: [execute_python, read_artifact]
+    temperature: 0.1
+    max_tokens: 1500
+  reporter:
+    tools: []
+    temperature: 0.4
+    max_tokens: 2000
+  critic:
+    tools: [check_report]
+    temperature: 0.3
+    max_tokens: 800

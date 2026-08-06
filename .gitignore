@@ -8,6 +8,7 @@ venv/
 # 环境与密钥
 .env
 *.local
+.pip-cache/
 
 # 运行产物（报告、图表、日志不入库）
 outputs/
