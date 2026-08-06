@@ -206,3 +206,43 @@ JSON 容错链：剥离 Markdown 围栏 → 提取首个合法 JSON → pydantic
 - **进程级隔离**：execute_python 每次独立子进程 + 独立环境变量与 cwd，进程间无内存共享，**不存在内存覆盖**；pandas / matplotlib 的全局状态也不会跨任务污染；
 - **共享写入点**（transcript / manifest / 预算计数）由 Orchestrator 层统一加锁，Agent 与工具不感知锁的存在；
 - 完整规范见[交互设计.md](交互设计.md)第 9.4 节。
+
+## 9. Agent 边界与权限设计
+
+### 9.1 六层边界模型
+
+| 边界 | 定义 | 机制类型 |
+| :--- | :--- | :--- |
+| 职责边界 | 每个 Agent 负责什么（角色定义 + 输入输出 schema） | 软（prompt）+ 硬（schema 校验） |
+| 信息边界 | 能看什么（推送授权切片 + 显式路径） | 硬（消息组装 + 路径守卫） |
+| 工具边界 | 能用什么（白名单注入） | 硬（不存在即不可用） |
+| 动作边界 | 能产生什么副作用（写命名空间、执行代码） | 硬（子进程隔离 + cwd 绑定 + 禁网络） |
+| 资源边界 | 能用多少（超时 / 预算 / 并发） | 硬（运行时守卫） |
+| 输出边界 | 输出必须符合既定 schema | 硬（pydantic 校验） |
+
+### 9.2 强制手段（不是靠 prompt 自觉）
+
+1. **工具白名单注入**：Agent 的上下文里只存在授权工具，未授权工具没有 handler 引用——"不存在的东西无法调用"；
+2. **路径守卫**：所有文件读写经 `ensure_within(run_dir, path)` 校验，拒绝 `..` 与越界路径；违规即报错并归为 CODE_ERROR；
+3. **子进程隔离**：生成的代码在 `python -I` 子进程内运行，cwd 绑定任务 work 目录，env 只注入 DATA_PATH / ARTIFACTS_DIR；
+4. **只读共享**：RunContext 对 Agent 只读，写入仅 Orchestrator；
+5. **输出 schema**：pydantic 校验，不合法重试 ≤ 2 次或标记失败；
+6. **全程审计**：工具调用与文件访问写入 transcript，越权行为可事后复盘。
+
+### 9.3 各 Agent 边界矩阵
+
+| Agent | 能读 | 能写 | 可用工具 | 明确禁止 |
+| :--- | :--- | :--- | :--- | :--- |
+| Explorer | data_path | schema_profile.json | profile_csv | 不修改源数据、不执行任意代码 |
+| Planner | question + schema + session | plan.json | 无 | 不读数据文件、不执行代码、不编造列名 |
+| Executor | DATA_PATH + 上游产物路径 | work/<task_id>/（attempt_N） | execute_python、read_artifact | 禁网络、禁写源数据、禁读其他任务 work、禁危险库 |
+| Inspector | result + task + question + schema | 无（只返回 Verdict） | validate_rules | 不执行代码、不修改结果 |
+| Visualizer | 审核通过的结果 + 路径 | work/<task_id>/ + chart_task_<id>.png | execute_python、read_artifact | 禁改结果数据、禁网络 |
+| Reporter | 结果摘要 + figures + time_base + session | report.md + summary | 无 | 不访问原始数据、不执行代码、只能引用给定数字 |
+| Critic | report + question + 数据概要 | 无（只返回 Review） | check_report | 不执行代码、不改报告 |
+
+### 9.4 越界处理
+
+- 越界读写被路径守卫拒绝 → 该任务 CODE_ERROR（message 注明违规原因）→ 按[恢复与回滚设计.md](恢复与回滚设计.md)重试 / 降级；
+- 越权读（如 Reporter 尝试读原始数据）→ 无工具、无路径，天然不可达；
+- 语义违规（如 Reporter 编造数字）→ 确定性数字比对（Critic）+ prompt 约束双保险。
