@@ -198,3 +198,11 @@ JSON 容错链：剥离 Markdown 围栏 → 提取首个合法 JSON → pydantic
 - 工具元数据用 JSON Schema 描述，与 LLM function calling 天然兼容；
 - 未来若需要 MCP 生态，可把内部工具包装成 MCP server，Agent 协议不变；
 - 工具注册表属于 Phase 1 核心框架交付物。
+
+### 8.5 工具调用并发安全
+
+- **实现约束**：工具无共享可变状态；写操作只允许落在调用方命名空间内（路径由 Orchestrator 传入的 run_id / task_id 决定）；
+- **双重边界**：白名单 + 命名空间隔离——即使多个 Agent 并发调用同一工具（如 read_artifact），各任务写入路径互不相同，不会互相覆盖；
+- **进程级隔离**：execute_python 每次独立子进程 + 独立环境变量与 cwd，进程间无内存共享，**不存在内存覆盖**；pandas / matplotlib 的全局状态也不会跨任务污染；
+- **共享写入点**（transcript / manifest / 预算计数）由 Orchestrator 层统一加锁，Agent 与工具不感知锁的存在；
+- 完整规范见[交互设计.md](交互设计.md)第 9.4 节。
