@@ -246,3 +246,7 @@ JSON 容错链：剥离 Markdown 围栏 → 提取首个合法 JSON → pydantic
 - 越界读写被路径守卫拒绝 → 该任务 CODE_ERROR（message 注明违规原因）→ 按[恢复与回滚设计.md](恢复与回滚设计.md)重试 / 降级；
 - 越权读（如 Reporter 尝试读原始数据）→ 无工具、无路径，天然不可达；
 - 语义违规（如 Reporter 编造数字）→ 确定性数字比对（Critic）+ prompt 约束双保险。
+
+### 9.5 与安全隔离的关系
+
+边界限制的落地依赖[安全与隔离设计.md](安全与隔离设计.md)：能力授权（grants）、权限根、执行后端抽象（LocalBackend / DockerBackend）、提示词注入防线。路径守卫是其中一环，不是全部。
