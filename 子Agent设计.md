@@ -157,3 +157,44 @@ JSON 容错链：剥离 Markdown 围栏 → 提取首个合法 JSON → pydantic
 | Critic | 0.3 | 800 | ≤ 2 | 可独立模型 |
 
 所有参数均可在 config/agents.yaml 中按 Agent 覆盖；MockLLM 模式为全部 Agent 提供确定性降级输出，保证离线可验收。
+
+## 8. 工具架构：统一池 + 按 Agent 白名单 + 任务级调度
+
+### 8.1 三种候选方案对比
+
+| 方案 | 优点 | 缺点 | 结论 |
+| :--- | :--- | :--- | :--- |
+| 统一池全量共享 | 实现一次、复用方便 | 提示词污染（工具越多注意力越稀释）、越权风险 | 不单独采用 |
+| 主 Agent 分配工具 | 控制集中 | 微管理、耦合高、消息膨胀 | 不采用（分配任务即可） |
+| 每 Agent 自写工具 | 隔离简单 | 重复实现、安全边界分散、维护成本高 | 不采用 |
+| **统一池 + 白名单（采用）** | 实现一次 + 按 Agent 注入可见性 + 全程审计 | 需维护注册表与权限配置 | ✅ |
+
+### 8.2 设计
+
+- **ToolRegistry（统一池）**：集中注册所有工具，`Tool = {name, description, parameters(JSON Schema), handler, visibility}`，实现一次、多 Agent 复用；
+- **白名单注入**：每个 Agent 在 agents.yaml 中声明 `allowed_tools`，运行时只把白名单内的工具注入该 Agent（提示词只带白名单工具的 description，避免注意力稀释）；
+- **两种调用方式**：
+  - **确定性调用**：流程固定的 Agent 由代码直接调用 handler（Explorer 的 profile_csv、Inspector 的规则函数、Critic 的检查函数）；
+  - **固定循环调用**：Executor / Visualizer 的"生成代码 → execute_python → 修错"是固定循环，不是自由 ReAct；
+  - 纯 LLM Agent（Planner / Reporter）无工具，输入即上下文。
+- **Orchestrator 分配的是任务与产物引用，不干预工具级调用**；
+- 所有工具调用写入 transcript：调用方、参数摘要、结果摘要、耗时。
+
+### 8.3 各 Agent 工具白名单
+
+| Agent | 工具 | 调用方式 |
+| :--- | :--- | :--- |
+| Explorer | profile_csv | 确定性 |
+| Planner | （无） | 纯 LLM |
+| Executor | execute_python、read_artifact | 固定循环（≤ 3 次自愈） |
+| Inspector | validate_rules（规则函数） | 确定性 |
+| Visualizer | execute_python、read_artifact | 固定循环（≤ 2 次重试） |
+| Reporter | （无，只读 artifacts 路径） | 纯 LLM + 模板 |
+| Critic | check_report（确定性检查） | 确定性 |
+
+### 8.4 说明
+
+- **安全边界集中**：execute_python 是唯一"危险"工具，超时 / 环境注入 / 禁网络等约束集中实现一次、审计一次；
+- 工具元数据用 JSON Schema 描述，与 LLM function calling 天然兼容；
+- 未来若需要 MCP 生态，可把内部工具包装成 MCP server，Agent 协议不变；
+- 工具注册表属于 Phase 1 核心框架交付物。
