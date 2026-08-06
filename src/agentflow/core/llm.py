@@ -194,6 +194,36 @@ class MockLLM(BaseLLM):
             "planner": '{"question": "", "time_base": null, "tasks": []}',
             "inspector": '{"task_id": 1, "status": "PASS", "checks": [], "suggestion": null}',
             "critic": '{"verdict": "PASS", "rounds": 1, "issues": []}',
+            "executor": (
+                "import json, os\n"
+                "import pandas as pd\n"
+                "df = pd.read_csv(os.environ['DATA_PATH'])\n"
+                "print(json.dumps({'rows': int(len(df)), 'columns': list(df.columns), "
+                "'head': df.head(5).astype(str).to_dict(orient='records')}, "
+                "ensure_ascii=False))\n"
+            ),
+            "visualizer": (
+                "import os\n"
+                "import matplotlib\n"
+                "matplotlib.use('Agg')\n"
+                "import matplotlib.pyplot as plt\n"
+                "plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']\n"
+                "plt.rcParams['axes.unicode_minus'] = False\n"
+                "import pandas as pd\n"
+                "df = pd.read_csv(os.environ['DATA_PATH'])\n"
+                "num_cols = df.select_dtypes(include='number').columns.tolist()\n"
+                "if num_cols:\n"
+                "    df[num_cols[0]].head(20).plot(kind='bar', title='Top-20 ' + num_cols[0])\n"
+                "else:\n"
+                "    df.head(10).plot(kind='bar')\n"
+                "plt.tight_layout()\n"
+                "plt.savefig(os.environ['CHART_PATH'], dpi=100)\n"
+            ),
+            "reporter": (
+                "【总体概况】本次分析共完成若干任务，数据规模以表格为准。\n"
+                "【趋势分析】趋势变化请结合图表查看。\n"
+                "【结论建议】建议重点关注表格中的关键指标与异常值。"
+            ),
         }
         if name in defaults:
             return defaults[name]
