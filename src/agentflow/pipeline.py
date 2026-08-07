@@ -29,21 +29,36 @@ def build_agents(
     config: dict[str, Any],
     budget: Any,
 ) -> dict[str, Any]:
-    common = {
-        "llm": llm,
-        "config": config,
-        "budget": budget,
-        "registry": registry,
-    }
+    agents_cfg = config.get("agents", {})
     return {
-        "explorer": ExplorerAgent(**common),
-        "planner": PlannerAgent(**common),
-        "executor": ExecutorAgent(**common),
-        "inspector": InspectorAgent(**common),
-        "visualizer": VisualizerAgent(**common),
-        "reporter": ReporterAgent(**common),
-        "critic": CriticAgent(**common),
+        name: cls(
+            llm=_agent_llm(llm, agents_cfg.get(name, {})),
+            config=config,
+            budget=budget,
+            registry=registry,
+        )
+        for name, cls in (
+            ("explorer", ExplorerAgent),
+            ("planner", PlannerAgent),
+            ("executor", ExecutorAgent),
+            ("inspector", InspectorAgent),
+            ("visualizer", VisualizerAgent),
+            ("reporter", ReporterAgent),
+            ("critic", CriticAgent),
+        )
     }
+
+
+def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
+    """按 Agent 配置覆盖模型（真实模式下为每个 Agent 克隆一个带指定模型的客户端）。"""
+    model = agent_cfg.get("model")
+    if model and isinstance(llm, OpenAILLM):
+        return OpenAILLM(
+            api_key=llm.api_key,
+            base_url=llm.base_url,
+            model=model,
+        )
+    return llm
 
 
 def run_analysis(
@@ -59,7 +74,15 @@ def run_analysis(
     config = load_config(config_path)
     registry = build_default_registry()
     if llm is None:
-        llm = MockLLM() if mode == "mock" else OpenAILLM()
+        llm_cfg = config.get("llm", {})
+        llm = (
+            MockLLM()
+            if mode == "mock"
+            else OpenAILLM(
+                base_url=llm_cfg.get("base_url") or None,
+                model=llm_cfg.get("model") or None,
+            )
+        )
 
     project_root = Path(__file__).resolve().parents[2]
     outputs_root = (
