@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,7 +39,7 @@ class Orchestrator:
         data_path: str,
         outputs_root: str | Path,
         session: Any = None,
-        max_review_rounds: int = 2,
+        max_review_rounds: int | None = None,
     ) -> dict[str, Any]:
         run_id = new_run_id()
         outputs_dir = Path(outputs_root) / run_id
@@ -58,16 +59,20 @@ class Orchestrator:
             budget=budget,
         )
         started = time.monotonic()
-        status = "success"
+        status = "failed"
         try:
             self._explore(ctx)
             self._plan(ctx)
             self._execute_dag(ctx)
-            degraded = self._run_degraded(ctx)
-            self._report(ctx, degraded)
-            self._review(ctx, max_review_rounds)
-            if degraded or (ctx.report or {}).get("degraded"):
-                status = "degraded"
+            status, degraded, failure_info = self._classify_state(ctx)
+            self._report(
+                ctx,
+                degraded=degraded,
+                partial=status == "partial",
+                failure_info=failure_info,
+            )
+            if not degraded:
+                self._review(ctx, max_review_rounds)
         except Exception as exc:  # noqa: BLE001 - 运行级兜底
             status = "failed"
             transcript.write({"event": "run_failed", "error": str(exc)})
@@ -132,7 +137,10 @@ class Orchestrator:
         """执行单元 = 生成代码 → 子进程执行 → Inspector 审核 → 两阶段提交 → Visualizer。"""
         task_id = int(task["task_id"])
         result: dict[str, Any] = {}
-        for redo in range(1, 4):
+        max_redos = max(
+            1, int(ctx.config.get("execution", {}).get("max_inspector_redos", 3))
+        )
+        for redo in range(1, max_redos + 1):
             message = self._request(
                 ctx, "executor", "execute_task", json.dumps(task, ensure_ascii=False)
             )
@@ -175,26 +183,77 @@ class Orchestrator:
         ctx.results[task_id] = {
             **result,
             "status": "failed",
-            "error": "Inspector 连续 3 次未通过：" + str(verdict.get("suggestion", "")),
+            "error": f"Inspector 连续 {max_redos} 次未通过：" + str(verdict.get("suggestion", "")),
             "error_class": "EMPTY_RESULT",
         }
         return task_id, "FAILED"
 
-    def _report(self, ctx: RunContext, degraded: bool) -> None:
-        failure_info = None
-        if degraded:
-            failed = [
-                ctx.results[tid]
-                for tid in ctx.results
-                if ctx.results[tid].get("status") == "failed"
-            ]
-            if failed:
-                first = failed[0]
-                failure_info = {
-                    "error_class": first.get("error_class", "UNKNOWN"),
-                    "error": first.get("error", "任务执行失败"),
-                    "suggestion": first.get("suggestion", "请检查列名或数据源"),
-                }
+    def _classify_state(
+        self, ctx: RunContext
+    ) -> tuple[str, bool, dict[str, Any] | None]:
+        """运行状态分类：success / partial / degraded（区分设计内降级与异常）。"""
+        states = ctx.task_states
+        tasks = (ctx.task_list or {}).get("tasks", [])
+        failed = [tid for tid, state in states.items() if state in ("FAILED", "SKIPPED")]
+        if not failed:
+            ctx.degraded_reason = None
+            return "success", False, None
+        if not tasks or len(failed) == len(tasks):
+            ctx.degraded_reason = "all_tasks_failed"
+            return "degraded", True, self._failure_info(ctx, failed)
+        if self._is_critical_failure(ctx, failed):
+            ctx.degraded_reason = "critical_task_failed"
+            return "degraded", True, self._failure_info(ctx, failed)
+        ctx.degraded_reason = "partial_failure"
+        return "partial", False, None
+
+    def _is_critical_failure(self, ctx: RunContext, failed: list[int]) -> bool:
+        """关键失败：关闭部分结果时；或用户问题中明确提到的字段缺失（如 TC-03）。"""
+        allow_partial = bool(
+            ctx.config.get("execution", {}).get("allow_partial_results", True)
+        )
+        if not allow_partial:
+            return True
+        for tid in failed:
+            result = ctx.results.get(tid, {})
+            if result.get("error_class") != "MISSING_COLUMN":
+                continue
+            # 提取错误信息中引号内的疑似列名，判断是否出现在用户问题中（如 TC-03 的"利润"）
+            missing_names = {
+                name
+                for name in re.findall(r"['\"]([^'\"]{1,20})['\"]", result.get("error", ""))
+                if name
+            }
+            if any(name in ctx.question for name in missing_names):
+                return True
+        return False
+
+    def _failure_info(
+        self, ctx: RunContext, failed: list[int]
+    ) -> dict[str, Any]:
+        failed_results = [
+            ctx.results[tid] for tid in failed if tid in ctx.results
+        ]
+        if not failed_results:
+            return {
+                "error_class": "UNKNOWN",
+                "error": "任务执行失败",
+                "suggestion": "请检查任务与数据",
+            }
+        first = failed_results[0]
+        return {
+            "error_class": first.get("error_class", "UNKNOWN"),
+            "error": first.get("error", "任务执行失败"),
+            "suggestion": first.get("suggestion", "请检查列名或数据源"),
+        }
+
+    def _report(
+        self,
+        ctx: RunContext,
+        degraded: bool = False,
+        partial: bool = False,
+        failure_info: dict[str, Any] | None = None,
+    ) -> None:
         payload = json.dumps(
             {
                 "question": ctx.question,
@@ -202,6 +261,7 @@ class Orchestrator:
                 "figures": {str(k): v for k, v in ctx.figures.items()},
                 "time_base": (ctx.task_list or {}).get("time_base"),
                 "degraded": degraded,
+                "partial": partial,
                 "failure_info": failure_info,
             },
             ensure_ascii=False,
@@ -211,8 +271,14 @@ class Orchestrator:
         )
         ctx.report = json.loads(reply.content)
 
-    def _review(self, ctx: RunContext, max_rounds: int) -> None:
-        for _ in range(max(1, max_rounds)):
+    def _review(self, ctx: RunContext, max_review_rounds: int | None = None) -> None:
+        max_rounds = max(
+            1,
+            max_review_rounds
+            or int(ctx.config.get("execution", {}).get("max_review_rounds", 2)),
+        )
+        ctx.critic_passed = False
+        for _ in range(max_rounds):
             payload = json.dumps(
                 {
                     "report_path": ctx.report["report_path"],
@@ -228,6 +294,7 @@ class Orchestrator:
                 .content
             )
             if review["verdict"] == "PASS":
+                ctx.critic_passed = True
                 return
             # 不通过：携带 issues 返回 Reporter 重写
             report_payload = json.dumps(
@@ -271,16 +338,14 @@ class Orchestrator:
             )
         ctx.results[task_id]["intermediate_file"] = str(target)
 
-    def _run_degraded(self, ctx: RunContext) -> bool:
-        tasks = (ctx.task_list or {}).get("tasks", [])
-        if not tasks:
-            return True
-        return any(
-            ctx.task_states.get(task["task_id"], "PENDING") in ("FAILED", "SKIPPED")
-            for task in tasks
-        )
-
     def _write_evaluation(self, ctx: RunContext, status: str, duration: float) -> None:
+        figures = ctx.figures
+        chart_attempted = sum(
+            1
+            for figure in figures.values()
+            if figure.get("chart_type") and figure["chart_type"] != "none"
+        )
+        chart_success = sum(1 for figure in figures.values() if figure.get("file_path"))
         evaluation = {
             "run_id": ctx.run_id,
             "question": ctx.question,
@@ -288,6 +353,9 @@ class Orchestrator:
             "duration_seconds": duration,
             "llm_calls": getattr(ctx.budget, "used", 0),
             "task_states": ctx.task_states,
+            "degraded_reason": ctx.degraded_reason,
+            "chart_success": chart_success if chart_attempted else None,
+            "critic_pass": ctx.critic_passed,
             "results": {str(k): v for k, v in ctx.results.items()},
         }
         (ctx.outputs_dir / "evaluation.json").write_text(

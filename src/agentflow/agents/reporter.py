@@ -58,6 +58,7 @@ class ReporterAgent(BaseAgent):
         results: dict[str, Any] = data.get("results", {})
         figures: dict[str, Any] = data.get("figures", {})
         degraded = bool(data.get("degraded", False))
+        partial = bool(data.get("partial", False))
         failure_info = data.get("failure_info")
         time_base = data.get("time_base")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -105,6 +106,19 @@ class ReporterAgent(BaseAgent):
             narrative = "【总体概况】本次分析已完成。\n【趋势分析】趋势请结合图表查看。\n【结论建议】建议关注表格中的关键指标。"
 
         overview, trend, conclusion = self._split_narrative(narrative)
+        if partial:
+            failed_tasks = [
+                f"任务 {tid}"
+                for tid, result in sorted(results.items(), key=lambda kv: int(kv[0]))
+                if result.get("status") == "failed"
+            ]
+            if failed_tasks:
+                overview = (
+                    "⚠ 部分子任务未完成（"
+                    + "、".join(failed_tasks)
+                    + "），相关结论可能不完整。\n\n"
+                    + overview
+                )
         time_base_note = None
         if time_base:
             time_base_note = f"以数据集最大日期为基准（{time_base.get('date', '见数据')}）"

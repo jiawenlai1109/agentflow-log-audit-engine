@@ -32,8 +32,11 @@ class ExecutorAgent(BaseAgent):
         messages = [{"role": "user", "content": self._task_prompt(ctx, task)}]
         result: TaskExecutionResult | None = None
         last_outcome: Any = None
+        max_attempts = int(
+            ctx.config.get("execution", {}).get("max_executor_attempts", 3)
+        )
 
-        for attempt in range(1, 4):
+        for attempt in range(1, max_attempts + 1):
             try:
                 code = self.complete(ctx, self._task_prompt(ctx, task), messages=messages)
             except LLMError as exc:
@@ -80,10 +83,11 @@ class ExecutorAgent(BaseAgent):
             result = TaskExecutionResult(
                 task_id=task_id,
                 status="failed",
-                error=(last_outcome.stderr or "")[:500],
+                # 取 stderr 末尾（真实异常通常在 traceback 尾部）
+                error=(last_outcome.stderr or "")[-500:],
                 error_class=error_class,
                 duration_seconds=last_outcome.duration_seconds,
-                attempts=3,
+                attempts=max_attempts,
                 suggestion=self._suggestion(error_class),
             )
 

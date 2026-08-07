@@ -51,6 +51,8 @@ class RunContext:
     figures: dict[int, dict[str, Any]] = field(default_factory=dict)
     report: dict[str, Any] | None = None
     task_states: dict[int, str] = field(default_factory=dict)
+    degraded_reason: str | None = None
+    critic_passed: bool | None = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

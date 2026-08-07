@@ -60,6 +60,26 @@ PATH_LIKE_KEYS = {
     "report_path",
 }
 
+FILTER_HINTS = (
+    "筛选",
+    "某个",
+    "某天",
+    "某地区",
+    "特定",
+    "只有",
+    "低于",
+    "高于",
+    "小于",
+    "大于",
+    "退款",
+    "异常",
+    "超出",
+)
+
+
+def _has_filter_hint(text: str) -> bool:
+    return any(hint in text for hint in FILTER_HINTS)
+
 
 class ToolRegistry:
     """统一工具注册表：实现一次，按 Agent 白名单注入可见性。"""
@@ -204,9 +224,19 @@ def _validate_rules(
     if rows is None:
         checks.append({"rule": "empty_check", "level": "FAIL", "message": "结果缺少行数信息"})
     elif rows == 0:
-        checks.append(
-            {"rule": "empty_check", "level": "FAIL", "message": "结果为空，建议扩大时间范围或检查字段名"}
-        )
+        context = f"{task.get('description', '')} {question}"
+        if _has_filter_hint(context):
+            checks.append(
+                {
+                    "rule": "empty_check",
+                    "level": "WARN",
+                    "message": "查询条件较窄，0 行可能为合法结果，请确认筛选条件",
+                }
+            )
+        else:
+            checks.append(
+                {"rule": "empty_check", "level": "FAIL", "message": "结果为空，建议扩大时间范围或检查字段名"}
+            )
     else:
         checks.append({"rule": "empty_check", "level": "PASS", "message": f"结果包含 {rows} 行"})
 
@@ -256,22 +286,28 @@ def _check_report(
     if not path.exists():
         return [{"severity": "high", "section": "整体", "message": "报告文件不存在"}]
     text = path.read_text(encoding="utf-8")
-    for section in ("总体概况", "数据详情", "趋势分析", "结论建议"):
+    for section in ("总体概况", "数据详情", "趋势分析", "结论与建议"):
         if section not in text:
             issues.append({"severity": "medium", "section": section, "message": f"缺少章节：{section}"})
     for ref in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text):
         ref_path = ensure_allowed(ctx, ref)
         if not ref_path.exists():
             issues.append({"severity": "high", "section": "图表", "message": f"图表引用无效：{ref}"})
-    numbers: list[str] = []
+    expected: list[float] = []
     for result in results.values():
         summary = result.get("summary") or {}
-        for row in (summary.get("head") or [])[:3]:
-            for key, value in row.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    numbers.append(str(value))
-    for number in numbers[:5]:
-        if number not in text:
+        aggregate = summary.get("aggregate") or {}
+        for value in aggregate.values():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                expected.append(float(value))
+    # 数值解析比对：仅校验"关键指标"（aggregate）必须出现在报告中，样例行不强制
+    actual_numbers = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+    for number in expected[:10]:
+        matched = any(
+            abs(number - actual) <= max(1e-6, 1e-4 * abs(number))
+            for actual in actual_numbers
+        )
+        if not matched:
             issues.append(
                 {"severity": "medium", "section": "数据详情", "message": f"关键数字 {number} 未出现在报告中"}
             )

@@ -7,6 +7,10 @@ execution:
   task_timeout_seconds: 30
   total_budget_seconds: 120
   max_llm_calls: 30
+  max_executor_attempts: 3
+  max_inspector_redos: 3
+  max_review_rounds: 2
+  allow_partial_results: true
 
 agents:
   explorer:
