@@ -9,7 +9,7 @@ from agentflow.schemas.result import ErrorClass
 
 class FailureInfo(BaseModel):
     error_class: ErrorClass
-    error: str
+    error: str = ""
     suggestion: str = ""
 
 

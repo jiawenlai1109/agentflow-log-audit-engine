@@ -95,6 +95,19 @@ class PlannerAgent(BaseAgent):
                     "depends_on": [],
                 }
             )
+        for keyword in ("利润", "利润率", "成本", "毛利率", "费用"):
+            if keyword in question and not any(keyword in col for col in columns):
+                tasks.append(
+                    {
+                        "task_id": len(tasks) + 1,
+                        "description": f"分析{keyword}",
+                        "required_columns": [keyword],
+                        "code_hint": "引用该列",
+                        "chart_type": "none",
+                        "depends_on": [],
+                    }
+                )
+                break
         return {
             "question": question,
             "time_base": {"type": "data_max_date"} if date_col else None,

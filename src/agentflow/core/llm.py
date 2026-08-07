@@ -166,19 +166,99 @@ class MockLLM(BaseLLM):
     def __init__(self, overrides: dict[str, str] | None = None) -> None:
         self.overrides = overrides or {}
 
+    ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+        "explorer": ("探查", "画像"),
+        "planner": ("规划",),
+        "executor": ("数据工程师",),
+        "inspector": ("审核",),
+        "visualizer": ("可视化",),
+        "reporter": ("汇报",),
+        "critic": ("评审",),
+    }
+
     def _agent_name(self, system: str) -> str:
-        for name in (
-            "explorer",
-            "planner",
-            "executor",
-            "inspector",
-            "visualizer",
-            "reporter",
-            "critic",
-        ):
-            if re.search(rf"\b{name}\b", system, re.IGNORECASE):
+        lowered = system.lower()
+        for name, keywords in self.ROLE_KEYWORDS.items():
+            if any(k in system or k in lowered for k in keywords):
                 return name
         return "default"
+
+    def _executor_code(self, messages: list[dict[str, str]]) -> str:
+        """按任务描述生成确定性代码（离线模式）：求和 / 按日期趋势 / 类别对比 / 缺失列报错。"""
+        first = messages[0]["content"] if messages else ""
+        import ast
+        import re
+
+        def extract(label: str) -> list[str]:
+            match = re.search(rf"{label}：(\[.*?\])", first)
+            if not match:
+                return []
+            try:
+                value = ast.literal_eval(match.group(1))
+                return list(value) if isinstance(value, list) else []
+            except (ValueError, SyntaxError):
+                return []
+
+        required = extract("必需列")
+        available = extract("可用列")
+        desc_match = re.search(r"任务：(.+)", first)
+        desc = desc_match.group(1) if desc_match else ""
+        header = (
+            "import json, os\n"
+            "import pandas as pd\n"
+            "df = pd.read_csv(os.environ['DATA_PATH'])\n"
+            "num_cols = df.select_dtypes(include='number').columns.tolist()\n"
+        )
+        if required and any(col not in available for col in required):
+            missing = next(col for col in required if col not in available)
+            return header + f"print(df[{missing!r}].sum())\n"
+        if any(k in desc for k in ("总", "合计", "sum")):
+            return (
+                header
+                + "num = num_cols[0]\n"
+                + "total = float(df[num].sum())\n"
+                + "print(json.dumps({'rows': int(len(df)), 'columns': list(df.columns), "
+                + "'head': df.head(5).astype(str).to_dict(orient='records'), "
+                + "'aggregate': {'合计_' + num: total}}, ensure_ascii=False))\n"
+            )
+        if any(k in desc for k in ("按日期", "每日", "趋势", "走势")):
+            return header + """
+date_col = None
+for c in df.columns:
+    if any(k in str(c) for k in ('日期', 'date', '时间')):
+        date_col = c
+        break
+if date_col is not None:
+    df[date_col] = pd.to_datetime(df[date_col])
+    num = num_cols[0] if num_cols else None
+    if num is not None:
+        agg = df.groupby(df[date_col].dt.date)[num].sum().sort_index()
+        agg = agg.tail(7) if len(agg) > 30 else agg
+        head = [{'日期': str(k), num: float(v)} for k, v in agg.items()]
+        out = {'rows': len(head), 'columns': [date_col, num], 'head': head}
+    else:
+        out = {'rows': int(len(df)), 'columns': list(df.columns), 'head': df.head(5).astype(str).to_dict(orient='records')}
+else:
+    out = {'rows': int(len(df)), 'columns': list(df.columns), 'head': df.head(5).astype(str).to_dict(orient='records')}
+print(json.dumps(out, ensure_ascii=False))
+"""
+        if any(k in desc for k in ("对比", "哪个", "最高", "排名")):
+            return header + """
+cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+num = num_cols[0] if num_cols else None
+if cat_cols and num:
+    agg = df.groupby(cat_cols[0])[num].sum().sort_values(ascending=False).head(10)
+    head = [{cat_cols[0]: str(k), num: float(v)} for k, v in agg.items()]
+    out = {'rows': len(head), 'columns': [cat_cols[0], num], 'head': head}
+else:
+    out = {'rows': int(len(df)), 'columns': list(df.columns), 'head': df.head(5).astype(str).to_dict(orient='records')}
+print(json.dumps(out, ensure_ascii=False))
+"""
+        return (
+            header
+            + "print(json.dumps({'rows': int(len(df)), 'columns': list(df.columns), "
+            + "'head': df.head(5).astype(str).to_dict(orient='records')}, ensure_ascii=False))\n"
+        )
 
     def complete(
         self,
@@ -190,18 +270,12 @@ class MockLLM(BaseLLM):
         name = self._agent_name(system)
         if name in self.overrides:
             return self.overrides[name]
+        if name == "executor":
+            return self._executor_code(messages)
         defaults = {
             "planner": '{"question": "", "time_base": null, "tasks": []}',
             "inspector": '{"task_id": 1, "status": "PASS", "checks": [], "suggestion": null}',
             "critic": '{"verdict": "PASS", "rounds": 1, "issues": []}',
-            "executor": (
-                "import json, os\n"
-                "import pandas as pd\n"
-                "df = pd.read_csv(os.environ['DATA_PATH'])\n"
-                "print(json.dumps({'rows': int(len(df)), 'columns': list(df.columns), "
-                "'head': df.head(5).astype(str).to_dict(orient='records')}, "
-                "ensure_ascii=False))\n"
-            ),
             "visualizer": (
                 "import os\n"
                 "import matplotlib\n"
@@ -212,7 +286,15 @@ class MockLLM(BaseLLM):
                 "import pandas as pd\n"
                 "df = pd.read_csv(os.environ['DATA_PATH'])\n"
                 "num_cols = df.select_dtypes(include='number').columns.tolist()\n"
-                "if num_cols:\n"
+                "ctype = os.environ.get('CHART_TYPE', 'bar')\n"
+                "if ctype == 'line' and num_cols:\n"
+                "    for c in df.columns:\n"
+                "        if any(k in str(c) for k in ('日期', 'date')):\n"
+                "            df[c] = pd.to_datetime(df[c])\n"
+                "            df = df.set_index(c)\n"
+                "            break\n"
+                "    df.groupby(df.index)[num_cols[0]].sum().tail(30).plot(kind='line', title='Trend ' + num_cols[0])\n"
+                "elif num_cols:\n"
                 "    df[num_cols[0]].head(20).plot(kind='bar', title='Top-20 ' + num_cols[0])\n"
                 "else:\n"
                 "    df.head(10).plot(kind='bar')\n"

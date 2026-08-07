@@ -115,14 +115,20 @@ def _detect_encoding(path: Path) -> str:
 
 def _try_date(series: Any) -> tuple[bool, str | None, str | None]:
     import pandas as pd
+    import warnings
 
     try:
-        parsed = pd.to_datetime(series.dropna(), errors="raise")
-        if parsed.empty:
-            return False, None, None
-        return True, str(parsed.min().date()), str(parsed.max().date())
+        parsed = pd.to_datetime(series.dropna(), format="%Y-%m-%d", errors="raise")
     except (ValueError, TypeError, OverflowError):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                parsed = pd.to_datetime(series.dropna(), errors="raise")
+            except (ValueError, TypeError, OverflowError):
+                return False, None, None
+    if parsed.empty:
         return False, None, None
+    return True, str(parsed.min().date()), str(parsed.max().date())
 
 
 def _profile_csv(ctx: Any, data_path: str | Path) -> dict[str, Any]:

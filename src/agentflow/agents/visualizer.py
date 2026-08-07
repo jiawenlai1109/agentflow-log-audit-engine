@@ -67,6 +67,7 @@ class VisualizerAgent(BaseAgent):
                 "RESULT_PATH": result.get("intermediate_file") or "",
                 "CHART_PATH": str(chart_path),
                 "ARTIFACTS_DIR": str(ctx.artifacts_dir),
+                "CHART_TYPE": chart_type,
             },
         )
         if not outcome.success or not chart_path.exists() or chart_path.stat().st_size == 0:
@@ -91,9 +92,12 @@ class VisualizerAgent(BaseAgent):
 
     # ------------------------------------------------------------ helpers
     def _decide_chart_type(self, task: dict[str, Any], result: dict[str, Any], ctx: Any) -> str:
-        suggested = task.get("chart_type", "none")
-        if suggested != "none":
+        suggested = task.get("chart_type") or ""
+        if suggested and suggested != "none":
             return suggested
+        if suggested == "none":
+            # 显式 none：Planner 明确不需要图表，不做推断
+            return "none"
         required = task.get("required_columns", [])
         schema = ctx.schema_profile or {}
         date_col = schema.get("suggested_date_column")

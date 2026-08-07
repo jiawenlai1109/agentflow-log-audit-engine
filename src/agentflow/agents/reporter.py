@@ -84,6 +84,7 @@ class ReporterAgent(BaseAgent):
             )
 
         detail = self._detail_table(results)
+        aggregate = self._aggregate_block(results)
         numbers = self._numbers_context(results)
         fig_list = [
             {"title": fig.get("title", ""), "file_path": fig.get("file_path", "")}
@@ -111,7 +112,7 @@ class ReporterAgent(BaseAgent):
             timestamp=timestamp,
             time_base_note=time_base_note,
             overview=overview,
-            detail=detail,
+            detail=aggregate + detail if aggregate else detail,
             figures=fig_list,
             trend=trend,
             conclusion=conclusion,
@@ -138,6 +139,16 @@ class ReporterAgent(BaseAgent):
             detail = self._row_detail(result, summary)
             rows.append(f"| {task_id} | {result.get('status')} | {summary.get('rows', '-')} | {detail} |")
         return "\n".join(rows)
+
+    def _aggregate_block(self, results: dict[str, Any]) -> str:
+        """把结果中的聚合数字（如合计）确定性写入报告，满足"数字结论"要求。"""
+        lines: list[str] = []
+        for task_id in sorted(int(k) for k in results):
+            summary = results[str(task_id)].get("summary") or {}
+            aggregate = summary.get("aggregate") or {}
+            for key, value in aggregate.items():
+                lines.append(f"- {key} = {value}")
+        return ("\n关键指标：\n" + "\n".join(lines) + "\n\n") if lines else ""
 
     def _row_detail(self, result: dict[str, Any], summary: dict[str, Any]) -> str:
         if result.get("error"):

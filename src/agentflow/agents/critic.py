@@ -34,6 +34,14 @@ class CriticAgent(BaseAgent):
             results=results,
         )
         if degraded:
+            # 降级报告不检查标准章节/数字（预期缺失），只确认文件可读
+            exists = True
+            try:
+                exists = ctx.ensure_within(report_path).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                issues = [{"severity": "high", "section": "整体", "message": "降级报告文件不存在"}]
             review = Review(
                 verdict="PASS" if not issues else "FAIL",
                 rounds=1,

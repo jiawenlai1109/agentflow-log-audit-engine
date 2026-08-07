@@ -237,6 +237,7 @@ class Orchestrator:
                     "figures": {str(k): v for k, v in ctx.figures.items()},
                     "time_base": (ctx.task_list or {}).get("time_base"),
                     "degraded": ctx.report.get("degraded", False),
+                    "failure_info": ctx.report.get("failure_info"),
                     "review_issues": review["issues"],
                 },
                 ensure_ascii=False,

@@ -1,10 +1,10 @@
 import pytest
 
 from agentflow.core.tools import (
+    build_default_registry,
     PathViolationError,
     ToolRegistry,
     ensure_within,
-    register_default_tools,
 )
 
 
@@ -20,8 +20,7 @@ def test_ensure_within_accepts_inside(tmp_path):
 
 
 def test_registry_allowed_tools_by_whitelist():
-    registry = ToolRegistry()
-    register_default_tools(registry)
+    registry = build_default_registry()
     config = {"agents": {"executor": {"tools": ["read_artifact"]}}}
     names = [tool.name for tool in registry.allowed_tools("executor", config)]
     assert names == ["read_artifact"]

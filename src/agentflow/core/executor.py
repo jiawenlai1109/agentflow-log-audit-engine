@@ -102,7 +102,7 @@ class LocalBackend(ExecutionBackend):
         env: dict[str, str] | None = None,
         timeout: int = 30,
     ) -> ExecutionOutcome:
-        work_dir = Path(work_dir)
+        work_dir = Path(work_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
 
         violations = static_scan(code)
@@ -119,7 +119,8 @@ class LocalBackend(ExecutionBackend):
         start = time.monotonic()
         try:
             proc = subprocess.run(
-                [self.python, "-I", str(script)],
+                # -I 会忽略 PYTHON* 环境变量，因此用 -X utf8 命令行开关强制 UTF-8 输出
+                [self.python, "-I", "-X", "utf8", str(script)],
                 cwd=str(work_dir),
                 env=run_env,
                 capture_output=True,
