@@ -32,3 +32,21 @@ def test_tc03_missing_profit_degraded(tmp_path):
     assert result["report"]["degraded"] is True
     report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
     assert "利润" in report
+
+
+def test_mock_session_recall_without_recompute(tmp_path):
+    """记忆回答：第二轮回忆第一轮结论，关键数字来自记忆而非重算。"""
+    session_id = "sess_recall_test"
+    first = run_analysis(
+        "总销售额是多少？", str(DATA), outputs_root=tmp_path, session_id=session_id
+    )
+    assert first["status"] == "success"
+    second = run_analysis(
+        "我之前问的第一个问题的答案是什么？",
+        str(DATA),
+        outputs_root=tmp_path,
+        session_id=session_id,
+    )
+    assert second["status"] == "success"
+    report = Path(second["report"]["report_path"]).read_text(encoding="utf-8")
+    assert "1950562" in report

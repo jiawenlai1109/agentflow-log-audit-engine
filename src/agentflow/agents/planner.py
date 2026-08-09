@@ -8,6 +8,7 @@ from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.core.llm import MockLLM
+from agentflow.core.memory import build_turn_view, is_recall_question
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.plan import TaskList
 
@@ -32,12 +33,14 @@ class PlannerAgent(BaseAgent):
         question = message.content
         schema = ctx.schema_profile or {}
         columns = [col["name"] for col in schema.get("columns", [])]
-        session_memory = self._load_session_memory(ctx)
+        turns = ctx.session.read_turns() if ctx.session else []
+        recall = is_recall_question(question) and bool(turns)
+        session_memory = self._load_session_memory(ctx, question)
 
         if isinstance(self.llm, MockLLM):
-            task_list = self._mock_plan(question, schema)
+            task_list = self._mock_plan(question, schema, recall=recall)
         else:
-            task_list = self._llm_plan(ctx, question, columns, session_memory)
+            task_list = self._llm_plan(ctx, question, columns, session_memory, recall=recall)
 
         plan_path = ctx.outputs_dir / "plan.json"
         plan_path.write_text(json.dumps(task_list, ensure_ascii=False), encoding="utf-8")
@@ -50,7 +53,15 @@ class PlannerAgent(BaseAgent):
         )
 
     # ------------------------------------------------------------ mock 模式
-    def _mock_plan(self, question: str, schema: dict[str, Any]) -> dict[str, Any]:
+    def _mock_plan(
+        self, question: str, schema: dict[str, Any], recall: bool = False
+    ) -> dict[str, Any]:
+        if recall:
+            return {
+                "question": question,
+                "time_base": None,
+                "tasks": [self._memory_task()],
+            }
         columns = [col["name"] for col in schema.get("columns", [])]
         numeric = [
             col["name"]
@@ -115,6 +126,17 @@ class PlannerAgent(BaseAgent):
             "tasks": tasks,
         }
 
+    @staticmethod
+    def _memory_task() -> dict[str, Any]:
+        return {
+            "task_id": 1,
+            "description": "基于会话记忆回答历史问题",
+            "required_columns": [],
+            "code_hint": "memory_answer",
+            "chart_type": "none",
+            "depends_on": [],
+        }
+
     # ------------------------------------------------------------ LLM 模式
     def _llm_plan(
         self,
@@ -122,11 +144,21 @@ class PlannerAgent(BaseAgent):
         question: str,
         columns: list[str],
         session_memory: str,
+        recall: bool = False,
     ) -> dict[str, Any]:
+        recall_hint = (
+            "\n注意：这是一个回忆/引用历史轮次的问题，请只输出一个任务："
+            "description 以'基于会话记忆回答'开头，code_hint 为 memory_answer，"
+            "required_columns 为空数组，chart_type 为 none。"
+            "不要规划重新加载数据计算的子任务。"
+            if recall
+            else ""
+        )
         user_content = (
             f"用户问题：{question}\n"
             f"可用列：{columns}\n"
             f"会话记忆：{session_memory}\n"
+            f"{recall_hint}\n"
             "请输出任务清单 JSON。"
         )
         messages = [{"role": "user", "content": user_content}]
@@ -144,6 +176,13 @@ class PlannerAgent(BaseAgent):
                 if col not in columns
             ]
             if not missing:
+                if recall:
+                    # 回忆问题：只保留记忆回答任务，不重新计算
+                    return {
+                        "question": question,
+                        "time_base": None,
+                        "tasks": [self._memory_task()],
+                    }
                 return task_list.model_dump(mode="json")
             messages += [
                 {"role": "assistant", "content": task_list.model_dump_json()},
@@ -153,15 +192,20 @@ class PlannerAgent(BaseAgent):
                 },
             ]
         # 兜底：LLM 连续失败时退化为 mock 计划
-        return self._mock_plan(question, ctx.schema_profile or {})
+        return self._mock_plan(question, ctx.schema_profile or {}, recall=recall)
 
-    def _load_session_memory(self, ctx: Any) -> str:
+    def _load_session_memory(self, ctx: Any, question: str) -> str:
         if not ctx.session:
             return "（无）"
+        summary = ctx.session.load_summary()
+        turns = ctx.session.read_turns()
         parts: list[str] = []
-        if ctx.session.summary_path.exists():
-            parts.append("历史摘要：" + ctx.session.summary_path.read_text(encoding="utf-8")[:1000])
-        if ctx.session.conversation_path.exists():
-            lines = ctx.session.conversation_path.read_text(encoding="utf-8").strip().splitlines()
-            parts.append("最近对话：" + " | ".join(lines[-3:]))
+        if summary and summary.get("summary"):
+            parts.append("历史摘要：" + str(summary["summary"])[:800])
+        conflicts = (summary or {}).get("conflicts") or []
+        if conflicts:
+            parts.append("冲突提醒：" + "；".join(conflicts)[:500])
+        view = build_turn_view(turns, question)
+        if view and view != "（无历史对话）":
+            parts.append("相关历史对话：\n" + view)
         return "\n".join(parts) or "（无）"

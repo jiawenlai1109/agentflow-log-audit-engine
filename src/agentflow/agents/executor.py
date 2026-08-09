@@ -8,6 +8,7 @@ from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.core.llm import LLMError, extract_json
+from agentflow.core.memory import clean_summary
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.result import ErrorClass, TaskExecutionResult
 
@@ -29,6 +30,12 @@ class ExecutorAgent(BaseAgent):
         task = json.loads(message.content) if isinstance(message.content, str) else message.content
         task_id = int(task["task_id"])
         work_dir = ctx.task_work_dir(task_id)
+        is_memory = (
+            task.get("code_hint") == "memory_answer"
+            or "基于会话记忆回答" in str(task.get("description", ""))
+        )
+        if is_memory:
+            return self._answer_from_memory(ctx, task_id, work_dir)
         messages = [{"role": "user", "content": self._task_prompt(ctx, task)}]
         result: TaskExecutionResult | None = None
         last_outcome: Any = None
@@ -104,6 +111,65 @@ class ExecutorAgent(BaseAgent):
         )
 
     # ------------------------------------------------------------ helpers
+    def _answer_from_memory(
+        self, ctx: Any, task_id: int, work_dir: Any
+    ) -> AgentMessage:
+        """记忆回答：不重新加载数据计算，直接读取会话历史返回可读结论。"""
+        turns = ctx.session.read_turns(limit=10) if ctx.session else []
+        if not turns:
+            result = TaskExecutionResult(
+                task_id=task_id,
+                status="failed",
+                error="会话中没有可用的历史记忆",
+                error_class=ErrorClass.EMPTY_RESULT,
+                suggestion="请先完成至少一轮分析",
+                attempts=1,
+            )
+        else:
+            lines: list[str] = []
+            head: list[dict[str, Any]] = []
+            for turn in turns[-5:]:
+                conclusion = clean_summary(turn.get("summary", ""))[:150]
+                numbers = turn.get("key_numbers") or {}
+                numbers_text = "；".join(f"{k}={v}" for k, v in numbers.items())
+                trace = str(turn.get("run_id", ""))[-8:]
+                line = (
+                    f"第{turn.get('turn')}轮（run_{trace}）：问题：{turn.get('question', '')}"
+                    f" → 结论：{conclusion}"
+                )
+                if numbers_text:
+                    line += f"；关键数字：{numbers_text}"
+                lines.append(line)
+                head.append(
+                    {
+                        "轮次": turn.get("turn"),
+                        "问题": turn.get("question", ""),
+                        "关键数字": numbers_text or "-",
+                    }
+                )
+            result = TaskExecutionResult(
+                task_id=task_id,
+                status="success",
+                summary={
+                    "rows": len(lines),
+                    "columns": ["轮次", "问题", "结论"],
+                    "head": head,
+                    "memory_text": "\n".join(lines),
+                },
+                attempts=1,
+            )
+        data = result.model_dump(mode="json")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        step_file = work_dir / f"step_{task_id}_result.json"
+        step_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return self.reply(
+            ctx,
+            receiver="orchestrator",
+            kind="execution_result",
+            content=json.dumps(data, ensure_ascii=False),
+            artifacts=[str(step_file)],
+        )
+
     def _task_prompt(self, ctx: Any, task: dict[str, Any]) -> str:
         schema = ctx.schema_profile or {}
         return (

@@ -20,6 +20,7 @@ from agentflow.core.config import load_config
 from agentflow.core.context import SessionContext
 from agentflow.core.llm import BaseLLM, MockLLM, OpenAILLM
 from agentflow.core.orchestrator import Orchestrator
+from agentflow.core.memory import detect_conflicts, extract_key_numbers
 from agentflow.core.tools import build_default_registry
 
 
@@ -115,25 +116,30 @@ def run_analysis(
 def _persist_session(
     session: SessionContext, question: str, result: dict[str, Any]
 ) -> None:
-    """L3 会话记忆持久化（简化版：追加轮次 + 更新 summary）。"""
+    """L3 会话记忆持久化：结构化轮次（含关键数字与溯源）+ 冲突检测 + summary 快照。"""
     report = result.get("report") or {}
+    key_numbers: dict[str, float] = {}
+    evaluation_path = Path(result["outputs_dir"]) / "evaluation.json"
+    if evaluation_path.exists():
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        key_numbers = extract_key_numbers(evaluation.get("results", {}))
+
+    previous_turns = session.read_turns()
+    conflicts = detect_conflicts(previous_turns, key_numbers)
     entry = {
-        "turn": time_turn(session),
-        "timestamp": result.get("run_id"),
+        "turn": (previous_turns[-1]["turn"] + 1) if previous_turns else 1,
         "question": question,
         "run_id": result.get("run_id"),
         "report_path": report.get("report_path"),
         "summary": report.get("summary", ""),
+        "key_numbers": key_numbers,
+        "conflicts": conflicts,
     }
-    with session.conversation_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    session.summary_path.write_text(
-        json.dumps({"summary": report.get("summary", "")}, ensure_ascii=False),
-        encoding="utf-8",
+    session.append_turn(entry)
+    session.save_summary(
+        {
+            "summary": report.get("summary", ""),
+            "conflicts": conflicts,
+            "last_run_id": result.get("run_id"),
+        }
     )
-
-
-def time_turn(session: SessionContext) -> int:
-    if not session.conversation_path.exists():
-        return 1
-    return len(session.conversation_path.read_text(encoding="utf-8").strip().splitlines()) + 1

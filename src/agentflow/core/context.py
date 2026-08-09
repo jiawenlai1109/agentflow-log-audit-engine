@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,39 @@ class SessionContext:
     @property
     def summary_path(self) -> Path:
         return self.session_dir / "summary.json"
+
+    def append_turn(self, entry: dict[str, Any]) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        with self.conversation_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def read_turns(self, limit: int | None = None) -> list[dict[str, Any]]:
+        if not self.conversation_path.exists():
+            return []
+        lines = self.conversation_path.read_text(encoding="utf-8").strip().splitlines()
+        if limit is not None:
+            lines = lines[-limit:]
+        turns: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                turns.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return turns
+
+    def load_summary(self) -> dict[str, Any] | None:
+        if not self.summary_path.exists():
+            return None
+        try:
+            return json.loads(self.summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def save_summary(self, summary: dict[str, Any]) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False), encoding="utf-8"
+        )
 
 
 @dataclass

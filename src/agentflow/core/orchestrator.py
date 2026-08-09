@@ -155,6 +155,29 @@ class Orchestrator:
         """执行单元 = 生成代码 → 子进程执行 → Inspector 审核 → 两阶段提交 → Visualizer。"""
         task_id = int(task["task_id"])
         result: dict[str, Any] = {}
+        is_memory = (
+            task.get("code_hint") == "memory_answer"
+            or "基于会话记忆回答" in str(task.get("description", ""))
+        )
+        if is_memory:
+            # 记忆回答任务：不审核、不画图，直接提交结果
+            message = self._request(
+                ctx, "executor", "execute_task", json.dumps(task, ensure_ascii=False)
+            )
+            reply = self.agents["executor"].run(ctx, message)
+            result = json.loads(reply.content)
+            ctx.results[task_id] = result
+            if result["status"] == "success":
+                self._commit(ctx, task_id)
+                ctx.figures[task_id] = {
+                    "task_id": task_id,
+                    "chart_type": "none",
+                    "title": "",
+                    "file_path": None,
+                    "note": "",
+                }
+                return task_id, "SUCCEEDED"
+            return task_id, "FAILED"
         max_redos = max(
             1, int(ctx.config.get("execution", {}).get("max_inspector_redos", 3))
         )
