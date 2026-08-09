@@ -10,7 +10,7 @@ import yaml
 
 
 DEFAULT_CONFIG = {
-    "llm": {"model": "gpt-4o-mini", "temperature": 0.2},
+    "llm": {"model": "", "base_url": "", "temperature": 0.2},
     "execution": {
         "max_concurrency": 3,
         "task_timeout_seconds": 30,

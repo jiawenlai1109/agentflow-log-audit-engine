@@ -1,5 +1,5 @@
 llm:
-  model: gpt-4o-mini          # 真实模式默认模型（可被 .env 的 LLM_MODEL 覆盖）
+  model: ""                   # 留空 → 使用 .env 的 LLM_MODEL；显式填写才覆盖环境变量
   base_url: ""                # 留空则用 OPENAI_BASE_URL（默认 https://api.openai.com/v1）
   temperature: 0.2
 

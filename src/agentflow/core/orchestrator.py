@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +75,24 @@ class Orchestrator:
             if not degraded:
                 self._review(ctx, max_review_rounds)
         except Exception as exc:  # noqa: BLE001 - 运行级兜底
-            status = "failed"
+            from agentflow.core.llm import LLMError
+
+            is_llm_error = isinstance(exc, LLMError)
+            status = "degraded"
+            ctx.degraded_reason = "llm_error" if is_llm_error else "run_error"
+            failure_info = {
+                "error_class": "LLM_ERROR" if is_llm_error else "UNKNOWN",
+                "error": str(exc)[:500],
+                "suggestion": (
+                    "检查 LLM 配置（OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）"
+                    if is_llm_error
+                    else "检查运行日志"
+                ),
+            }
+            try:
+                self._write_degraded_report(ctx, failure_info)
+            except Exception:  # noqa: BLE001 - 降级报告失败不影响状态记录
+                pass
             transcript.write({"event": "run_failed", "error": str(exc)})
         finally:
             duration = round(time.monotonic() - started, 3)
@@ -361,6 +379,26 @@ class Orchestrator:
         (ctx.outputs_dir / "evaluation.json").write_text(
             json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def _write_degraded_report(
+        self, ctx: RunContext, failure_info: dict[str, Any]
+    ) -> None:
+        """LLM/运行级失败时写出可读的降级报告，避免"只留下 json 无报告"。"""
+        report_path = ctx.outputs_dir / "report.md"
+        text = (
+            "# 数据分析报告（未完成）\n\n"
+            f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"- 失败原因：{failure_info.get('error', '')}\n"
+            f"- 错误分类：{failure_info.get('error_class', 'UNKNOWN')}\n"
+            f"- 建议：{failure_info.get('suggestion', '')}\n"
+        )
+        report_path.write_text(text, encoding="utf-8")
+        ctx.report = {
+            "report_path": str(report_path),
+            "degraded": True,
+            "failure_info": failure_info,
+            "summary": "分析未完成：" + str(failure_info.get("error", ""))[:100],
+        }
 
     def _request(
         self, ctx: RunContext, receiver: str, kind: str, content: str
