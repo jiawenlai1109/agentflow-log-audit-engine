@@ -178,7 +178,8 @@ class ReporterAgent(BaseAgent):
             result = results[str(task_id)]
             summary = result.get("summary") or {}
             parts.append(
-                f"任务{task_id}：rows={summary.get('rows')}, head={summary.get('head')}"
+                f"任务{task_id}：rows={summary.get('rows')}, "
+                f"aggregate={summary.get('aggregate')}, head={summary.get('head')}"
             )
         return "；".join(parts) or "（无）"
 

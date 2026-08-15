@@ -113,7 +113,7 @@ class OpenAILLM(BaseLLM):
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
-        timeout: int = 60,
+        timeout: int = 120,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -154,6 +154,8 @@ class OpenAILLM(BaseLLM):
             raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(f"LLM 网络错误: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise LLMError(f"LLM 网络超时或连接失败: {exc}") from exc
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:

@@ -1,4 +1,11 @@
+from agentflow.agents.executor import strip_code_fence
 from agentflow.core.executor import LocalBackend, static_scan
+
+
+def test_strip_code_fence():
+    code = '```python\nprint("hello")\n```'
+    assert strip_code_fence(code) == 'print("hello")'
+    assert strip_code_fence("print('x')") == "print('x')"
 
 
 def test_static_scan_detects_dangerous_patterns():

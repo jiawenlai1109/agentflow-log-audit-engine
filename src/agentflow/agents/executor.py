@@ -20,7 +20,18 @@ EXECUTOR_SYSTEM = """你是高级数据工程师。根据任务编写 pandas 代
 - 结果用 print(json.dumps({'rows': ..., 'columns': [...], 'head': [...], 'aggregate': {...}})) 输出 JSON；
 - aggregate 必须包含至少一个可验证的关键指标（如合计、Top1、最新值、count），格式 {'指标名': 数值}；
 - 必须 try/except 捕获异常并 print 错误信息；
+- 计算出错时禁止吞掉异常伪装成功：要么让异常自然抛出（非零退出），要么输出 {"error": "..."} 并 sys.exit(1)；
+- 注意：本环境 pandas 为 3.x，月末频率请用 'ME'（'M' 已废弃），月初频率 'MS' 不变；
 - 禁止访问网络、禁止写源数据目录。"""
+
+
+def strip_code_fence(code: str) -> str:
+    """剥离 LLM 输出中的 Markdown 代码围栏（容错，即使违反提示词也能执行）。"""
+    code = code.strip()
+    if code.startswith("```"):
+        code = re.sub(r"^```[a-zA-Z0-9_]*\s*\n?", "", code)
+        code = re.sub(r"\n?```\s*$", "", code)
+    return code.strip()
 
 
 class ExecutorAgent(BaseAgent):
@@ -40,6 +51,7 @@ class ExecutorAgent(BaseAgent):
         messages = [{"role": "user", "content": self._task_prompt(ctx, task)}]
         result: TaskExecutionResult | None = None
         last_outcome: Any = None
+        last_error_text: str | None = None
         max_attempts = int(
             ctx.config.get("execution", {}).get("max_executor_attempts", 3)
         )
@@ -57,6 +69,7 @@ class ExecutorAgent(BaseAgent):
                     suggestion="检查模型配置或预算",
                 )
                 break
+            code = strip_code_fence(code)
             outcome = self.registry.call(
                 self.name,
                 "execute_python",
@@ -70,10 +83,25 @@ class ExecutorAgent(BaseAgent):
                 },
             )
             if outcome.success:
+                summary = self._parse_summary(outcome.stdout)
+                if summary and summary.get("error"):
+                    # 代码把错误写进结果 JSON 伪装成功：按失败处理进入自愈
+                    last_error_text = str(summary["error"])[:500]
+                    messages += [
+                        {"role": "assistant", "content": code},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"执行结果包含错误（第 {attempt} 次）：{last_error_text}\n"
+                                "请修正代码后重新输出纯 Python 代码，注意让错误自然抛出或显式非零退出。"
+                            ),
+                        },
+                    ]
+                    continue
                 result = TaskExecutionResult(
                     task_id=task_id,
                     status="success",
-                    summary=self._parse_summary(outcome.stdout),
+                    summary=summary,
                     duration_seconds=outcome.duration_seconds,
                     attempts=attempt,
                 )
@@ -92,7 +120,7 @@ class ExecutorAgent(BaseAgent):
                 task_id=task_id,
                 status="failed",
                 # 取 stderr 末尾（真实异常通常在 traceback 尾部）
-                error=(last_outcome.stderr or "")[-500:],
+                error=last_error_text or (last_outcome.stderr or "")[-500:],
                 error_class=error_class,
                 duration_seconds=last_outcome.duration_seconds,
                 attempts=max_attempts,

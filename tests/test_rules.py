@@ -48,3 +48,29 @@ def test_critic_numeric_compare_detects_missing(tmp_path):
     results = {"1": {"summary": {"aggregate": {"合计_销售额": 1950562.47}, "head": []}}}
     issues = _check_report(_ctx(tmp_path), report, "总销售额是多少？", results)
     assert any("关键数字" in issue["message"] for issue in issues)
+
+
+def test_groupby_result_missing_filter_column_is_warn_not_fail(tmp_path):
+    """分组聚合结果缺筛选列（如 groupby 后无'地区'）应为 WARN 而非 FAIL。"""
+    checks = _validate_rules(
+        _ctx(tmp_path),
+        {"summary": {"rows": 5, "columns": ["产品类别", "销售额"], "aggregate": {"Top1类别": "家居"}}},
+        {"task_id": 1, "required_columns": ["地区", "产品类别", "销售额"]},
+        "华东各产品类别销售额",
+        {"row_count": 2000},
+    )
+    levels = [check["level"] for check in checks]
+    assert "FAIL" not in levels
+    assert "WARN" in levels
+
+
+def test_result_without_rows_but_with_aggregate_is_warn(tmp_path):
+    checks = _validate_rules(
+        _ctx(tmp_path),
+        {"summary": {"columns": ["产品类别"], "aggregate": {"最高利润类别": "家居"}}},
+        {"task_id": 1, "required_columns": ["产品类别"]},
+        "利润最高的类别",
+        {"row_count": 2000},
+    )
+    levels = [check["level"] for check in checks]
+    assert "FAIL" not in levels

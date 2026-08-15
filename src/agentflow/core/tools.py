@@ -222,7 +222,16 @@ def _validate_rules(
     summary = result.get("summary") or {}
     rows = summary.get("rows")
     if rows is None:
-        checks.append({"rule": "empty_check", "level": "FAIL", "message": "结果缺少行数信息"})
+        if summary.get("aggregate"):
+            checks.append(
+                {
+                    "rule": "empty_check",
+                    "level": "WARN",
+                    "message": "结果未提供行数信息，但含关键指标（aggregate）",
+                }
+            )
+        else:
+            checks.append({"rule": "empty_check", "level": "FAIL", "message": "结果缺少行数信息"})
     elif rows == 0:
         context = f"{task.get('description', '')} {question}"
         if _has_filter_hint(context):
@@ -244,8 +253,14 @@ def _validate_rules(
     columns = summary.get("columns", [])
     missing = [col for col in required if col not in columns]
     if missing:
+        # 分组聚合/筛选会消费用于过滤的列（如 groupby 后不再含"地区"），非空结果不判 FAIL
+        level = "FAIL" if not rows or rows == 0 else "WARN"
         checks.append(
-            {"rule": "column_completeness_check", "level": "FAIL", "message": f"结果缺少列：{missing}"}
+            {
+                "rule": "column_completeness_check",
+                "level": level,
+                "message": f"结果缺少列：{missing}" + ("（可能被分组/筛选消费，请确认输出完整）" if level == "WARN" else ""),
+            }
         )
     else:
         checks.append({"rule": "column_completeness_check", "level": "PASS", "message": "必需列齐全"})
