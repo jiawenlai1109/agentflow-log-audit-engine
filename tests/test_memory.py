@@ -2,10 +2,13 @@
 
 from agentflow.core.memory import (
     build_turn_view,
+    clean_turn,
     clean_summary,
     detect_conflicts,
     extract_key_numbers,
     is_recall_question,
+    merge_summary_mock,
+    render_summary_text,
 )
 
 
@@ -58,3 +61,35 @@ def test_clean_summary_strips_markers():
     cleaned = clean_summary("【总体概况】总销售额为100 【结论建议】建议关注")
     assert "总销售额" in cleaned
     assert "【" not in cleaned
+
+
+def test_clean_turn_strips_filler_and_keeps_columns():
+    cleaned = clean_turn(
+        "请问总销售额是多少呢？",
+        "【总体概况】总销售额为100",
+        {"总销售额": 100.0},
+        ["销售额", "订单日期"],
+    )
+    assert "请问" not in cleaned["question_clean"]
+    assert "呢" not in cleaned["question_clean"]
+    assert cleaned["mentioned_columns"] == ["销售额", "订单日期"]
+    assert cleaned["key_numbers"]["总销售额"] == 100.0
+
+
+def test_merge_summary_mock_accumulates_findings_and_constraints():
+    old = {"goals": [], "data_refs": [], "key_findings": [], "constraints": [], "pending": []}
+    merged = merge_summary_mock(old, {"question": "以后只用2024年数据", "key_numbers": {"总销售额": 100.0}, "turn": 2, "run_id": "r1"})
+    assert merged["constraints"] == ["以后只用2024年数据"]
+    assert len(merged["key_findings"]) == 1
+    assert merged["last_focus"] != ""
+
+
+def test_render_summary_text_structured():
+    text = render_summary_text(
+        {
+            "goals": ["关注华东"],
+            "key_findings": [{"conclusion": "总销售额=100"}],
+            "constraints": ["只看2024"],
+        }
+    )
+    assert "华东" in text and "总销售额=100" in text and "只看2024" in text

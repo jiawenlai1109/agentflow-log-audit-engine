@@ -18,6 +18,93 @@ RECALL_KEYWORDS = (
     "前面",
 )
 
+SUMMARIZER_SYSTEM = """你是会话记忆管理员。把旧会话摘要与新一轮对话合并为新的会话摘要 JSON。
+输出必须符合结构：
+{"goals": ["用户核心目标，只增补不删除，除非用户明确改变目标"],
+ "data_refs": ["数据文件/列/时间范围"],
+ "key_findings": [{"conclusion": "结论", "value": 数值或null, "turn": 轮次, "run_id": "来源"}],
+ "constraints": ["用户约束与偏好"],
+ "pending": ["未决事项"],
+ "last_focus": "最近一轮的关注点"}
+规则：goals 只增补不删除；key_findings 保留重要结论（可截断最旧的）；constraints/pending 去重。"""
+
+
+def clean_turn(
+    question: str,
+    summary: str,
+    key_numbers: dict[str, float],
+    mentioned_columns: list[str],
+) -> dict[str, Any]:
+    """TurnCleaner：把一轮对话压缩为结构化条目（去语气词 + 结论 + 关键数字 + 涉及列）。"""
+    cleaned_question = re.sub(r"^(你好|您好|请问|请|麻烦)", "", question)
+    cleaned_question = cleaned_question.replace("吗", "").replace("呢", "").replace("啊", "")
+    return {
+        "question_clean": cleaned_question.strip(),
+        "answer_summary": clean_summary(summary)[:300],
+        "key_numbers": key_numbers,
+        "mentioned_columns": mentioned_columns,
+    }
+
+
+def merge_summary_mock(
+    old_summary: dict[str, Any] | None, turn: dict[str, Any]
+) -> dict[str, Any]:
+    """Mock 模式确定性摘要合并：goals/constraints 去重追加，key_findings 追加并截断。"""
+    old = old_summary or {}
+    constraints = list(old.get("constraints", []))
+    question = str(turn.get("question", ""))
+    if any(keyword in question for keyword in ("以后", "每次", "都", "只", "统一", "一直")):
+        constraint = clean_summary(question)[:100]
+        if constraint and constraint not in constraints:
+            constraints.append(constraint)
+    findings = list(old.get("key_findings", []))
+    for metric, value in (turn.get("key_numbers") or {}).items():
+        findings.append(
+            {
+                "conclusion": f"{metric}={value}",
+                "value": value,
+                "turn": turn.get("turn"),
+                "run_id": turn.get("run_id"),
+            }
+        )
+    return {
+        "goals": list(old.get("goals", [])),
+        "data_refs": list(old.get("data_refs", [])),
+        "key_findings": findings[-20:],
+        "constraints": constraints,
+        "pending": list(old.get("pending", [])),
+        "last_focus": clean_summary(question)[:50],
+    }
+
+
+def render_summary_text(summary: dict[str, Any] | None) -> str:
+    """把结构化摘要渲染为可读文本（供 Planner 注入）。"""
+    if not summary:
+        return "（无）"
+    if "summary" in summary and isinstance(summary["summary"], str):
+        # 兼容旧格式快照
+        return str(summary["summary"])[:800]
+    parts: list[str] = []
+    if summary.get("goals"):
+        parts.append("目标：" + "；".join(summary["goals"]))
+    if summary.get("constraints"):
+        parts.append("约束：" + "；".join(summary["constraints"]))
+    findings = summary.get("key_findings") or []
+    if findings:
+        parts.append(
+            "关键结论："
+            + "；".join(
+                str(finding.get("conclusion", ""))[:120] for finding in findings[:10]
+            )
+        )
+    if summary.get("data_refs"):
+        parts.append("数据引用：" + "；".join(summary["data_refs"][:5]))
+    if summary.get("pending"):
+        parts.append("待办：" + "；".join(summary["pending"]))
+    if summary.get("last_focus"):
+        parts.append("最近关注：" + str(summary["last_focus"]))
+    return "\n".join(parts) or "（无）"
+
 
 def is_recall_question(question: str) -> bool:
     """判断问题是否在回忆/引用历史轮次。"""
@@ -41,7 +128,9 @@ def score_turn(turn: dict[str, Any], question: str) -> int:
     if not question_grams:
         return 0
     body = _bigrams(
-        str(turn.get("question", "")) + " " + clean_summary(turn.get("summary", ""))
+        str(turn.get("question", ""))
+        + " "
+        + clean_summary(turn.get("answer_summary") or turn.get("summary") or "")
     )
     return len(question_grams & body)
 
@@ -65,7 +154,7 @@ def build_turn_view(
     for turn in selected:
         key_numbers = turn.get("key_numbers") or {}
         numbers_text = "；".join(f"{k}={v}" for k, v in key_numbers.items())
-        conclusion = clean_summary(turn.get("summary", ""))[:200]
+        conclusion = clean_summary(turn.get("answer_summary") or turn.get("summary") or "")[:200]
         trace = str(turn.get("run_id", ""))[-8:]
         lines.append(
             f"第{turn.get('turn')}轮（来源 run_{trace}）：问题：{turn.get('question', '')} "

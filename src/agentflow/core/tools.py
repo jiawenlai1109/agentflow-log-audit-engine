@@ -261,6 +261,15 @@ def _validate_rules(
                 {"rule": "negative_value_check", "level": "WARN", "message": f"发现负值（可能为退款）：{negative}"}
             )
 
+    if not summary.get("aggregate"):
+        checks.append(
+            {
+                "rule": "aggregate_check",
+                "level": "WARN",
+                "message": "结果未提供可验证的关键指标（aggregate），建议输出汇总值",
+            }
+        )
+
     total = (schema_profile or {}).get("row_count")
     if rows is not None and total is not None:
         if rows > total:

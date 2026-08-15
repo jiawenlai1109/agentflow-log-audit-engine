@@ -17,7 +17,8 @@ EXECUTOR_SYSTEM = """你是高级数据工程师。根据任务编写 pandas 代
 要求：
 - 只输出纯 Python 代码，禁止 Markdown 围栏；
 - 读取 os.environ['DATA_PATH'] 为 df；
-- 结果用 print(json.dumps({'rows': ..., 'columns': [...], 'head': [...]})) 输出 JSON；
+- 结果用 print(json.dumps({'rows': ..., 'columns': [...], 'head': [...], 'aggregate': {...}})) 输出 JSON；
+- aggregate 必须包含至少一个可验证的关键指标（如合计、Top1、最新值、count），格式 {'指标名': 数值}；
 - 必须 try/except 捕获异常并 print 错误信息；
 - 禁止访问网络、禁止写源数据目录。"""
 
@@ -129,7 +130,9 @@ class ExecutorAgent(BaseAgent):
             lines: list[str] = []
             head: list[dict[str, Any]] = []
             for turn in turns[-5:]:
-                conclusion = clean_summary(turn.get("summary", ""))[:150]
+                conclusion = clean_summary(
+                    turn.get("answer_summary") or turn.get("summary") or ""
+                )[:150]
                 numbers = turn.get("key_numbers") or {}
                 numbers_text = "；".join(f"{k}={v}" for k, v in numbers.items())
                 trace = str(turn.get("run_id", ""))[-8:]

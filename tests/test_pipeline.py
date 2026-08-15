@@ -50,3 +50,7 @@ def test_mock_session_recall_without_recompute(tmp_path):
     assert second["status"] == "success"
     report = Path(second["report"]["report_path"]).read_text(encoding="utf-8")
     assert "1950562" in report
+    summary = json.loads(
+        (tmp_path / "sessions" / session_id / "summary.json").read_text(encoding="utf-8")
+    )
+    assert "key_findings" in summary

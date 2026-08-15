@@ -8,7 +8,7 @@ from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.core.llm import MockLLM
-from agentflow.core.memory import build_turn_view, is_recall_question
+from agentflow.core.memory import build_turn_view, is_recall_question, render_summary_text
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.plan import TaskList
 
@@ -200,8 +200,10 @@ class PlannerAgent(BaseAgent):
         summary = ctx.session.load_summary()
         turns = ctx.session.read_turns()
         parts: list[str] = []
-        if summary and summary.get("summary"):
-            parts.append("历史摘要：" + str(summary["summary"])[:800])
+        if summary:
+            summary_text = render_summary_text(summary)
+            if summary_text and summary_text != "（无）":
+                parts.append("历史摘要：\n" + summary_text)
         conflicts = (summary or {}).get("conflicts") or []
         if conflicts:
             parts.append("冲突提醒：" + "；".join(conflicts)[:500])

@@ -19,8 +19,15 @@ from agentflow.core.budget import BudgetCounter
 from agentflow.core.config import load_config
 from agentflow.core.context import SessionContext
 from agentflow.core.llm import BaseLLM, MockLLM, OpenAILLM
+from agentflow.core.memory import (
+    SUMMARIZER_SYSTEM,
+    clean_turn,
+    detect_conflicts,
+    extract_key_numbers,
+    merge_summary_mock,
+)
 from agentflow.core.orchestrator import Orchestrator
-from agentflow.core.memory import detect_conflicts, extract_key_numbers
+from agentflow.schemas.summary import SessionSummary
 from agentflow.core.tools import build_default_registry
 
 
@@ -109,37 +116,78 @@ def run_analysis(
         session=session,
     )
     if session:
-        _persist_session(session, question, result)
+        _persist_session(session, question, result, llm=llm)
     return result
 
 
 def _persist_session(
-    session: SessionContext, question: str, result: dict[str, Any]
+    session: SessionContext,
+    question: str,
+    result: dict[str, Any],
+    llm: BaseLLM | None = None,
 ) -> None:
-    """L3 会话记忆持久化：结构化轮次（含关键数字与溯源）+ 冲突检测 + summary 快照。"""
+    """L3 会话记忆持久化：TurnCleaner 结构化轮次 + Summarizer 滚动合并 + 冲突检测。"""
     report = result.get("report") or {}
     key_numbers: dict[str, float] = {}
+    mentioned_columns: list[str] = []
     evaluation_path = Path(result["outputs_dir"]) / "evaluation.json"
     if evaluation_path.exists():
         evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
         key_numbers = extract_key_numbers(evaluation.get("results", {}))
+    plan_path = Path(result["outputs_dir"]) / "plan.json"
+    if plan_path.exists():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        mentioned_columns = sorted(
+            {
+                column
+                for task in plan.get("tasks", [])
+                for column in task.get("required_columns", [])
+            }
+        )
 
     previous_turns = session.read_turns()
     conflicts = detect_conflicts(previous_turns, key_numbers)
+    cleaned = clean_turn(question, report.get("summary", ""), key_numbers, mentioned_columns)
     entry = {
         "turn": (previous_turns[-1]["turn"] + 1) if previous_turns else 1,
         "question": question,
         "run_id": result.get("run_id"),
         "report_path": report.get("report_path"),
-        "summary": report.get("summary", ""),
-        "key_numbers": key_numbers,
+        **cleaned,
         "conflicts": conflicts,
     }
     session.append_turn(entry)
-    session.save_summary(
-        {
-            "summary": report.get("summary", ""),
-            "conflicts": conflicts,
-            "last_run_id": result.get("run_id"),
-        }
+    old_summary = session.load_summary()
+    summary = _summarize(old_summary, entry, llm)
+    summary.update({"conflicts": conflicts, "last_run_id": result.get("run_id")})
+    session.save_summary(summary)
+
+
+def _summarize(
+    old_summary: dict[str, Any] | None,
+    turn: dict[str, Any],
+    llm: BaseLLM | None,
+) -> dict[str, Any]:
+    """Summarizer：real 模式用 LLM 增量合并为结构化摘要；mock 模式确定性合并。"""
+    if llm is None or isinstance(llm, MockLLM):
+        return merge_summary_mock(old_summary, turn)
+    prompt = (
+        "旧会话摘要：\n"
+        f"{old_summary}\n\n"
+        "新一轮对话：\n"
+        f"问题：{turn.get('question', '')}\n"
+        f"结论摘要：{turn.get('answer_summary', '')}\n"
+        f"关键数字：{turn.get('key_numbers', {})}\n"
+        "请合并输出新的会话摘要 JSON。"
     )
+    try:
+        result = llm.complete_structured(
+            system=SUMMARIZER_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+            schema=SessionSummary,
+            temperature=0.2,
+            max_tokens=800,
+        )
+        return result.model_dump(mode="json")
+    except Exception:  # noqa: BLE001 - 摘要失败退化为确定性合并
+        return merge_summary_mock(old_summary, turn)

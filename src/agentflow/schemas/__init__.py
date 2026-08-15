@@ -7,6 +7,7 @@ from agentflow.schemas.verdict import CheckResult, Verdict
 from agentflow.schemas.figure import FigureResult
 from agentflow.schemas.report import FailureInfo, ReportResult
 from agentflow.schemas.review import Review, ReviewIssue
+from agentflow.schemas.summary import KeyFinding, SessionSummary
 
 __all__ = [
     "ColumnProfile",
@@ -22,4 +23,6 @@ __all__ = [
     "ReportResult",
     "Review",
     "ReviewIssue",
+    "KeyFinding",
+    "SessionSummary",
 ]
