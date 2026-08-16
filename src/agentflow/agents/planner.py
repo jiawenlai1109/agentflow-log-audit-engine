@@ -29,6 +29,8 @@ class PlannerAgent(BaseAgent):
     name = "planner"
     system_prompt = PLANNER_SYSTEM
 
+    METRIC_KEYWORDS = ("利润", "利润率", "销售额", "销量")
+
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
         question = message.content
         schema = ctx.schema_profile or {}
@@ -79,8 +81,27 @@ class PlannerAgent(BaseAgent):
                 "depends_on": [],
             }
         ]
-        if date_col and any(k in question for k in ("趋势", "走势", "变化", "每日", "最近")):
-            num = numeric[0] if numeric else columns[-1]
+        # Top-N / 对比优先于趋势（"近七天哪个产品利润最高？前三名"应走对比分支）
+        if any(
+            k in question for k in ("对比", "哪个", "最高", "最好", "排名", "top", "前三", "前3")
+        ):
+            cat = self._pick_category(schema)
+            num = self._pick_numeric(schema, question)
+            top_label = "前三名" if any(k in question for k in ("前三", "前3", "排名", "top")) else "Top"
+            tasks.append(
+                {
+                    "task_id": 2,
+                    "description": f"按{cat}对比{num}（取{top_label}）",
+                    "required_columns": [cat, num],
+                    "code_hint": f"按类别分组聚合取 {top_label}",
+                    "chart_type": "bar",
+                    "depends_on": [],
+                }
+            )
+        elif date_col and any(
+            k in question for k in ("趋势", "走势", "变化", "每日", "最近", "近七天", "近7天", "一周")
+        ):
+            num = self._pick_numeric(schema, question)
             tasks.append(
                 {
                     "task_id": 2,
@@ -88,22 +109,6 @@ class PlannerAgent(BaseAgent):
                     "required_columns": [date_col, num],
                     "code_hint": "按日期分组聚合",
                     "chart_type": "line",
-                    "depends_on": [],
-                }
-            )
-        elif any(k in question for k in ("对比", "哪个", "最高", "最好", "排名", "top")):
-            cat = next(
-                (col["name"] for col in schema.get("columns", []) if col["dtype"] == "object"),
-                columns[0],
-            )
-            num = numeric[0] if numeric else columns[-1]
-            tasks.append(
-                {
-                    "task_id": 2,
-                    "description": f"按{cat}对比{num}",
-                    "required_columns": [cat, num],
-                    "code_hint": "按类别分组聚合取 Top",
-                    "chart_type": "bar",
                     "depends_on": [],
                 }
             )
@@ -125,6 +130,35 @@ class PlannerAgent(BaseAgent):
             "time_base": {"type": "data_max_date"} if date_col else None,
             "tasks": tasks,
         }
+
+    def _pick_numeric(self, schema: dict[str, Any], question: str) -> str:
+        """优先选择问题中提到的指标列（如"利润"），否则取第一个数值列。"""
+        columns = schema.get("columns", [])
+        for keyword in self.METRIC_KEYWORDS:
+            if keyword in question:
+                for col in columns:
+                    if col["name"] == keyword and ("int" in col["dtype"] or "float" in col["dtype"]):
+                        return keyword
+                for col in columns:
+                    if keyword in col["name"] and ("int" in col["dtype"] or "float" in col["dtype"]):
+                        return col["name"]
+        for col in columns:
+            if "int" in col["dtype"] or "float" in col["dtype"]:
+                return col["name"]
+        return columns[-1]["name"] if columns else ""
+
+    def _pick_category(self, schema: dict[str, Any]) -> str:
+        """选择类别列（排除日期列，避免把日期当类别）。"""
+        columns = schema.get("columns", [])
+        for col in columns:
+            if col.get("is_date"):
+                continue
+            if col["dtype"] == "object":
+                return col["name"]
+        for col in columns:
+            if not col.get("is_date"):
+                return col["name"]
+        return columns[0]["name"] if columns else ""
 
     @staticmethod
     def _memory_task() -> dict[str, Any]:

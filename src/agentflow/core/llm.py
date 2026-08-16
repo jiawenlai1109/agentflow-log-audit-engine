@@ -210,6 +210,7 @@ class MockLLM(BaseLLM):
             "import pandas as pd\n"
             "df = pd.read_csv(os.environ['DATA_PATH'])\n"
             "num_cols = df.select_dtypes(include='number').columns.tolist()\n"
+            f"_TASK_DESC = {desc!r}\n"
         )
         if required and any(col not in available for col in required):
             missing = next(col for col in required if col not in available)
@@ -247,9 +248,19 @@ print(json.dumps(out, ensure_ascii=False))
         if any(k in desc for k in ("对比", "哪个", "最高", "排名")):
             return header + """
 cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-num = num_cols[0] if num_cols else None
+cat_cols = [c for c in cat_cols if not any(k in str(c) for k in ('日期', 'date'))] or cat_cols
+num = None
+for kw in ('利润', '利润率', '销售额', '销量'):
+    if kw in _TASK_DESC:
+        num = next((c for c in num_cols if kw in str(c)), None)
+        if num:
+            break
+num = num or (num_cols[0] if num_cols else None)
 if cat_cols and num:
-    agg = df.groupby(cat_cols[0])[num].sum().sort_values(ascending=False).head(10)
+    import re as _re
+    _m = _re.search(r'前(\\d+)', _TASK_DESC)
+    _top = int(_m.group(1)) if _m else 10
+    agg = df.groupby(cat_cols[0])[num].sum().sort_values(ascending=False).head(_top)
     head = [{cat_cols[0]: str(k), num: float(v)} for k, v in agg.items()]
     out = {'rows': len(head), 'columns': [cat_cols[0], num], 'head': head}
 else:

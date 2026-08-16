@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +12,33 @@ from app.config import OUTPUTS_ROOT
 from app.schemas import EvaluationSummary
 
 router = APIRouter(prefix="/api", tags=["reports"])
+
+
+def _normalize_report_links(run_id: str, content: str) -> str:
+    """把报告内图片引用统一转为可访问的 /outputs/<run_id>/... URL。
+
+    兼容两种写法：相对路径（./artifacts/...，新报告）与绝对本地路径（D:\\...\\outputs\\...，旧报告）。
+    """
+    content = re.sub(
+        r"!\[([^\]]*)\]\(\s*\.?/?((?:artifacts|work|sessions)/[^)]*)\)",
+        lambda m: f"![{m.group(1)}](/outputs/{run_id}/{m.group(2)})",
+        content,
+    )
+
+    def _absolute_link(match: re.Match) -> str:
+        raw = match.group(2).replace("\\", "/")
+        marker = "/outputs/"
+        idx = raw.find(marker)
+        if idx >= 0:
+            return f"![{match.group(1)}]({raw[idx:]})"
+        return match.group(0)
+
+    content = re.sub(
+        r"!\[([^\]]*)\]\(([^)]*outputs[\\/][^)]+)\)",
+        _absolute_link,
+        content,
+    )
+    return content
 
 
 @router.get("/runs")
@@ -42,7 +70,8 @@ def get_report(run_id: str) -> dict:
     report_path = OUTPUTS_ROOT / run_id / "report.md"
     if not report_path.exists():
         raise HTTPException(status_code=404, detail="报告不存在")
-    return {"run_id": run_id, "content": report_path.read_text(encoding="utf-8")}
+    content = report_path.read_text(encoding="utf-8")
+    return {"run_id": run_id, "content": _normalize_report_links(run_id, content)}
 
 
 @router.get("/evaluations/summary", response_model=EvaluationSummary)

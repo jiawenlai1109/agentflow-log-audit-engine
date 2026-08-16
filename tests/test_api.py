@@ -6,9 +6,21 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.routers.reports import _normalize_report_links
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA = PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"
+DATA_PROFIT = PROJECT_ROOT / "demo" / "data" / "retail_sales_with_profit.csv"
+
+
+def test_normalize_relative_report_link():
+    content = "![图](./artifacts/chart_task_2.png)"
+    assert _normalize_report_links("run_x", content) == "![图](/outputs/run_x/artifacts/chart_task_2.png)"
+
+
+def test_normalize_absolute_report_link():
+    content = r"![图](D:\my_agent_project\多agent数据分析\outputs\run_x\artifacts\chart_task_2.png)"
+    assert "/outputs/run_x/artifacts/chart_task_2.png" in _normalize_report_links("run_x", content)
 
 
 def _wait_job(client: TestClient, job_id: str, timeout: float = 60.0) -> dict:
@@ -72,3 +84,27 @@ def test_full_flow(tmp_path):
         history = client.get(f"/api/sessions/{session_id}/messages")
         assert history.status_code == 200
         assert len(history.json()) >= 1
+
+
+def test_mock_profit_top3_report_and_image_link():
+    """利润Top3 问题：mock 报告含利润指标，图片链接转为 /outputs/ URL。"""
+    with TestClient(app) as client:
+        with DATA_PROFIT.open("rb") as fh:
+            upload = client.post(
+                "/api/datasets", files={"file": ("retail_sales_with_profit.csv", fh, "text/csv")}
+            )
+        assert upload.status_code == 200
+        dataset = upload.json()
+        analyze = client.post(
+            "/api/analyze",
+            json={
+                "question": "近七天哪个产品的销售利润最高？把前三名的列出来",
+                "dataset_id": dataset["id"],
+                "mode": "mock",
+            },
+        )
+        job = _wait_job(client, analyze.json()["job_id"])
+        assert job["status"] == "success"
+        report = client.get(f"/api/reports/{job['run_id']}").json()["content"]
+        assert "利润" in report
+        assert "/outputs/" in report

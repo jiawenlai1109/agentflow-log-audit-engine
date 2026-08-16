@@ -39,6 +39,22 @@
     <div v-for="(item, index) in messages" :key="index" class="message-card">
       <el-card>
         <div class="message-q">问：{{ item.question }}</div>
+        <el-alert
+          v-if="item.error"
+          type="error"
+          :title="'分析失败'"
+          :description="item.error"
+          show-icon
+          :closable="false"
+          style="margin: 8px 0"
+        />
+        <el-alert
+          v-if="item.mode === 'mock' && !item.error"
+          type="info"
+          title="mock 模式为离线演示结果，复杂/精确问题请使用 real 模式"
+          :closable="false"
+          style="margin: 8px 0"
+        />
         <el-tag v-if="item.run_id" size="small" style="margin: 8px 0">{{ item.run_id }}</el-tag>
         <ReportViewer v-if="item.report" :content="item.report" />
         <div v-else>{{ item.answer_summary }}</div>
@@ -117,11 +133,21 @@ async function submit() {
       const job = await api.getJob(jobId);
       if (job.data.run_id) {
         const { data: report } = await api.getReport(job.data.run_id);
-        messages.value.push({ question: question.value, run_id: job.data.run_id, answer_summary: "", report: report.content });
+        messages.value.push({ question: question.value, run_id: job.data.run_id, answer_summary: "", report: report.content, mode: mode.value });
+      } else {
+        messages.value.push({
+          question: question.value,
+          error: job.data.error || event.error || "分析失败（无详细信息）",
+          mode: mode.value,
+        });
       }
       question.value = "";
       loadHistory();
-      ElMessage.success(event.type === "done" ? `分析完成（${event.status}）` : "分析出错");
+      if (event.type === "done") {
+        ElMessage.success(`分析完成（${event.status}）`);
+      } else {
+        ElMessage.error("分析出错");
+      }
     }
   };
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from jinja2 import Template
@@ -37,6 +38,14 @@ REPORT_TEMPLATE = """# 📊 数据分析报告
 四、结论与建议
 {{ conclusion }}
 """
+
+
+def _relative_artifact(ctx: Any, path: str) -> str:
+    """把图表绝对路径转为相对 report.md 目录的路径（Web/CLI 均可解析）。"""
+    try:
+        return "./" + str(Path(path).relative_to(ctx.outputs_dir)).replace("\\", "/")
+    except ValueError:
+        return str(Path(path)).replace("\\", "/")
 
 DEGRADED_TEMPLATE = """# 数据分析报告（未完成）
 
@@ -88,7 +97,10 @@ class ReporterAgent(BaseAgent):
         aggregate = self._aggregate_block(results)
         numbers = self._numbers_context(results)
         fig_list = [
-            {"title": fig.get("title", ""), "file_path": fig.get("file_path", "")}
+            {
+                "title": fig.get("title", ""),
+                "file_path": _relative_artifact(ctx, fig.get("file_path", "")),
+            }
             for fig in figures.values()
             if fig.get("file_path")
         ]
