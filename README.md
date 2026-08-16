@@ -23,6 +23,19 @@ python -m venv .venv
 .\.venv\Scripts\python.exe scripts\evaluate.py
 ```
 
+## Web 前后端（Phase 7）
+
+```powershell
+# 后端（项目 .venv）
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+# 前端（开发模式，Vite 代理 /api 与 /outputs 到 :8000）
+cd frontend
+npm install
+npm run dev        # 打开 http://localhost:5173（默认账号 admin / admin）
+```
+
+页面：登录 → 数据管理（上传 CSV）→ 分析工作台（提问 + SSE 实时 Agent 进度）→ 会话管理（多轮记忆）→ 历史与报告。设计详见[前后端设计方案.md](前后端设计方案.md)。
+
 ## 目录结构
 
 ```text

@@ -77,6 +77,7 @@ def run_analysis(
     llm: BaseLLM | None = None,
     outputs_root: str | Path | None = None,
     session_id: str | None = None,
+    on_event: Any | None = None,
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。"""
     config = load_config(config_path)
@@ -107,7 +108,11 @@ def run_analysis(
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
     agents = build_agents(llm, registry, config, budget)
     orchestrator = Orchestrator(
-        config=config, registry=registry, agents=agents, budget=budget
+        config=config,
+        registry=registry,
+        agents=agents,
+        budget=budget,
+        on_event=on_event,
     )
     result = orchestrator.run(
         question=question,

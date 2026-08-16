@@ -26,12 +26,21 @@ class Orchestrator:
         registry: Any,
         agents: dict[str, Any],
         budget: Any = None,
+        on_event: Any = None,
     ) -> None:
         self.config = config
         self.registry = registry
         self.agents = agents
         self.budget = budget
+        self.on_event = on_event
         self._commit_lock = threading.Lock()
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.on_event is not None:
+            try:
+                self.on_event({**event, "run_id": getattr(self, "_run_id", None)})
+            except Exception:  # noqa: BLE001 - 事件推送失败不影响运行
+                pass
 
     # ------------------------------------------------------------ 主流程
     def run(
@@ -62,10 +71,15 @@ class Orchestrator:
         started = time.monotonic()
         status = "failed"
         try:
+            self._run_id = run_id
+            self._emit({"type": "phase", "phase": "explore"})
             self._explore(ctx)
+            self._emit({"type": "phase", "phase": "plan"})
             self._plan(ctx)
+            self._emit({"type": "phase", "phase": "execute"})
             self._execute_dag(ctx)
             status, degraded, failure_info = self._classify_state(ctx)
+            self._emit({"type": "phase", "phase": "report"})
             self._report(
                 ctx,
                 degraded=degraded,
@@ -73,7 +87,9 @@ class Orchestrator:
                 failure_info=failure_info,
             )
             if not degraded:
+                self._emit({"type": "phase", "phase": "review"})
                 self._review(ctx, max_review_rounds)
+            self._emit({"type": "done", "status": status, "run_id": run_id})
         except Exception as exc:  # noqa: BLE001 - 运行级兜底
             from agentflow.core.llm import LLMError
 
@@ -94,6 +110,7 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 - 降级报告失败不影响状态记录
                 pass
             transcript.write({"event": "run_failed", "error": str(exc)})
+            self._emit({"type": "error", "error": str(exc)[:500]})
         finally:
             duration = round(time.monotonic() - started, 3)
             self._write_evaluation(ctx, status, duration)
@@ -176,7 +193,9 @@ class Orchestrator:
                     "file_path": None,
                     "note": "",
                 }
+                self._emit({"type": "task", "task_id": task_id, "status": "SUCCEEDED"})
                 return task_id, "SUCCEEDED"
+            self._emit({"type": "task", "task_id": task_id, "status": "FAILED"})
             return task_id, "FAILED"
         max_redos = max(
             1, int(ctx.config.get("execution", {}).get("max_inspector_redos", 3))
@@ -189,6 +208,7 @@ class Orchestrator:
             result = json.loads(reply.content)
             ctx.results[task_id] = result
             if result["status"] == "failed":
+                self._emit({"type": "task", "task_id": task_id, "status": "FAILED"})
                 return task_id, "FAILED"
             verdict_msg = self._request(
                 ctx,
@@ -218,6 +238,7 @@ class Orchestrator:
                 ctx.figures[task_id] = json.loads(
                     self.agents["visualizer"].run(ctx, figure_msg).content
                 )
+                self._emit({"type": "task", "task_id": task_id, "status": "SUCCEEDED"})
                 return task_id, "SUCCEEDED"
             # Inspector FAIL：携带建议重做
             task = {**task, "_redo_suggestion": verdict.get("suggestion")}
@@ -227,6 +248,7 @@ class Orchestrator:
             "error": f"Inspector 连续 {max_redos} 次未通过：" + str(verdict.get("suggestion", "")),
             "error_class": "EMPTY_RESULT",
         }
+        self._emit({"type": "task", "task_id": task_id, "status": "FAILED"})
         return task_id, "FAILED"
 
     def _classify_state(
@@ -443,4 +465,12 @@ class Orchestrator:
                     "content": content[:1000],
                 }
             )
+        self._emit(
+            {
+                "type": "message",
+                "sender": "orchestrator",
+                "receiver": receiver,
+                "kind": kind,
+            }
+        )
         return message
