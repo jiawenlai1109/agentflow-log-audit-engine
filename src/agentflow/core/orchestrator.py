@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -110,6 +111,9 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 - 降级报告失败不影响状态记录
                 pass
             transcript.write({"event": "run_failed", "error": str(exc)})
+            transcript.write(
+                {"event": "run_failed_traceback", "traceback": traceback.format_exc()[-3000:]}
+            )
             self._emit({"type": "error", "error": str(exc)[:500]})
         finally:
             duration = round(time.monotonic() - started, 3)

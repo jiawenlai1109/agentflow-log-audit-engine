@@ -172,8 +172,9 @@ class ReporterAgent(BaseAgent):
         for task_id in sorted(int(k) for k in results):
             summary = results[str(task_id)].get("summary") or {}
             aggregate = summary.get("aggregate") or {}
-            for key, value in aggregate.items():
-                lines.append(f"- {key} = {value}")
+            if isinstance(aggregate, dict):
+                for key, value in aggregate.items():
+                    lines.append(f"- {key} = {value}")
         return ("\n关键指标：\n" + "\n".join(lines) + "\n\n") if lines else ""
 
     def _row_detail(self, result: dict[str, Any], summary: dict[str, Any]) -> str:

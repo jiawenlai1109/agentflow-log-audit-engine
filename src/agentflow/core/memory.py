@@ -170,6 +170,8 @@ def extract_key_numbers(results: dict[str, Any]) -> dict[str, float]:
     extracted: dict[str, float] = {}
     for result in results.values():
         aggregate = (result.get("summary") or {}).get("aggregate") or {}
+        if not isinstance(aggregate, dict):
+            aggregate = {}  # LLM 可能把 aggregate 输出成数组，防御处理
         for key, value in aggregate.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 extracted[str(key)] = float(value)

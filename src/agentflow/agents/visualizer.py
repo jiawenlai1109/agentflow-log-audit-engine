@@ -115,6 +115,8 @@ class VisualizerAgent(BaseAgent):
         head = (result.get("summary") or {}).get("head") or []
         key: str | None = None
         for row in head:
+            if not isinstance(row, dict):
+                continue
             for k, v in row.items():
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     key = k

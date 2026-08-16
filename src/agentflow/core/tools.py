@@ -221,6 +221,9 @@ def _validate_rules(
     checks: list[dict[str, str]] = []
     summary = result.get("summary") or {}
     rows = summary.get("rows")
+    # 防御脏数据：rows 必须是数字，LLM 可能输出数组/字符串，一律按"缺行数"处理，绝不抛异常
+    if not isinstance(rows, (int, float)) or isinstance(rows, bool):
+        rows = None
     if rows is None:
         if summary.get("aggregate"):
             checks.append(
@@ -266,7 +269,7 @@ def _validate_rules(
         checks.append({"rule": "column_completeness_check", "level": "PASS", "message": "必需列齐全"})
 
     head = summary.get("head") or []
-    if head:
+    if head and isinstance(head[0], dict):
         first = head[0]
         negative = [
             f"{k}={v}" for k, v in first.items() if isinstance(v, (int, float)) and v < 0
@@ -321,9 +324,10 @@ def _check_report(
     for result in results.values():
         summary = result.get("summary") or {}
         aggregate = summary.get("aggregate") or {}
-        for value in aggregate.values():
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                expected.append(float(value))
+        if isinstance(aggregate, dict):
+            for value in aggregate.values():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    expected.append(float(value))
     # 数值解析比对：仅校验"关键指标"（aggregate）必须出现在报告中，样例行不强制
     actual_numbers = [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
     for number in expected[:10]:

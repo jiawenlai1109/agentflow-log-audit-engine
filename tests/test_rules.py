@@ -74,3 +74,40 @@ def test_result_without_rows_but_with_aggregate_is_warn(tmp_path):
     )
     levels = [check["level"] for check in checks]
     assert "FAIL" not in levels
+
+
+def test_rows_as_list_does_not_crash(tmp_path):
+    """LLM 把 rows 输出成数组时，Inspector 不抛异常，按缺行数处理。"""
+    checks = _validate_rules(
+        _ctx(tmp_path),
+        {"summary": {"rows": ["a", "b"], "columns": ["产品类别"], "aggregate": {"最高利润类别": "家居"}}},
+        {"task_id": 1, "required_columns": ["产品类别"]},
+        "利润最高的类别",
+        {"row_count": 2000},
+    )
+    levels = [check["level"] for check in checks]
+    assert "FAIL" not in levels
+
+
+def test_aggregate_as_list_does_not_crash(tmp_path):
+    """LLM 把 aggregate 输出成数组时，critic/记忆提取均不抛异常。"""
+    from agentflow.core.memory import extract_key_numbers
+
+    results = {"1": {"summary": {"aggregate": [{"x": 1}], "head": []}}}
+    assert extract_key_numbers(results) == {}
+    report = tmp_path / "report.md"
+    report.write_text("报告", encoding="utf-8")
+    issues = _check_report(_ctx(tmp_path), report, "问题", results)
+    assert isinstance(issues, list)
+
+
+def test_head_row_as_list_does_not_crash(tmp_path):
+    """LLM 把 head 输出成数组（list of list）时，Inspector 负值检查不抛异常。"""
+    checks = _validate_rules(
+        _ctx(tmp_path),
+        {"summary": {"rows": 3, "columns": ["产品类别", "利润"], "head": [["家居", 100], ["美妆", -5]]}},
+        {"task_id": 1, "required_columns": ["产品类别", "利润"]},
+        "利润前三",
+        {"row_count": 2000},
+    )
+    assert isinstance(checks, list)
