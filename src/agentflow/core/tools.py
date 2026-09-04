@@ -37,6 +37,55 @@ def ensure_allowed(ctx: Any, path: str | Path) -> Path:
     raise PathViolationError(f"路径越界：{path} 不在授权范围内")
 
 
+def ensure_authorized(
+    ctx: Any,
+    path: str | Path,
+    task_id: int | None = None,
+    grants: list[str] | None = None,
+) -> Path:
+    """两级授权（安全与隔离设计 §3，v1.2）：
+
+    1. ensure_allowed：run 根目录 / 源数据；
+    2. 任务级（依赖边 = 授权边）：task-scoped 调用（executor/visualizer）不可读
+       兄弟任务的 work/ 目录；其他任务的 artifacts 必须命中 grants 清单。
+       task_id 为空 = 运行级角色（explorer/inspector/critic/reporter），维持运行级放行。
+    """
+    target = ensure_allowed(ctx, path)
+    run_root = Path(ctx.outputs_dir).resolve()
+    work_root = run_root / "work"
+    art_root = run_root / "artifacts"
+
+    if target == work_root or work_root in target.parents:
+        if task_id is None:
+            return target
+        own = (work_root / str(task_id)).resolve()
+        if target != own and own not in target.parents:
+            raise PathViolationError(
+                f"路径越界：{path} 位于其他任务的 work 目录（work 目录任务私有）"
+            )
+        return target
+
+    if target == art_root or art_root in target.parents:
+        if task_id is None:
+            return target
+        owner = _artifact_owner(target)
+        if owner is not None and owner != int(task_id) and str(target) not in (grants or []):
+            raise PathViolationError(
+                f"路径越界：{path} 属于任务 {owner} 的产物，未在授权清单（grants）内——依赖边即授权边"
+            )
+    return target
+
+
+def _artifact_owner(target: Path) -> int | None:
+    """从产物文件名解析归属任务：step_<id>_result.json / chart_task_<id>.png。"""
+    import re
+
+    match = re.search(r"(?:^|/)step_(\d+)_result\.json$|(?:^|/)chart_task_(\d+)\.png$", str(target).replace("\\", "/"))
+    if not match:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
 @dataclass
 class Tool:
     """工具定义：名称、描述、参数 JSON Schema、处理函数。"""
@@ -81,11 +130,24 @@ def _has_filter_hint(text: str) -> bool:
     return any(hint in text for hint in FILTER_HINTS)
 
 
-class ToolRegistry:
-    """统一工具注册表：实现一次，按 Agent 白名单注入可见性。"""
+# 默认白名单（与 config/agents.yaml 对应；未绑定 config 时作为运行时强制依据）
+DEFAULT_TOOL_WHITELIST = {
+    "explorer": ["profile_csv"],
+    "planner": [],
+    "executor": ["execute_python", "read_artifact"],
+    "inspector": ["validate_rules", "verify_aggregate"],
+    "visualizer": ["execute_python", "read_artifact"],
+    "reporter": [],
+    "critic": ["check_report"],
+}
 
-    def __init__(self) -> None:
+
+class ToolRegistry:
+    """统一工具注册表：实现一次，按 Agent 白名单注入可见性并运行时强制（v1.2）。"""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
+        self._config = config
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
@@ -101,20 +163,50 @@ class ToolRegistry:
     def allowed_tools(
         self, agent_name: str, config: dict[str, Any] | None = None
     ) -> list[Tool]:
-        whitelist: list[str] = []
-        if config:
-            whitelist = (config.get("agents", {}).get(agent_name, {}) or {}).get(
-                "tools", []
-            )
+        whitelist = self._whitelist_for(agent_name, config)
         return [self._tools[name] for name in whitelist if name in self._tools]
 
-    def call(self, agent_name: str, tool_name: str, ctx: Any, **params: Any) -> Any:
-        """调用工具；所有带路径语义的参数先做运行级授权校验。"""
+    def _whitelist_for(
+        self, agent_name: str, config: dict[str, Any] | None = None
+    ) -> list[str]:
+        source = config or self._config
+        if source:
+            entry = (source.get("agents", {}).get(agent_name, {}) or {}).get("tools")
+            if entry is not None:
+                # 显式声明（含空列表 = 明确不给工具）优先
+                return list(entry)
+        # 未声明时回落默认白名单——配置缺 agents 段不应导致全员被拒
+        return list(DEFAULT_TOOL_WHITELIST.get(agent_name, []))
+
+    def _check_whitelist(self, agent_name: str, tool_name: str, ctx: Any) -> None:
+        if tool_name in self._whitelist_for(agent_name):
+            return
+        self._audit(ctx, {"event": "tool_denied_whitelist", "agent": agent_name, "tool": tool_name})
+        raise ToolError(f"越权工具调用：{agent_name} 未被授权使用 {tool_name}")
+
+    def _audit(self, ctx: Any, record: dict[str, Any]) -> None:
+        transcript = getattr(ctx, "transcript", None)
+        if transcript is not None:
+            transcript.write(record)
+
+    def call(
+        self, agent_name: str, tool_name: str, ctx: Any, _scope: dict[str, Any] | None = None, **params: Any
+    ) -> Any:
+        """调用工具。
+
+        v1.2 强制：①白名单运行时校验（越权抛 ToolError 并审计）；
+        ②带路径语义的参数经 ensure_authorized 两级校验；
+        ③task-scoped 调用经 _scope={"task_id", "grants"} 声明授权（依赖边=授权边）。
+        """
         tool = self.get(tool_name)
+        self._check_whitelist(agent_name, tool_name, ctx)
+        scope = _scope or {}
+        task_id = scope.get("task_id")
+        grants = scope.get("grants")
         guarded: dict[str, Any] = {}
         for key, value in params.items():
             if key in PATH_LIKE_KEYS and isinstance(value, (str, Path)):
-                guarded[key] = ensure_allowed(ctx, value)
+                guarded[key] = ensure_authorized(ctx, value, task_id=task_id, grants=grants)
             else:
                 guarded[key] = value
         return tool.handler(ctx=ctx, **guarded)
@@ -165,7 +257,8 @@ def _profile_csv(ctx: Any, data_path: str | Path) -> dict[str, Any]:
         series = df[col]
         missing_rate = float(series.isna().mean())
         unique_rate = float(series.nunique()) / max(1, len(series))
-        samples = [str(value) for value in series.dropna().head(3).tolist()]
+        # 样例值是数据原文进 prompt 的通道（提示词注入防线）：截断后仅作画像展示
+        samples = [str(value)[:50] for value in series.dropna().head(3).tolist()]
         is_date, cmin, cmax = _try_date(series)
         columns.append(
             ColumnProfile(
@@ -347,9 +440,24 @@ def _read_artifact(ctx: Any, path: str | Path) -> str:
     return target.read_text(encoding="utf-8")
 
 
-def build_default_registry() -> ToolRegistry:
+def _verify_aggregate(
+    ctx: Any,
+    result: dict[str, Any],
+    task: dict[str, Any],
+    data_path: str | Path,
+    schema_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """独立校验（v1.2，producer ≠ verifier）：按任务类别用确定性模板重算关键指标。"""
+    from agentflow.core.verification import run_verification
+
+    return run_verification(
+        task=task, result=result, data_path=str(data_path), schema_profile=schema_profile
+    )
+
+
+def build_default_registry(config: dict[str, Any] | None = None) -> ToolRegistry:
     """注册全部内置工具（与 config/agents.yaml 白名单对应）。"""
-    registry = ToolRegistry()
+    registry = ToolRegistry(config)
     registry.register(
         Tool(
             name="profile_csv",
@@ -379,6 +487,13 @@ def build_default_registry() -> ToolRegistry:
             name="validate_rules",
             description="Inspector 确定性审核规则",
             handler=_validate_rules,
+        )
+    )
+    registry.register(
+        Tool(
+            name="verify_aggregate",
+            description="独立校验模板：重算关键指标并与上报 aggregate 容差比对",
+            handler=_verify_aggregate,
         )
     )
     registry.register(

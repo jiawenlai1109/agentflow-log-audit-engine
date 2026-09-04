@@ -70,6 +70,7 @@ class Orchestrator:
             budget=budget,
         )
         started = time.monotonic()
+        self._started = started  # 墙钟守卫基准（total_budget_seconds 的执行点）
         status = "failed"
         try:
             self._run_id = run_id
@@ -139,24 +140,34 @@ class Orchestrator:
         ctx.task_list = json.loads(reply.content)
 
     def _execute_dag(self, ctx: RunContext) -> None:
-        tasks = ctx.task_list["tasks"]
-        states: dict[int, str] = {task["task_id"]: "PENDING" for task in tasks}
-        deps = {task["task_id"]: list(task.get("depends_on", [])) for task in tasks}
-        task_by_id = {task["task_id"]: task for task in tasks}
-        pending = set(states)
+        """DAG 调度（v1.2）：波次并行 + 墙钟守卫 + 波次末错误路由（MISSING_COLUMN → 重规划）。"""
         max_workers = max(
             1, int(self.config.get("execution", {}).get("max_concurrency", 3))
         )
-        while pending:
-            ready = [tid for tid in pending if all(d not in pending for d in deps[tid])]
+        states: dict[int, str] = {}
+        while True:
+            tasks = ctx.task_list["tasks"]
+            deps = {int(t["task_id"]): list(t.get("depends_on", [])) for t in tasks}
+            task_by_id = {int(t["task_id"]): t for t in tasks}
+            for tid in task_by_id:
+                states.setdefault(tid, "PENDING")
+            pending = {tid for tid, s in states.items() if s == "PENDING"}
+
+            # 墙钟守卫：每次派发前检查 deadline（恢复与回滚设计 §4.2）
+            if self._deadline_exceeded(ctx):
+                for tid in pending:
+                    states[tid] = "CANCELLED"
+                ctx.wall_clock_timeout = True
+                break
+
+            ready = [tid for tid in sorted(pending) if all(d not in pending for d in deps[tid])]
             if not ready:
                 for tid in pending:
                     states[tid] = "SKIPPED"
                 break
             to_run: list[int] = []
             for tid in ready:
-                dep_states = [states[dep] for dep in deps[tid]]
-                if any(s in ("FAILED", "SKIPPED") for s in dep_states):
+                if any(states.get(d) in ("FAILED", "SKIPPED") for d in deps[tid]):
                     states[tid] = "SKIPPED"
                 else:
                     to_run.append(tid)
@@ -170,7 +181,89 @@ class Orchestrator:
                     for future in as_completed(futures):
                         tid, new_state = future.result()
                         states[tid] = new_state
+
+            # 波次末错误路由：计划修订则重建调度结构进入下一波
+            if self._route_planning_failures(ctx, states):
+                continue
+            if not any(s == "PENDING" for s in states.values()):
+                break
         ctx.task_states = states
+
+    def _deadline_exceeded(self, ctx: RunContext) -> bool:
+        seconds = int(ctx.config.get("execution", {}).get("total_budget_seconds", 120))
+        return (time.monotonic() - getattr(self, "_started", time.monotonic())) > seconds
+
+    def _max_replan(self, ctx: RunContext) -> int:
+        return max(1, int(ctx.config.get("execution", {}).get("max_replan_rounds", 1)))
+
+    def _route_planning_failures(self, ctx: RunContext, states: dict[int, str]) -> bool:
+        """错误路由（v1.2）：MISSING_COLUMN 是规划错误，路由给 Planner 增量修订剩余任务。
+
+        返回 True 表示计划已修订、调度器应重建结构继续；不可修订时产出非阻塞澄清请求。
+        """
+        if ctx.replan_used >= self._max_replan(ctx):
+            return False
+        fresh = [
+            tid
+            for tid, s in states.items()
+            if s == "FAILED"
+            and (ctx.results.get(tid) or {}).get("error_class") == "MISSING_COLUMN"
+            and not (ctx.results[tid].get("_routed"))
+        ]
+        if not fresh:
+            return False
+        tid = fresh[0]
+        ctx.results[tid]["_routed"] = True
+        remaining = [
+            task
+            for task in ctx.task_list["tasks"]
+            if states.get(int(task["task_id"])) == "PENDING"
+        ]
+        missing = (ctx.results.get(tid) or {}).get("missing_columns") or []
+        payload = {
+            "question": ctx.question,
+            "failed_task": next(
+                (t for t in ctx.task_list["tasks"] if int(t["task_id"]) == tid), {}
+            ),
+            "missing_columns": missing,
+            "remaining_tasks": remaining,
+        }
+        ctx.replan_used += 1
+        self._emit(
+            {
+                "type": "error_routed",
+                "task_id": tid,
+                "error_class": "MISSING_COLUMN",
+                "action": "replan",
+                "missing_columns": missing,
+            }
+        )
+        if ctx.transcript is not None:
+            ctx.transcript.write(
+                {"event": "error_routed", "task_id": tid, "error_class": "MISSING_COLUMN", "action": "replan"}
+            )
+        reply = self.agents["planner"].run(
+            ctx,
+            self._request(
+                ctx, "planner", "replan_request", json.dumps(payload, ensure_ascii=False)
+            ),
+        )
+        reply_data = json.loads(reply.content)
+        if reply.kind == "clarify_request":
+            ctx.clarify = reply_data
+            self._emit({"type": "clarify_request", **reply_data})
+            return False
+        revised = reply_data.get("tasks") or []
+        if not revised:
+            return False
+        # 合并修订：只动未执行任务（PENDING），已完成/失败任务保留原定义
+        kept = [
+            task
+            for task in ctx.task_list["tasks"]
+            if states.get(int(task["task_id"]), "PENDING") != "PENDING"
+        ]
+        ctx.task_list = {**ctx.task_list, "tasks": kept + revised}
+        return True
 
     def _task_unit(self, ctx: RunContext, task: dict[str, Any]) -> tuple[int, str]:
         """执行单元 = 生成代码 → 子进程执行 → Inspector 审核 → 两阶段提交 → Visualizer。"""
@@ -188,6 +281,37 @@ class Orchestrator:
             reply = self.agents["executor"].run(ctx, message)
             result = json.loads(reply.content)
             ctx.results[task_id] = result
+            if result["status"] != "success" and ctx.replan_used < self._max_replan(ctx):
+                # v1.2 recall 回退：记忆回答失败 → 一次正常重规划（宁可多算不可答非所问）
+                ctx.replan_used += 1
+                payload = {
+                    "question": ctx.question,
+                    "failed_task": task,
+                    "missing_columns": [],
+                    "remaining_tasks": [],
+                    "disable_memory": True,
+                }
+                self._emit(
+                    {"type": "error_routed", "task_id": task_id, "error_class": "MEMORY_FALLBACK", "action": "replan"}
+                )
+                reply = self.agents["planner"].run(
+                    ctx,
+                    self._request(
+                        ctx,
+                        "planner",
+                        "replan_request",
+                        json.dumps(payload, ensure_ascii=False),
+                    ),
+                )
+                if reply.kind == "revised_task_list":
+                    revised = json.loads(reply.content).get("tasks") or []
+                    if revised:
+                        new_task = {**revised[0], "task_id": task_id}
+                        message = self._request(
+                            ctx, "executor", "execute_task", json.dumps(new_task, ensure_ascii=False)
+                        )
+                        result = json.loads(self.agents["executor"].run(ctx, message).content)
+                        ctx.results[task_id] = result
             if result["status"] == "success":
                 self._commit(ctx, task_id)
                 ctx.figures[task_id] = {
@@ -262,6 +386,10 @@ class Orchestrator:
         states = ctx.task_states
         tasks = (ctx.task_list or {}).get("tasks", [])
         failed = [tid for tid, state in states.items() if state in ("FAILED", "SKIPPED")]
+        if ctx.wall_clock_timeout:
+            # v1.2：墙钟超时属于运行级降级（恢复与回滚设计 §4.2）
+            ctx.degraded_reason = "wall_clock_timeout"
+            return "degraded", True, self._failure_info(ctx, failed)
         if not failed:
             ctx.degraded_reason = None
             return "success", False, None
@@ -275,7 +403,10 @@ class Orchestrator:
         return "partial", False, None
 
     def _is_critical_failure(self, ctx: RunContext, failed: list[int]) -> bool:
-        """关键失败：关闭部分结果时；或用户问题中明确提到的字段缺失（如 TC-03）。"""
+        """关键失败：关闭部分结果时；或用户问题中明确提到的字段缺失（如 TC-03）。
+
+        v1.2：优先消费结构化 missing_columns 字段，不再从 error 文本反解析。
+        """
         allow_partial = bool(
             ctx.config.get("execution", {}).get("allow_partial_results", True)
         )
@@ -285,12 +416,14 @@ class Orchestrator:
             result = ctx.results.get(tid, {})
             if result.get("error_class") != "MISSING_COLUMN":
                 continue
-            # 提取错误信息中引号内的疑似列名，判断是否出现在用户问题中（如 TC-03 的"利润"）
-            missing_names = {
-                name
-                for name in re.findall(r"['\"]([^'\"]{1,20})['\"]", result.get("error", ""))
-                if name
-            }
+            missing_names = set(result.get("missing_columns") or [])
+            if not missing_names:
+                # 兼容无结构化字段的旧结果
+                missing_names = {
+                    name
+                    for name in re.findall(r"['\"]([^'\"]{1,20})['\"]", result.get("error", ""))
+                    if name
+                }
             if any(name in ctx.question for name in missing_names):
                 return True
         return False
@@ -330,6 +463,7 @@ class Orchestrator:
                 "degraded": degraded,
                 "partial": partial,
                 "failure_info": failure_info,
+                "clarify": ctx.clarify,
             },
             ensure_ascii=False,
         )
@@ -419,6 +553,9 @@ class Orchestrator:
             "status": status,
             "duration_seconds": duration,
             "llm_calls": getattr(ctx.budget, "used", 0),
+            "token_usage": getattr(ctx.budget, "token_stats", None),
+            "replan_used": ctx.replan_used,
+            "clarify": ctx.clarify,
             "task_states": ctx.task_states,
             "degraded_reason": ctx.degraded_reason,
             "chart_success": chart_success if chart_attempted else None,
@@ -460,13 +597,14 @@ class Orchestrator:
             content=content,
         )
         if ctx.transcript is not None:
+            # v1.2：transcript 全量记录（事实层，不进 prompt），不再截断
             ctx.transcript.write(
                 {
                     "run_id": ctx.run_id,
                     "sender": "orchestrator",
                     "receiver": receiver,
                     "kind": kind,
-                    "content": content[:1000],
+                    "content": content,
                 }
             )
         self._emit(

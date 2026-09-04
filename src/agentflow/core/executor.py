@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 
-# 静态预扫描拒绝的高风险模式（安全与隔离设计 §5.1）
+# 静态预扫描拒绝的高风险模式（安全与隔离设计 §5.1，v1.2 增补写逃逸与相对路径逃逸）
+_WRITE_TO_PATTERN = r"\.\s*(?:to_csv|to_excel|to_parquet|to_pickle|to_sql|to_json)\s*\("
 FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     (r"\bos\.system\s*\(", "os.system"),
     (r"\bsubprocess\b", "subprocess"),
@@ -25,6 +26,10 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     (r"\burllib\.request\b", "urllib.request"),
     (r"\bopen\s*\(\s*['\"][A-Za-z]:", "open(绝对路径)"),
     (r"\bopen\s*\(\s*['\"]/", "open(绝对路径)"),
+    (r"\bopen\s*\(\s*['\"][^'\"]*\.\.", "open(相对路径逃逸)"),
+    (_WRITE_TO_PATTERN + r"\s*['\"][A-Za-z]:", "to_csv(绝对路径写出)"),
+    (_WRITE_TO_PATTERN + r"\s*['\"]/", "to_csv(绝对路径写出)"),
+    (_WRITE_TO_PATTERN + r"\s*['\"][^'\"]*\.\.", "to_csv(相对路径逃逸)"),
 ]
 
 

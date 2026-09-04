@@ -50,3 +50,38 @@ class AgentMessage:
             artifacts=data.get("artifacts", []),
             created_at=data.get("created_at", ""),
         )
+
+
+@dataclass
+class HistoryEntry:
+    role: str
+    content: str
+    kind: str = ""
+
+
+class MessageHistory:
+    """L1 有界消息历史（上下文与记忆设计 §2）。
+
+    规则：append 追加；bounded(limit) 保留最新消息、先丢最旧的 tool/assistant 轮次；
+    to_llm_messages() 输出 OpenAI 格式。多轮自愈/重试的历史长度由此封顶。
+    """
+
+    def __init__(self, limit: int = 8) -> None:
+        self.limit = max(2, int(limit))
+        self.entries: list[HistoryEntry] = []
+
+    def append(self, role: str, content: str, kind: str = "") -> None:
+        self.entries.append(HistoryEntry(role=role, content=content, kind=kind))
+
+    def bounded(self) -> list[HistoryEntry]:
+        """按上限截断：保留最新的 limit 条；system 类消息不因截断丢失（由调用方在首条固定）。"""
+        if len(self.entries) <= self.limit:
+            return list(self.entries)
+        tail = self.entries[-self.limit :]
+        # 尽量保证截断边界落在 user 消息上（成对丢弃 assistant+user 轮次）
+        while tail and tail[0].role == "assistant" and len(tail) > 2:
+            tail = tail[1:]
+        return tail
+
+    def to_llm_messages(self) -> list[dict[str, str]]:
+        return [{"role": entry.role, "content": entry.content} for entry in self.bounded()]

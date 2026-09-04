@@ -54,6 +54,7 @@ class CriticAgent(BaseAgent):
             report_text = ctx.ensure_within(report_path).read_text(encoding="utf-8")
         except Exception:
             issues.append({"severity": "high", "section": "整体", "message": "报告无法读取"})
+        llm_unavailable = False
         try:
             llm_review = self.complete_structured(
                 ctx,
@@ -66,8 +67,18 @@ class CriticAgent(BaseAgent):
             )
         except Exception:
             llm_review = Review(verdict="PASS", rounds=1, issues=[])
+            llm_unavailable = True
 
         all_issues = issues + [issue.model_dump() for issue in llm_review.issues]
+        if llm_unavailable:
+            # v1.2：fail-open 的降级必须留痕，否则评估数据无法区分"通过"与"评审没跑成"
+            all_issues.append(
+                {
+                    "severity": "low",
+                    "section": "评审",
+                    "message": "LLM 语义评审不可用，本次仅完成确定性检查",
+                }
+            )
         verdict = "FAIL" if (all_issues or llm_review.verdict == "FAIL") else "PASS"
         review = Review(
             verdict=verdict,

@@ -61,11 +61,14 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
     """按 Agent 配置覆盖模型（真实模式下为每个 Agent 克隆一个带指定模型的客户端）。"""
     model = agent_cfg.get("model")
     if model and isinstance(llm, OpenAILLM):
-        return OpenAILLM(
+        clone = OpenAILLM(
             api_key=llm.api_key,
             base_url=llm.base_url,
             model=model,
+            max_retries=llm.max_retries,
         )
+        clone.budget = llm.budget
+        return clone
     return llm
 
 
@@ -81,7 +84,7 @@ def run_analysis(
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。"""
     config = load_config(config_path)
-    registry = build_default_registry()
+    registry = build_default_registry(config)
     if llm is None:
         llm_cfg = config.get("llm", {})
         llm = (
@@ -106,6 +109,7 @@ def run_analysis(
         session = SessionContext(session_id=session_id, session_dir=session_dir)
 
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
+    llm.budget = budget  # v1.2：预算计数点下沉到 LLM 层（每次真实 API 调用计 1）
     agents = build_agents(llm, registry, config, budget)
     orchestrator = Orchestrator(
         config=config,

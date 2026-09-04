@@ -1,10 +1,13 @@
-"""LLM 接入层：OpenAI 兼容客户端 + MockLLM 离线模式 + 结构化输出校验。"""
+"""LLM 接入层：OpenAI 兼容客户端（退避重试 + usage 核算）+ MockLLM 离线模式 + 结构化输出校验。"""
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -14,7 +17,7 @@ from pydantic import BaseModel
 
 
 class LLMError(RuntimeError):
-    """LLM 调用失败（网络 / 鉴权 / 响应结构异常）。"""
+    """LLM 调用失败（网络 / 鉴权 / 响应结构异常 / 预算耗尽）。"""
 
 
 class OutputValidationError(RuntimeError):
@@ -57,7 +60,18 @@ def extract_json(text: str) -> Any:
 
 
 class BaseLLM(ABC):
-    """LLM 统一接口。"""
+    """LLM 统一接口。
+
+    v1.2：预算计数点在每次真实 API 调用上——complete_structured 的内部校验重试、
+    Summarizer、重规划等所有路径都会经过 _spend()，"30 次硬预算"不再被低估。
+    """
+
+    budget: Any = None  # BudgetCounter（由 pipeline 注入）
+    agent_local = threading.local()  # 线程本地 agent 名（用于 usage 归因）
+
+    def _spend(self) -> None:
+        if self.budget is not None and not self.budget.spend():
+            raise LLMError(f"LLM 调用预算耗尽（上限 {self.budget.limit} 次）")
 
     @abstractmethod
     def complete(
@@ -82,6 +96,7 @@ class BaseLLM(ABC):
         last_error: Exception | None = None
         current_messages = list(messages)
         for _ in range(max_retries + 1):
+            self._spend()
             raw = self.complete(
                 system=system,
                 messages=current_messages,
@@ -106,7 +121,12 @@ class BaseLLM(ABC):
 
 
 class OpenAILLM(BaseLLM):
-    """OpenAI 兼容 Chat Completions 客户端（标准库实现，零重依赖）。"""
+    """OpenAI 兼容 Chat Completions 客户端（标准库实现，零重依赖）。
+
+    v1.2：429/5xx/网络超时传输层退避重试（尊重 Retry-After）；采集 usage token 计入预算。
+    """
+
+    RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
     def __init__(
         self,
@@ -114,6 +134,7 @@ class OpenAILLM(BaseLLM):
         base_url: str | None = None,
         model: str | None = None,
         timeout: int = 120,
+        max_retries: int = 2,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -123,6 +144,7 @@ class OpenAILLM(BaseLLM):
         ).rstrip("/")
         self.model = model or os.getenv("LLM_MODEL") or "gpt-4o-mini"
         self.timeout = timeout
+        self.max_retries = int(os.getenv("LLM_MAX_RETRIES", str(max_retries)))
 
     def complete(
         self,
@@ -146,20 +168,47 @@ class OpenAILLM(BaseLLM):
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "ignore")[:500]
-            raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise LLMError(f"LLM 网络错误: {exc.reason}") from exc
-        except (TimeoutError, OSError) as exc:
-            raise LLMError(f"LLM 网络超时或连接失败: {exc}") from exc
+        attempt = 0
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "ignore")[:500]
+                if exc.code in self.RETRYABLE_CODES and attempt < self.max_retries:
+                    time.sleep(self._backoff(attempt, exc.headers.get("Retry-After")))
+                    attempt += 1
+                    continue
+                raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < self.max_retries:
+                    time.sleep(self._backoff(attempt, None))
+                    attempt += 1
+                    continue
+                raise LLMError(f"LLM 网络错误或超时: {exc}") from exc
+        usage = data.get("usage") or {}
+        if usage and self.budget is not None:
+            agent = getattr(self.agent_local, "agent", "unknown")
+            self.budget.add_tokens(
+                agent,
+                int(usage.get("prompt_tokens", 0) or 0),
+                int(usage.get("completion_tokens", 0) or 0),
+            )
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"LLM 响应结构异常: {data}") from exc
+
+    @staticmethod
+    def _backoff(attempt: int, retry_after: str | None) -> float:
+        """指数退避 + 随机抖动；服务端给了 Retry-After 则尊重之。"""
+        if retry_after:
+            try:
+                return min(float(retry_after), 30.0)
+            except ValueError:
+                pass
+        return min(2**attempt, 8) + random.uniform(0, 0.5)
 
 
 class MockLLM(BaseLLM):

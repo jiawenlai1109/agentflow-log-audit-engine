@@ -60,6 +60,12 @@ class VisualizerAgent(BaseAgent):
                 self.name,
                 "execute_python",
                 ctx,
+                _scope={
+                    "task_id": task_id,
+                    "grants": [result["intermediate_file"]]
+                    if result.get("intermediate_file")
+                    else [],
+                },
                 code=code,
                 work_dir=ctx.task_work_dir(task_id),
                 timeout=self._timeout(ctx),
@@ -95,6 +101,16 @@ class VisualizerAgent(BaseAgent):
 
     # ------------------------------------------------------------ helpers
     def _decide_chart_type(self, task: dict[str, Any], result: dict[str, Any], ctx: Any) -> str:
+        # 约束一等公民（v1.2）：UserConstraints 的 display 图表偏好覆盖默认选图规则
+        constraints = getattr(ctx, "constraints", None) or {}
+        for pref in constraints.get("display") or []:
+            text = str(pref)
+            if any(k in text for k in ("柱状", "柱形", "bar")):
+                return "bar"
+            if any(k in text for k in ("折线", "line", "走势图")):
+                return "line"
+            if any(k in text for k in ("饼图", "pie")):
+                return "pie"
         suggested = task.get("chart_type") or ""
         if suggested and suggested != "none":
             return suggested

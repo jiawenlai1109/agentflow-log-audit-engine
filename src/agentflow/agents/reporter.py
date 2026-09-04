@@ -70,6 +70,10 @@ class ReporterAgent(BaseAgent):
         partial = bool(data.get("partial", False))
         failure_info = data.get("failure_info")
         time_base = data.get("time_base")
+        # v1.2：评审问题清单（重写回流契约）、澄清请求、用户展示约束
+        review_issues = data.get("review_issues") or []
+        clarify = data.get("clarify")
+        constraints = getattr(ctx, "constraints", None)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         report_path = ctx.outputs_dir / "report.md"
 
@@ -78,6 +82,13 @@ class ReporterAgent(BaseAgent):
                 timestamp=timestamp,
                 failure_info=failure_info or {"error": "未知错误", "error_class": "UNKNOWN", "suggestion": ""},
             )
+            if clarify:
+                # 澄清建议写入降级报告（v1.2：给用户可行动的下一步）
+                text += (
+                    f"\n**建议下一步**：{clarify.get('question', '')}"
+                    + (f"（{clarify.get('suggestion', '')}）" if clarify.get("suggestion") else "")
+                    + "\n"
+                )
             report_path.write_text(text, encoding="utf-8")
             result = ReportResult(
                 report_path=str(report_path),
@@ -104,20 +115,35 @@ class ReporterAgent(BaseAgent):
             for fig in figures.values()
             if fig.get("file_path")
         ]
-        try:
-            narrative = self.complete(
-                ctx,
-                (
-                    f"用户问题：{question}\n"
-                    f"关键数字：{numbers}\n"
-                    f"数据明细：\n{detail}\n"
-                    "请输出三段叙述，分别以【总体概况】【趋势分析】【结论建议】开头。"
-                ),
+        prompt_parts = [
+            f"用户问题：{question}",
+            f"关键数字：{numbers}",
+            f"数据明细：\n{detail}",
+        ]
+        if constraints:
+            # 约束一等公民（v1.2）：display 类约束直接进入叙述 prompt
+            prompt_parts.append(
+                f"用户展示约束（必须遵守）：{json.dumps(constraints, ensure_ascii=False)}"
             )
+        if review_issues:
+            # 评审-重写回流契约（v1.2）：issues 必须进入重写 prompt，否则是盲改
+            prompt_parts.append(
+                "评审问题清单（必须逐条在叙述中解决）："
+                + json.dumps(review_issues, ensure_ascii=False)
+            )
+        prompt_parts.append("请输出三段叙述，分别以【总体概况】【趋势分析】【结论建议】开头。")
+        try:
+            narrative = self.complete(ctx, "\n".join(prompt_parts))
         except LLMError:
             narrative = "【总体概况】本次分析已完成。\n【趋势分析】趋势请结合图表查看。\n【结论建议】建议关注表格中的关键指标。"
 
         overview, trend, conclusion = self._split_narrative(narrative)
+        if clarify:
+            # 澄清环（v1.2）：非阻塞澄清写入"结论与建议"
+            conclusion += (
+                f"\n\n> **建议下一步**：{clarify.get('question', '')}"
+                + (f"（{clarify.get('suggestion', '')}）" if clarify.get("suggestion") else "")
+            )
         if partial:
             failed_tasks = [
                 f"任务 {tid}"

@@ -22,6 +22,7 @@ class TaskExecutionResult(BaseModel):
     status: Literal["success", "failed"]
     error: str | None = None
     error_class: ErrorClass | None = None
+    missing_columns: list[str] = []
     summary: dict | None = None
     intermediate_file: str | None = None
     duration_seconds: float = 0.0

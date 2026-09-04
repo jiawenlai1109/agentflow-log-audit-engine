@@ -18,3 +18,4 @@ class Verdict(BaseModel):
     status: Literal["PASS", "WARN", "FAIL"]
     checks: list[CheckResult] = []
     suggestion: str | None = None
+    verification: Literal["ok", "skipped"] | None = None

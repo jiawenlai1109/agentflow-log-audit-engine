@@ -1,26 +1,37 @@
-"""PlannerAgent：数据分析规划师（Plan-and-Execute 的 Plan 阶段）。"""
+"""PlannerAgent：数据分析规划师（Plan-and-Execute 的 Plan 阶段 + 重规划环/澄清）。"""
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.core.llm import MockLLM
-from agentflow.core.memory import build_turn_view, is_recall_question, render_summary_text
+from agentflow.core.memory import (
+    build_turn_view,
+    is_recall_question,
+    render_summary_text,
+    score_turn,
+)
 from agentflow.core.messages import AgentMessage
+from agentflow.schemas.clarify import ClarifyRequest
 from agentflow.schemas.plan import TaskList
 
 
 PLANNER_SYSTEM = """你是一位资深的数据分析规划师。把用户的业务问题拆解为 1~5 个结构化子任务。
 输出必须是合法 JSON，结构为：
-{"question": "...", "time_base": {...} 或 null, "tasks": [
-  {"task_id": 1, "description": "...", "required_columns": ["..."], "code_hint": "...", "chart_type": "none|line|bar|pie|hist", "depends_on": []}
+{"question": "...", "time_base": {...} 或 null,
+ "constraints": {"time_scope": null 或 "时间范围约束", "display": ["展示约束"], "scope": ["范围约束"], "custom": ["口径约定"]} 或 null,
+ "tasks": [
+  {"task_id": 1, "description": "...", "required_columns": ["..."], "code_hint": "...", "chart_type": "none|line|bar|pie|hist", "depends_on": [], "upstream_refs": []}
 ]}
 规则：
 - required_columns 必须来自"可用列"，不得臆造列名；
 - task_id 从 1 递增；depends_on 为空表示无依赖（可并行），只能引用更小的 task_id；
+- upstream_refs 只能引用 depends_on 中任务的产物（artifacts/step_<task_id>_result.json），供下游任务消费上游结果；
+- 从问题与会话记忆中抽取用户约束写入 constraints（抽不到就为 null，禁止臆造）；
 - 相对时间（最近7天/上周）在 time_base 中注明以数据集最大日期为基准；
 - 业务常识提示：退款/退货通常表现为金额为负的记录，涉及"退款金额/退货"的问题应先筛选负值记录再按类别汇总。"""
 
@@ -32,11 +43,19 @@ class PlannerAgent(BaseAgent):
     METRIC_KEYWORDS = ("利润", "利润率", "销售额", "销量")
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
+        if message.kind == "replan_request":
+            return self._replan(ctx, message)
         question = message.content
         schema = ctx.schema_profile or {}
         columns = [col["name"] for col in schema.get("columns", [])]
         turns = ctx.session.read_turns() if ctx.session else []
-        recall = is_recall_question(question) and bool(turns)
+        # recall 回退（v1.2）：回忆词命中只是必要条件，还需历史轮次与问题有相关性——
+        # 防"前面三种商品的对比"这类误伤；误判方向不对称，宁可多算不可答非所问
+        recall = (
+            is_recall_question(question)
+            and bool(turns)
+            and any(score_turn(turn, question) > 0 for turn in turns)
+        )
         session_memory = self._load_session_memory(ctx, question)
 
         if isinstance(self.llm, MockLLM):
@@ -44,6 +63,10 @@ class PlannerAgent(BaseAgent):
         else:
             task_list = self._llm_plan(ctx, question, columns, session_memory, recall=recall)
 
+        constraints = task_list.get("constraints")
+        if constraints:
+            # 约束一等公民（v1.2）：写入 RunContext，由 Orchestrator 注入下游全部 Agent
+            ctx.constraints = constraints
         plan_path = ctx.outputs_dir / "plan.json"
         plan_path.write_text(json.dumps(task_list, ensure_ascii=False), encoding="utf-8")
         return self.reply(
@@ -53,6 +76,123 @@ class PlannerAgent(BaseAgent):
             content=json.dumps(task_list, ensure_ascii=False),
             artifacts=[str(plan_path)],
         )
+
+    # ------------------------------------------------------------ 重规划环 / 澄清（v1.2）
+    def _replan(self, ctx: Any, message: AgentMessage) -> AgentMessage:
+        """错误路由（MISSING_COLUMN / memory 回退）到规划层：增量修订剩余任务，不可修订则澄清。"""
+        data = json.loads(message.content)
+        question = data.get("question", "")
+        schema = ctx.schema_profile or {}
+        columns = [col["name"] for col in schema.get("columns", [])]
+        missing = data.get("missing_columns") or []
+        remaining = data.get("remaining_tasks") or []
+        disable_memory = bool(data.get("disable_memory"))
+        failed_desc = str((data.get("failed_task") or {}).get("description", ""))
+
+        if isinstance(self.llm, MockLLM):
+            revised = self._mock_replan(question, schema, remaining, missing, disable_memory)
+        else:
+            revised = self._llm_replan(
+                ctx, question, columns, missing, failed_desc, remaining, disable_memory
+            )
+
+        if not revised:
+            clarify = ClarifyRequest(
+                reason="missing_column" if missing else "unrecoverable_plan",
+                missing_columns=missing,
+                question=(
+                    f"数据中缺少字段：{'、'.join(missing)}，且无语义等价列可替代。"
+                    if missing
+                    else "当前计划无法继续执行。"
+                )
+                + "是否改为分析其他可用指标？",
+                options=["改为分析现有可用字段", "仅说明问题并结束"],
+                suggestion="如需该字段分析，请上传包含相应列的数据集",
+            )
+            return self.reply(
+                ctx, "orchestrator", "clarify_request", clarify.model_dump_json()
+            )
+
+        revised = self._renumber(revised)
+        return self.reply(
+            ctx,
+            receiver="orchestrator",
+            kind="revised_task_list",
+            content=json.dumps(revised, ensure_ascii=False),
+        )
+
+    def _mock_replan(
+        self,
+        question: str,
+        schema: dict[str, Any],
+        remaining: list[dict[str, Any]],
+        missing: list[str],
+        disable_memory: bool,
+    ) -> list[dict[str, Any]] | None:
+        """确定性修订：丢弃依赖缺失列的任务；其余保持原样（等 orchestrator 重新派发）。"""
+        columns = {col["name"] for col in schema.get("columns", [])}
+        survivors: list[dict[str, Any]] = []
+        for task in remaining:
+            if disable_memory and task.get("code_hint") == "memory_answer":
+                continue
+            required = task.get("required_columns") or []
+            if missing and any(col in missing for col in required):
+                continue
+            if required and not all(col in columns for col in required):
+                continue
+            survivors.append(task)
+        return survivors or None
+
+    def _llm_replan(
+        self,
+        ctx: Any,
+        question: str,
+        columns: list[str],
+        missing: list[str],
+        failed_desc: str,
+        remaining: list[dict[str, Any]],
+        disable_memory: bool,
+    ) -> list[dict[str, Any]] | None:
+        extra = (
+            "\n注意：不要输出记忆回答任务（code_hint=memory_answer），请按正常数据计算重新规划。"
+            if disable_memory
+            else ""
+        )
+        user_content = (
+            f"用户问题：{question}\n"
+            f"可用列：{columns}\n"
+            f"失败任务：{failed_desc}（缺失字段：{missing}）\n"
+            f"剩余未执行任务：{json.dumps(remaining, ensure_ascii=False)}\n"
+            "请修订剩余任务：只允许修改或删除未执行任务，不得重复已完成的任务；"
+            "可为缺失字段寻找语义等价列，或把分析目标调整为现有数据可回答的形式。"
+            "输出修订后的任务清单 JSON（task_id 从 1 递增）；若无可行修订，输出 {\"tasks\": []}。"
+            + extra
+        )
+        try:
+            task_list = self.complete_structured(ctx, schema=TaskList, user_content=user_content)
+            return [task.model_dump() for task in task_list.tasks] or None
+        except Exception:  # noqa: BLE001 - 修订失败退化为确定性修订
+            schema = ctx.schema_profile or {}
+            return self._mock_replan(question, schema, remaining, missing, disable_memory)
+
+    @staticmethod
+    def _renumber(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        """重新编号为 1..N 连续，清理指向已删除任务的依赖与上游引用。"""
+        kept = [dict(task) for task in tasks]
+        kept.sort(key=lambda task: int(task.get("task_id", 0)))
+        old_to_new: dict[int, int] = {}
+        for new_id, task in enumerate(kept, start=1):
+            old_to_new[int(task.get("task_id", 0))] = new_id
+            task["task_id"] = new_id
+        for task in kept:
+            new_deps = [old_to_new[d] for d in task.get("depends_on", []) if d in old_to_new]
+            task["depends_on"] = new_deps
+            old_refs = task.get("upstream_refs") or []
+            task["upstream_refs"] = [
+                ref for ref in old_refs if int(re.search(r"step_(\d+)_", ref).group(1)) in old_to_new
+            ] if old_refs else []
+        return {"tasks": kept}
+
 
     # ------------------------------------------------------------ mock 模式
     def _mock_plan(

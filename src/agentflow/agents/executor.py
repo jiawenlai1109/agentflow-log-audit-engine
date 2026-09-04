@@ -49,17 +49,24 @@ class ExecutorAgent(BaseAgent):
         )
         if is_memory:
             return self._answer_from_memory(ctx, task_id, work_dir)
-        messages = [{"role": "user", "content": self._task_prompt(ctx, task)}]
+
+        upstream = self._upstream_grants(ctx, task)
+        history = self.new_history()
+        history.append("user", self._task_prompt(ctx, task))
         result: TaskExecutionResult | None = None
         last_outcome: Any = None
         last_error_text: str | None = None
         max_attempts = int(
             ctx.config.get("execution", {}).get("max_executor_attempts", 3)
         )
+        timeout_seconds = self._task_timeout(ctx)
+        bumped_timeout = False
 
         for attempt in range(1, max_attempts + 1):
             try:
-                code = self.complete(ctx, self._task_prompt(ctx, task), messages=messages)
+                code = self.complete(
+                    ctx, self._task_prompt(ctx, task), messages=history.to_llm_messages()
+                )
             except LLMError as exc:
                 result = TaskExecutionResult(
                     task_id=task_id,
@@ -75,12 +82,14 @@ class ExecutorAgent(BaseAgent):
                 self.name,
                 "execute_python",
                 ctx,
+                _scope={"task_id": task_id, "grants": upstream["grants"]},
                 code=code,
                 work_dir=work_dir,
-                timeout=self._task_timeout(ctx),
+                timeout=timeout_seconds,
                 env={
                     "DATA_PATH": ctx.data_path,
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),
+                    **upstream["env"],
                 },
             )
             if outcome.success:
@@ -88,16 +97,14 @@ class ExecutorAgent(BaseAgent):
                 if summary and summary.get("error"):
                     # 代码把错误写进结果 JSON 伪装成功：按失败处理进入自愈
                     last_error_text = str(summary["error"])[:500]
-                    messages += [
-                        {"role": "assistant", "content": code},
-                        {
-                            "role": "user",
-                            "content": (
-                                f"执行结果包含错误（第 {attempt} 次）：{last_error_text}\n"
-                                "请修正代码后重新输出纯 Python 代码，注意让错误自然抛出或显式非零退出。"
-                            ),
-                        },
-                    ]
+                    history.append("assistant", code)
+                    history.append(
+                        "user",
+                        (
+                            f"执行结果包含错误（第 {attempt} 次）：{last_error_text}\n"
+                            "请修正代码后重新输出纯 Python 代码，注意让错误自然抛出或显式非零退出。"
+                        ),
+                    )
                     continue
                 result = TaskExecutionResult(
                     task_id=task_id,
@@ -107,23 +114,35 @@ class ExecutorAgent(BaseAgent):
                     attempts=attempt,
                 )
                 break
-            messages += [
-                {"role": "assistant", "content": code},
-                {
-                    "role": "user",
-                    "content": f"执行失败（第 {attempt} 次）：\n{outcome.stderr[:2000]}\n请修正代码后重新输出纯 Python 代码。",
-                },
-            ]
+            # v1.2 错误路由（TIMEOUT → Executor 提档）：先翻倍超时重试一次，而非同超时盲目重试
+            if outcome.timed_out and not bumped_timeout:
+                bumped_timeout = True
+                timeout_seconds = min(timeout_seconds * 2, 120)
+            history.append("assistant", code)
+            history.append(
+                "user",
+                f"执行失败（第 {attempt} 次）：\n{outcome.stderr[:2000]}\n请修正代码后重新输出纯 Python 代码。",
+            )
             last_outcome = outcome
-        else:
-            error_class = self._classify_error(ctx, task, last_outcome)
+            # v1.2 错误路由：字段缺失是规划错误，改码自愈无解——首次分类即跳出，交 Orchestrator 路由
+            err_class, _ = self._classify_error(ctx, last_outcome)
+            if err_class == ErrorClass.MISSING_COLUMN:
+                break
+
+        if result is None:
+            outcome = last_outcome
+            error_class, missing = (
+                self._classify_error(ctx, outcome) if outcome else (ErrorClass.CODE_ERROR, [])
+            )
             result = TaskExecutionResult(
                 task_id=task_id,
                 status="failed",
                 # 取 stderr 末尾（真实异常通常在 traceback 尾部）
-                error=last_error_text or (last_outcome.stderr or "")[-500:],
+                error=last_error_text
+                or ((outcome.stderr or "")[-500:] if outcome else ""),
                 error_class=error_class,
-                duration_seconds=last_outcome.duration_seconds,
+                missing_columns=missing,
+                duration_seconds=outcome.duration_seconds if outcome else 0.0,
                 attempts=max_attempts,
                 suggestion=self._suggestion(error_class),
             )
@@ -204,14 +223,38 @@ class ExecutorAgent(BaseAgent):
 
     def _task_prompt(self, ctx: Any, task: dict[str, Any]) -> str:
         schema = ctx.schema_profile or {}
-        return (
-            f"任务：{task.get('description')}\n"
-            f"任务编号：{task.get('task_id')}\n"
-            f"必需列：{task.get('required_columns')}\n"
-            f"可用列：{[c['name'] for c in schema.get('columns', [])]}\n"
-            f"提示：{task.get('code_hint', '')}\n"
-            "请输出实现该任务的纯 Python 代码。"
-        )
+        parts = [
+            f"任务：{task.get('description')}",
+            f"任务编号：{task.get('task_id')}",
+            f"必需列：{task.get('required_columns')}",
+            f"可用列：{[c['name'] for c in schema.get('columns', [])]}",
+        ]
+        refs = task.get("upstream_refs") or []
+        if refs:
+            parts.append(
+                f"上游产物（经授权可读，绝对路径已注入环境变量 UPSTREAM_<任务号>_PATH）：{refs}"
+            )
+        constraints = getattr(ctx, "constraints", None)
+        if constraints:
+            parts.append(f"用户约束（必须遵守）：{json.dumps(constraints, ensure_ascii=False)}")
+        # 闭环回流契约（v1.2）：Inspector 的 suggestion 必须真实进入重做 prompt
+        if task.get("_redo_suggestion"):
+            parts.append(f"上轮审核未通过，审核建议：{task['_redo_suggestion']}")
+        parts.append(f"提示：{task.get('code_hint', '')}")
+        parts.append("请输出实现该任务的纯 Python 代码。")
+        return "\n".join(parts)
+
+    def _upstream_grants(self, ctx: Any, task: dict[str, Any]) -> dict[str, Any]:
+        """把任务声明的 upstream_refs 解析为授权清单（grants）与环境变量（依赖边=授权边）。"""
+        env: dict[str, str] = {}
+        grants: list[str] = []
+        for ref in task.get("upstream_refs") or []:
+            target = (ctx.outputs_dir / ref).resolve()
+            grants.append(str(target))
+            match = re.search(r"step_(\d+)_result", target.name)
+            if match:
+                env[f"UPSTREAM_{match.group(1)}_PATH"] = str(target)
+        return {"env": env, "grants": grants}
 
     def _parse_summary(self, stdout: str) -> dict[str, Any]:
         try:
@@ -225,16 +268,24 @@ class ExecutorAgent(BaseAgent):
     def _task_timeout(self, ctx: Any) -> int:
         return int(ctx.config.get("execution", {}).get("task_timeout_seconds", 30))
 
-    def _classify_error(self, ctx: Any, task: dict[str, Any], outcome: Any) -> ErrorClass:
-        stderr = (outcome.stderr or "").lower()
+    def _classify_error(self, ctx: Any, outcome: Any) -> tuple[ErrorClass, list[str]]:
+        """错误分类 + 结构化缺失列（v1.2：路由与澄清依赖结构化字段，不再反解析 error 文本）。"""
+        stderr = outcome.stderr or ""
+        lowered = stderr.lower()
         if outcome.timed_out:
-            return ErrorClass.TIMEOUT
+            return ErrorClass.TIMEOUT, []
         schema_cols = [c["name"] for c in (ctx.schema_profile or {}).get("columns", [])]
-        tokens = re.findall(r"['\"\[]([^'\"\]]{1,20})['\"\]]", outcome.stderr or "")
-        unknown = [t for t in tokens if t not in schema_cols]
-        if "keyerror" in stderr or "不存在" in stderr or "not in index" in stderr:
-            return ErrorClass.MISSING_COLUMN if unknown else ErrorClass.CODE_ERROR
-        return ErrorClass.CODE_ERROR
+        tokens = re.findall(r"['\"\[]([^'\"\]]{1,20})['\"\]]", stderr)
+        missing = [
+            token
+            for token in tokens
+            if token not in schema_cols and not token.strip().isdigit() and token.strip()
+        ]
+        if "keyerror" in lowered or "不存在" in lowered or "not in index" in lowered:
+            if missing:
+                return ErrorClass.MISSING_COLUMN, missing[:5]
+            return ErrorClass.CODE_ERROR, []
+        return ErrorClass.CODE_ERROR, []
 
     def _suggestion(self, error_class: ErrorClass) -> str:
         return {

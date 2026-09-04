@@ -1,4 +1,4 @@
-"""Planner → TaskList（结构化任务清单，含 depends_on）。"""
+"""Planner → TaskList（结构化任务清单，含 depends_on / upstream_refs / 约束）。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,15 @@ from pydantic import BaseModel, Field, field_validator
 ChartType = Literal["none", "line", "bar", "pie", "hist"]
 
 
+class UserConstraints(BaseModel):
+    """用户约束（一等公民）：Planner 抽取，Orchestrator 注入下游 Agent。"""
+
+    time_scope: str | None = None
+    display: list[str] = Field(default_factory=list)
+    scope: list[str] = Field(default_factory=list)
+    custom: list[str] = Field(default_factory=list)
+
+
 class Task(BaseModel):
     task_id: int = Field(ge=1)
     description: str
@@ -16,6 +25,7 @@ class Task(BaseModel):
     code_hint: str = ""
     chart_type: ChartType = "none"
     depends_on: list[int] = Field(default_factory=list)
+    upstream_refs: list[str] = Field(default_factory=list)
 
     @field_validator("depends_on")
     @classmethod
@@ -29,6 +39,7 @@ class Task(BaseModel):
 class TaskList(BaseModel):
     question: str
     time_base: dict | None = None
+    constraints: UserConstraints | None = None
     tasks: list[Task] = Field(min_length=1, max_length=5)
 
     @field_validator("tasks")
