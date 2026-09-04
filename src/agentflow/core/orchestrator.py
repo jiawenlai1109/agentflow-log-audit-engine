@@ -354,6 +354,16 @@ class Orchestrator:
             verdict = json.loads(self.agents["inspector"].run(ctx, verdict_msg).content)
             if verdict["status"] != "FAIL":
                 self._commit(ctx, task_id)
+                # 审核结论随结果留存：供 evaluation.json 统计校验覆盖率与重做率
+                ctx.results[task_id]["verdict"] = {
+                    "status": verdict["status"],
+                    "verification": verdict.get("verification"),
+                    "redos": redo - 1,
+                    "checks": [
+                        f"{check.get('rule')}:{check.get('level')}"
+                        for check in verdict.get("checks", [])
+                    ],
+                }
                 figure_msg = self._request(
                     ctx,
                     "visualizer",
