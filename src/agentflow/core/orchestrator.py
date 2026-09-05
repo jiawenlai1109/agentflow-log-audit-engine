@@ -451,10 +451,12 @@ class Orchestrator:
                 "suggestion": "请检查任务与数据",
             }
         first = failed_results[0]
+        # 字段兜底：real 模式 LLM 常把 error/suggestion 输出成 null，
+        # 直接透传会让 FailureInfo 的 pydantic 校验抛异常（把降级路径变成 run_error）
         return {
-            "error_class": first.get("error_class", "UNKNOWN"),
-            "error": first.get("error", "任务执行失败"),
-            "suggestion": first.get("suggestion", "请检查列名或数据源"),
+            "error_class": first.get("error_class") or "UNKNOWN",
+            "error": first.get("error") or "任务执行失败",
+            "suggestion": first.get("suggestion") or "请检查列名或数据源",
         }
 
     def _report(

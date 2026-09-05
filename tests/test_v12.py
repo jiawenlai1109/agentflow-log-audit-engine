@@ -160,3 +160,111 @@ def test_recall_guard_ignores_irrelevant_history(tmp_path):
     plan = json.loads(reply.content)
     assert plan["tasks"]
     assert plan["tasks"][0].get("code_hint") != "memory_answer"
+
+# ---------------------------------------------------------------- 校验器不得误判（real 批次回归）
+_SCHEMA = {
+    "columns": [
+        {"name": "订单日期", "dtype": "object"},
+        {"name": "产品类别", "dtype": "object"},
+        {"name": "销售额", "dtype": "float64"},
+        {"name": "销量", "dtype": "int64"},
+    ]
+}
+
+
+def _verify(task, reported, question):
+    from agentflow.core.verification import run_verification
+
+    return run_verification(
+        task={**task, "_question": question},
+        result={"summary": {"aggregate": reported}},
+        data_path=str(DATA_PROFIT),
+        schema_profile=_SCHEMA,
+    )
+
+
+def test_classify_prefers_count_over_sum_for_order_count():
+    """"一共有多少笔订单"含"总"字，但必须判为计数类（real 批次曾误判成 sum 导致假 FAIL）。"""
+    from agentflow.core.verification import classify_task
+
+    assert (
+        classify_task({"description": "统计一共有多少笔订单 一共有多少笔订单？", "code_hint": ""})
+        == "count"
+    )
+
+
+def test_verification_count_not_false_fail():
+    outcome = _verify(
+        {"description": "统计订单笔数", "code_hint": "count", "required_columns": []},
+        {"订单总数": 2000},
+        "一共有多少笔订单？",
+    )
+    assert outcome["status"] == "pass", outcome
+
+
+def test_verification_respects_time_window():
+    """趋势题：对照必须落在同一"最近7天"窗口内，否则会把正确结果判成不一致。"""
+    import pandas as pd
+
+    df = pd.read_csv(DATA_PROFIT)
+    df["订单日期"] = pd.to_datetime(df["订单日期"])
+    cutoff = df["订单日期"].max() - pd.Timedelta(days=6)
+    daily = (
+        df[df["订单日期"] >= cutoff]
+        .groupby(df[df["订单日期"] >= cutoff]["订单日期"].dt.date)["销售额"]
+        .sum()
+    )
+    outcome = _verify(
+        {
+            "description": "按日期聚合销售额趋势",
+            "code_hint": "按日期分组聚合",
+            "required_columns": ["订单日期", "销售额"],
+        },
+        {"合计_销售额": round(float(daily.sum()), 2), "记录条数": float(len(daily))},
+        "最近7天每日销售额的走势如何？",
+    )
+    assert outcome["status"] == "pass", outcome
+
+
+def test_verification_ignores_non_intersect_metrics():
+    """模板没算的指标（此处全列合计被故意写错）不参与对照，只比 Top1 相关项。"""
+    import pandas as pd
+
+    df = pd.read_csv(DATA_PROFIT)
+    top = df.groupby("产品类别")["销售额"].sum().sort_values(ascending=False)
+    outcome = _verify(
+        {
+            "description": "按类别对比销售额取Top",
+            "code_hint": "分组聚合",
+            "required_columns": ["产品类别", "销售额"],
+        },
+        {
+            "合计_销售额": 1.0,
+            "Top1_销售额": round(float(top.iloc[0]), 2),
+            "Top1_类别": str(top.index[0]),
+        },
+        "哪个产品类别卖得最好？",
+    )
+    assert outcome["status"] == "pass", outcome
+
+
+def test_verification_catches_real_mismatch():
+    """真错必须抓到：Top1 数值与独立重算不符 → fail。"""
+    outcome = _verify(
+        {
+            "description": "按类别对比销售额取Top",
+            "code_hint": "分组聚合",
+            "required_columns": ["产品类别", "销售额"],
+        },
+        {"Top1_销售额": 12345.67, "Top1_类别": "不存在的类别"},
+        "哪个产品类别卖得最好？",
+    )
+    assert outcome["status"] == "fail", outcome
+
+
+def test_parse_window_days():
+    from agentflow.core.verification import parse_window_days
+
+    assert parse_window_days("最近7天每日销售额走势") == 7
+    assert parse_window_days("近30天") == 30
+    assert parse_window_days("总销售额是多少") is None

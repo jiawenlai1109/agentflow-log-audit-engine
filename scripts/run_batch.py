@@ -20,6 +20,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from agentflow.core.config import load_dotenv  # noqa: E402
 from agentflow.pipeline import run_analysis  # noqa: E402
 
 DATA = PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"
@@ -40,8 +41,24 @@ def main() -> int:
     parser.add_argument("--name", default=None, help="批次名（默认含日期时间）")
     parser.add_argument("--outputs", default=None, help="批次产物目录（默认 outputs/batch_<ts>）")
     parser.add_argument("--mode", default="mock", choices=["mock", "real"])
+    parser.add_argument(
+        "--env-file", default=None, help="real 模式的 .env 路径（默认取脚本所在项目根的 .env）"
+    )
     parser.add_argument("--no-record", action="store_true", help="只跑不写评估记录")
     args = parser.parse_args()
+
+    if args.mode == "real":
+        env_path = Path(args.env_file) if args.env_file else PROJECT_ROOT / ".env"
+        if not env_path.exists():
+            print(f"real 模式需要 .env（含 OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）：{env_path} 不存在")
+            return 2
+        load_dotenv(env_path)
+        import os
+
+        if not os.getenv("OPENAI_API_KEY"):
+            print(f"{env_path} 中缺少 OPENAI_API_KEY")
+            return 2
+        print(f"LLM: {os.getenv('OPENAI_BASE_URL')} ｜ model: {os.getenv('LLM_MODEL')}")
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     batch_name = args.name or f"{time.strftime('%Y-%m-%d %H:%M')} {args.mode} 批次"

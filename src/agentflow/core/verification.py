@@ -1,8 +1,14 @@
 """独立校验模板（v1.2）：producer ≠ verifier。
 
-按任务类别（code_hint / description 关键词分类）生成确定性对照计算，在独立子进程
-重算关键指标，与 Executor 上报的 aggregate 容差比对（相对误差 ≤ 0.1%）。
-无模板覆盖的类别返回 skipped，计入评估指标"校验覆盖率"。
+按任务类别生成确定性对照代码，在独立子进程重算指标，与 Executor 上报的 aggregate
+按「指标族 + 列名」取交集比对（相对误差 ≤ 0.1%）。
+
+三条关键语义（都是 real 批次踩坑后固化的）：
+1. **只对照双方都算过的同一指标**：生产者常报不同命名/不同口径的指标，无交集 → skipped，
+   不计入失败，只计入"校验覆盖率"；
+2. **作用域多解**：任务是否受时间窗影响无法总是推断，因此模板同时给出"全量"和"最近 N 天"
+   两种口径，上报值命中任一即视为一致；两者都不命中才算真不一致；
+3. **不可复现的时间限定**（上周/本月/环比等未量化窗）→ 直接 skipped，不做猜测式判罚。
 """
 
 from __future__ import annotations
@@ -16,13 +22,41 @@ from typing import Any
 
 from agentflow.core.executor import LocalBackend
 
-# 校验模板覆盖的任务类别 → 生成对照代码所需的信息
+# 顺序敏感：更具体的类别先匹配。不用裸"多少"做计数线索（"总销售额是多少"是求和问句）
 CATEGORY_HINTS: dict[str, tuple[str, ...]] = {
-    "sum": ("总", "合计", "求和", "总额", "总销售额", "总利润"),
-    "count": ("多少笔", "笔数", "订单数", "多少条", "行数", "多少个"),
-    "date_trend": ("趋势", "走势", "每日", "按日期", "按天"),
-    "category_top": ("对比", "最高", "最好", "排名", "top", "前三", "前3", "哪个"),
+    "count": ("多少笔", "笔数", "订单数", "多少条", "行数", "多少个", "多少行", "条数", "count"),
+    "date_trend": ("趋势", "走势", "每日", "按日期", "按天", "日度"),
+    "category_top": ("对比", "最高", "最好", "排名", "top", "前三", "前3", "哪个", "排行"),
+    "sum": ("合计", "总", "求和", "总额", "累计", "sum"),
 }
+
+# 上报指标名 → 指标族（顺序敏感：先判计数/类别，避免"总数"被 sum 吞掉）
+_FAMILY_WORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("name", ("类别", "类目", "品类", "类型", "哪种", "哪个", "产品名")),
+    ("count", ("行数", "天数", "笔数", "条数", "个数", "订单数", "总数", "数量", "count")),
+    ("max", ("最高", "最大", "top1", "top", "峰值", "最多")),
+    ("min", ("最低", "最小", "谷值", "最少")),
+    ("sum", ("合计", "总额", "总量", "累计", "求和", "sum", "总")),
+]
+
+_FAMILY_TO_CATEGORY = {"sum": "sum", "count": "count", "max": "category_top", "name": "category_top"}
+
+_WINDOW_RE = re.compile(r"(?:最近|近|前|过去)?\s*(\d{1,3})\s*天")
+# 未量化的时间限定：模板无法确定同一作用域，放弃校验而不是猜
+_AMBIGUOUS_SCOPE_RE = re.compile(r"上周|本周|本月|上月|当周|当月|季度|环比|同比|工作日|周末")
+
+
+def parse_window_days(text: str) -> int | None:
+    """从文本解析"最近 N 天"（项目约定：以数据集最大日期为基准，见需求分析 §1.5）。"""
+    match = _WINDOW_RE.search(text or "")
+    if not match:
+        return None
+    days = int(match.group(1))
+    return days if 0 < days <= 3650 else None
+
+
+def has_ambiguous_scope(text: str) -> bool:
+    return bool(_AMBIGUOUS_SCOPE_RE.search(text or ""))
 
 
 def classify_task(task: dict[str, Any]) -> str | None:
@@ -36,122 +70,251 @@ def classify_task(task: dict[str, Any]) -> str | None:
     return None
 
 
-def _numeric_column(schema_profile: dict[str, Any], question: str, task: dict[str, Any]) -> str | None:
-    """选择对照计算用的数值列：优先问题中提到的指标词，其次任务必需列，再次首个数值列。"""
+def _parse_family(key: str) -> str | None:
+    lowered = str(key).lower()
+    for family, words in _FAMILY_WORDS:
+        if any(word in lowered for word in words):
+            return family
+    return None
+
+
+def _parse_column(key: str, columns: list[str]) -> str | None:
+    """从指标名解析它针对哪一列（优先长列名，避免短名误吞）。"""
+    text = str(key)
+    for col in sorted((c for c in columns if c and c in text), key=len, reverse=True):
+        return col
+    return None
+
+
+def _numeric_columns(schema_profile: dict[str, Any], question: str, task: dict[str, Any]) -> list[str]:
+    """对照计算可尝试的数值列顺序：问题提到的指标 → 任务必需列 → 其余数值列。"""
     columns = (schema_profile or {}).get("columns") or []
     numeric = [
-        c["name"]
+        str(c.get("name"))
         for c in columns
         if isinstance(c.get("dtype"), str) and ("int" in c["dtype"] or "float" in c["dtype"])
     ]
     for keyword in ("利润", "利润率", "销售额", "销量", "金额"):
         if keyword in question:
-            for name in numeric:
-                if keyword in name:
-                    return name
-    for col in task.get("required_columns") or []:
-        if col in numeric:
-            return col
-    return numeric[0] if numeric else None
+            exact = [name for name in numeric if name == keyword]
+            partial = [name for name in numeric if keyword in name]
+            if exact or partial:
+                return exact + partial + [n for n in numeric if n not in exact + partial]
+    ordered = [c for c in task.get("required_columns") or [] if c in numeric]
+    return ordered + [n for n in numeric if n not in ordered]
 
 
-def build_check_code(category: str, numeric_col: str | None) -> str | None:
-    """生成确定性对照代码（不接触 Executor 的代码与结果）。"""
-    col = numeric_col or "df.columns[0]"
-    if category == "sum":
-        return (
-            "import json, os\n"
-            "import pandas as pd\n"
-            "df = pd.read_csv(os.environ['DATA_PATH'])\n"
-            f"col = {col!r}\n"
-            "value = float(pd.to_numeric(df[col], errors='coerce').sum())\n"
-            "print(json.dumps({'aggregate': {'合计_' + col: value}, 'rows': int(len(df))}))\n"
-        )
-    if category == "count":
-        return (
-            "import json, os\n"
-            "import pandas as pd\n"
-            "df = pd.read_csv(os.environ['DATA_PATH'])\n"
-            "value = float(len(df))\n"
-            "print(json.dumps({'aggregate': {'总行数': value}, 'rows': int(len(df))}))\n"
-        )
-    if category == "date_trend":
-        return (
-            "import json, os\n"
-            "import pandas as pd\n"
-            "df = pd.read_csv(os.environ['DATA_PATH'])\n"
-            f"col = {col!r}\n"
-            "date_col = next((c for c in df.columns if any(k in str(c) for k in ('日期','date','时间'))), None)\n"
-            "if date_col is None:\n"
-            "    print(json.dumps({'skipped': True}))\n"
-            "else:\n"
-            "    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')\n"
-            "    agg = df.groupby(df[date_col].dt.date)[col].sum().sort_index()\n"
-            "    out = {'aggregate': {'合计_' + col: float(agg.sum()), '天数': float(len(agg))},"
-            " 'head': [{'日期': str(k), col: float(v)} for k, v in agg.tail(7).items()]}\n"
-            "    print(json.dumps(out))\n"
-        )
-    if category == "category_top":
-        return (
-            "import json, os\n"
-            "import pandas as pd\n"
-            "df = pd.read_csv(os.environ['DATA_PATH'])\n"
-            f"col = {col!r}\n"
-            "cat_cols = [c for c in df.select_dtypes(include=['object']).columns if c != col]\n"
-            "cat_cols = [c for c in cat_cols if not any(k in str(c) for k in ('日期','date','时间'))]\n"
-            "if not cat_cols:\n"
-            "    print(json.dumps({'skipped': True}))\n"
-            "else:\n"
-            "    agg = df.groupby(cat_cols[0])[col].sum().sort_values(ascending=False)\n"
-            "    top1_key = str(agg.index[0]); top1_value = float(agg.iloc[0])\n"
-            "    print(json.dumps({'aggregate': {'Top1类别': top1_key, 'Top1数值': top1_value}}))\n"
-        )
-    return None
-
-
-def _compare(reported: dict[str, Any], expected: dict[str, Any]) -> tuple[bool, str]:
-    """比对上报 aggregate 与重算 aggregate：对每个数值型重算键，找上报中容差匹配项。"""
-    matched = 0
-    checked = 0
-    for key, exp_value in expected.items():
-        if isinstance(exp_value, str):
-            # 类别型键（Top1类别）：要求上报中出现相同字符串值
-            if any(str(v) == exp_value for v in reported.values()):
-                matched += 1
-                checked += 1
-            continue
-        if not isinstance(exp_value, (int, float)) or isinstance(exp_value, bool):
-            continue
-        checked += 1
-        tol = max(1e-6, 0.001 * abs(float(exp_value)))
-        ok = any(
-            isinstance(v, (int, float))
-            and not isinstance(v, bool)
-            and math.isclose(float(v), float(exp_value), rel_tol=0.0, abs_tol=tol)
-            for v in reported.values()
-        )
-        if ok:
-            matched += 1
-    if checked == 0:
-        return False, "重算结果中没有可比对的数值指标"
-    if matched == checked:
-        return True, f"独立重算 {checked} 项指标全部与上报一致"
-    return False, f"独立重算仅 {matched}/{checked} 项与上报一致（容差 0.1%），疑似计算错误"
-
-
-def _column_from_reported_keys(
-    reported: dict[str, Any], schema_columns: list[dict[str, Any]]
-) -> str | None:
-    """从上报的指标名解析计算列（如 合计_销售额 → 销售额）。
-
-    校验模板应对照"生产者声称计算的指标"重算，而不是按用户问题猜列。
-    """
-    names = [str(c.get("name")) for c in schema_columns or []]
+def _column_from_reported_keys(reported: dict[str, Any], columns: list[str]) -> str | None:
+    """从上报指标名解析计算列（如 合计_销售额 → 销售额）：对照生产者声称算的是什么。"""
     for key in reported:
-        # 优先长列名匹配，避免"销售额"误吞"净利润销售额"之类
-        for col in sorted((n for n in names if n and n in str(key)), key=len, reverse=True):
+        col = _parse_column(key, columns)
+        if col:
             return col
     return None
+
+
+def build_check_code(category: str, columns: list[str], window: int | None = None) -> str | None:
+    """生成对照代码，输出 metrics=[{family, column, value, scope}]。
+
+    scope ∈ {"full", "window"}：同一指标给出口径变体，命中任一即视为一致。
+    """
+    col_list = repr(columns)
+    header = (
+        "import json, os\n"
+        "import pandas as pd\n"
+        "df = pd.read_csv(os.environ['DATA_PATH'])\n"
+        f"_COLS = {col_list}\n"
+        f"_WINDOW = {window!r}\n"
+        "def pick(cands):\n"
+        "    for c in cands:\n"
+        "        if c in df.columns:\n"
+        "            return c\n"
+        "    num = df.select_dtypes(include='number').columns.tolist()\n"
+        "    return num[0] if num else None\n"
+        "def dated(frame):\n"
+        "    dc = next((c for c in frame.columns if any(k in str(c) for k in ('日期','date','时间'))), None)\n"
+        "    if dc is None:\n"
+        "        return None, frame, dc\n"
+        "    parsed = pd.to_datetime(frame[dc], errors='coerce')\n"
+        "    if parsed.dropna().empty:\n"
+        "        return None, frame, dc\n"
+        "    return parsed, frame, dc\n"
+        "def windowed(frame, parsed):\n"
+        "    if parsed is None or not _WINDOW:\n"
+        "        return frame\n"
+        "    cutoff = parsed.max() - pd.Timedelta(days=_WINDOW - 1)\n"
+        "    out = frame[parsed >= cutoff]\n"
+        "    return out if len(out) else frame\n"
+        "metrics = []\n"
+        "_done = False\n"
+        "def add(family, column, value, scope):\n"
+        "    if value is None:\n"
+        "        return\n"
+        "    metrics.append({'family': family, 'column': column, 'value': float(value) if not isinstance(value, str) else value, 'scope': scope})\n"
+        "col = pick(_COLS)\n"
+        "if col is None:\n"
+        "    _done = True\n"
+        "    print(json.dumps({'skipped': True}))\n"
+    )
+    skip_stmts = (
+        "        _done = True\n"
+        "        print(json.dumps({'skipped': True}))\n"
+    )
+    body = {
+        "sum": (
+            "else:\n"
+            "    series = pd.to_numeric(df[col], errors='coerce')\n"
+            "    add('sum', col, series.sum(), 'full')\n"
+            "    parsed, frame, dc = dated(df)\n"
+            "    if _WINDOW:\n"
+            "        sub = windowed(df, parsed)\n"
+            "        add('sum', col, pd.to_numeric(sub[col], errors='coerce').sum(), 'window')\n"
+        ),
+        "count": (
+            "else:\n"
+            "    add('count', None, len(df), 'full')\n"
+            "    parsed, frame, dc = dated(df)\n"
+            "    if _WINDOW:\n"
+            "        add('count', None, len(windowed(df, parsed)), 'window')\n"
+        ),
+        "date_trend": (
+            "else:\n"
+            "    parsed, frame, dc = dated(df)\n"
+            "    if dc is None or parsed is None:\n"
+            + skip_stmts
+            + "    else:\n"
+            "        def agg_of(data):\n"
+            "            return data.groupby(pd.to_datetime(data[dc], errors='coerce').dt.date)[col].sum().dropna().sort_index()\n"
+            "        variants = [('full', df)]\n"
+            "        if _WINDOW:\n"
+            "            variants.append(('window', windowed(df, parsed)))\n"
+            "        for scope, sub in variants:\n"
+            "            agg = agg_of(sub)\n"
+            "            if agg.empty:\n"
+            "                continue\n"
+            "            if scope == 'window':\n"
+            "                agg = agg.tail(_WINDOW)\n"
+            "            add('sum', col, agg.sum(), scope)\n"
+            "            add('count', None, len(agg), scope)\n"
+            "            add('max', col, agg.max(), scope)\n"
+            "            add('min', col, agg.min(), scope)\n"
+        ),
+        "category_top": (
+            "else:\n"
+            "    cats = [c for c in df.select_dtypes(include=['object']).columns\n"
+            "            if c != col and not any(k in str(c) for k in ('日期','date','时间'))]\n"
+            "    if not cats:\n"
+            + skip_stmts
+            + "    else:\n"
+            "        parsed, frame, dc = dated(df)\n"
+            "        variants = [('full', df)]\n"
+            "        if _WINDOW:\n"
+            "            variants.append(('window', windowed(df, parsed)))\n"
+            "        for scope, sub in variants:\n"
+            "            agg = sub.groupby(cats[0])[col].sum().sort_values(ascending=False)\n"
+            "            if agg.empty:\n"
+            "                continue\n"
+            "            add('max', col, agg.iloc[0], scope)\n"
+            "            add('name', cats[0], str(agg.index[0]), scope)\n"
+        ),
+    }.get(category)
+    if body is None:
+        return None
+    tail = (
+        "if not _done:\n"
+        "    print(json.dumps({'metrics': metrics}) if metrics else json.dumps({'skipped': True}))\n"
+    )
+    return header + body + tail
+
+
+def _compare(
+    reported: dict[str, Any], metrics: list[dict[str, Any]], columns: list[str]
+) -> tuple[str, str, int]:
+    """按（指标族 + 列名）取交集比对，同族同列的任意口径变体命中即一致。
+
+    返回 (status, message, comparable)；comparable=0 表示无交集（不可判）。
+    """
+    comparable = 0
+    mismatches: list[str] = []
+    for key, value in reported.items():
+        is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        family = _parse_family(key)
+        if family is None:
+            continue
+        column = _parse_column(key, columns)
+        candidates = []
+        for metric in metrics:
+            if metric.get("family") != family:
+                continue
+            metric_column = metric.get("column")
+            if column and metric_column and column != metric_column:
+                continue
+            candidates.append(metric)
+        if not candidates:
+            continue
+        exp_numbers = [
+            m["value"] for m in candidates if isinstance(m.get("value"), (int, float)) and not isinstance(m.get("value"), bool)
+        ]
+        exp_strings = [m["value"] for m in candidates if isinstance(m.get("value"), str)]
+        if is_number and exp_numbers:
+            comparable += 1
+            ok = any(
+                math.isclose(float(value), float(exp), rel_tol=0.0, abs_tol=max(1e-6, 0.001 * abs(float(exp))))
+                for exp in exp_numbers
+            )
+            if not ok:
+                mismatches.append(f"{key}={value} 对照值={exp_numbers[:3]}")
+        elif (not is_number) and exp_strings:
+            comparable += 1
+            if not any(str(value).strip() == exp.strip() for exp in exp_strings):
+                mismatches.append(f"{key}={value} 对照值={exp_strings[:3]}")
+        # 类型不一致（如上报"最大日期"是字符串而模板只有数值）不参与对照
+    if comparable == 0:
+        return "skipped", "上报指标与对照模板无共同指标（命名/口径不同），无法独立校验", 0
+    if mismatches:
+        return (
+            "fail",
+            f"{len(mismatches)}/{comparable} 项指标与独立重算不一致：" + "；".join(mismatches[:3]),
+            comparable,
+        )
+    return "pass", f"独立重算 {comparable} 项可比指标全部与上报一致（容差 0.1%）", comparable
+
+
+def _candidate_categories(task: dict[str, Any], reported: dict[str, Any], question: str) -> list[str]:
+    """候选模板：描述+问题判定优先，上报指标族反推兜底（最多两个，控制开销）。"""
+    candidates: list[str] = []
+    primary = classify_task({**task, "description": f"{task.get('description', '')} {question}"})
+    if primary:
+        candidates.append(primary)
+    for key in reported:
+        mapped = _FAMILY_TO_CATEGORY.get(_parse_family(key) or "")
+        if mapped and mapped not in candidates:
+            candidates.append(mapped)
+    return candidates[:2]
+
+
+def _run_template(
+    category: str, columns: list[str], window: int | None, data_path: str
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """执行一个对照模板，返回 (metrics, 不可用原因)。"""
+    code = build_check_code(category, columns, window)
+    if code is None:
+        return None, "任务类别无校验模板覆盖"
+    work_dir = Path(tempfile.mkdtemp(prefix="verify_"))
+    outcome = LocalBackend().execute(
+        code, work_dir=work_dir, env={"DATA_PATH": str(data_path)}, timeout=60
+    )
+    if not outcome.success:
+        return None, f"校验模板执行失败：{(outcome.stderr or '')[-200:]}"
+    try:
+        start = outcome.stdout.index("{")
+        parsed = json.loads(outcome.stdout[start : outcome.stdout.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return None, "校验模板输出无法解析"
+    metrics = parsed.get("metrics") or []
+    if parsed.get("skipped") or not metrics:
+        return None, "数据缺少对照计算所需列"
+    return metrics, None
 
 
 def run_verification(
@@ -166,42 +329,32 @@ def run_verification(
     if not reported:
         return {"status": "skipped", "message": "结果未提供 aggregate，无可校验指标", "expected": None}
 
-    category = classify_task(task)
-    if category is None:
-        return {"status": "skipped", "message": "任务类别无校验模板覆盖", "expected": None}
-
     question = task.get("_question", "")
-    columns = (schema_profile or {}).get("columns") or []
-    numeric_col = _column_from_reported_keys(reported, columns) or _numeric_column(
-        schema_profile or {}, question, task
-    )
-    code = build_check_code(category, numeric_col)
-    if code is None:
+    task_text = f"{task.get('description', '')} {task.get('code_hint', '')}"
+    scope_text = f"{task_text} {question}"
+    # 未量化的时间限定（上周/环比…）无法确定同一作用域 → 放弃校验，不做猜测式判罚
+    if parse_window_days(scope_text) is None and has_ambiguous_scope(scope_text):
+        return {"status": "skipped", "message": "任务含未量化的时间限定，无法确定对照作用域", "expected": None}
+
+    candidates = _candidate_categories(task, reported, question)
+    if not candidates:
         return {"status": "skipped", "message": "任务类别无校验模板覆盖", "expected": None}
 
-    work_dir = Path(tempfile.mkdtemp(prefix="verify_"))
-    backend = LocalBackend()
-    outcome = backend.execute(
-        code, work_dir=work_dir, env={"DATA_PATH": str(data_path)}, timeout=60
-    )
-    if not outcome.success:
-        # 校验代码自身失败不判产品代码错，标记 skipped 供人工跟进
-        return {
-            "status": "skipped",
-            "message": f"校验模板执行失败：{(outcome.stderr or '')[-200:]}",
-            "expected": None,
-        }
-    try:
-        start = outcome.stdout.index("{")
-        expected = json.loads(outcome.stdout[start : outcome.stdout.rindex("}") + 1])
-    except (ValueError, json.JSONDecodeError):
-        return {"status": "skipped", "message": "校验模板输出无法解析", "expected": None}
-    if expected.get("skipped"):
-        return {"status": "skipped", "message": "数据缺少对照计算所需列", "expected": None}
+    columns = [str(c.get("name")) for c in ((schema_profile or {}).get("columns") or [])]
+    ordered = _numeric_columns(schema_profile or {}, question, task)
+    preferred = _column_from_reported_keys(reported, columns)
+    check_columns = ([preferred] if preferred else []) + [c for c in ordered if c != preferred]
+    window = parse_window_days(scope_text)
 
-    ok, message = _compare(reported, expected.get("aggregate") or {})
-    return {
-        "status": "pass" if ok else "fail",
-        "message": message,
-        "expected": expected.get("aggregate"),
-    }
+    fallback: dict[str, Any] | None = None
+    for category in candidates:
+        metrics, reason = _run_template(category, check_columns, window, data_path)
+        if reason:
+            fallback = fallback or {"status": "skipped", "message": reason, "expected": None}
+            continue
+        status, message, comparable = _compare(reported, metrics, columns)
+        if comparable == 0:
+            fallback = fallback or {"status": "skipped", "message": message, "expected": metrics}
+            continue
+        return {"status": status, "message": message, "expected": metrics}
+    return fallback or {"status": "skipped", "message": "无可用对照模板", "expected": None}
