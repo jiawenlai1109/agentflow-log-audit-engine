@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from agentflow.agents.base import BaseAgent
-from agentflow.core.llm import LLMError, extract_json
+from agentflow.core.llm import LLMError, MockLLM, extract_json
 from agentflow.core.memory import clean_summary
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.result import ErrorClass, TaskExecutionResult
@@ -49,6 +49,12 @@ class ExecutorAgent(BaseAgent):
         )
         if is_memory:
             return self._answer_from_memory(ctx, task_id, work_dir)
+
+        rule_params = task.get("rule_params") or {}
+        if rule_params and isinstance(self.llm, MockLLM):
+            # 场景包规则任务（mock）：短路执行参考实现，确定性可复现（先例：memory_answer）
+            result = self._run_rule_reference(ctx, task, work_dir, rule_params)
+            return self._finish(ctx, task_id, work_dir, result)
 
         upstream = self._upstream_grants(ctx, task)
         history = self.new_history()
@@ -147,6 +153,11 @@ class ExecutorAgent(BaseAgent):
                 suggestion=self._suggestion(error_class),
             )
 
+        return self._finish(ctx, task_id, work_dir, result)
+
+    def _finish(
+        self, ctx: Any, task_id: int, work_dir: Any, result: TaskExecutionResult
+    ) -> AgentMessage:
         data = result.model_dump(mode="json")
         step_file = work_dir / f"step_{task_id}_result.json"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +168,59 @@ class ExecutorAgent(BaseAgent):
             kind="execution_result",
             content=json.dumps(data, ensure_ascii=False),
             artifacts=[str(step_file)],
+        )
+
+    def _run_rule_reference(
+        self, ctx: Any, task: dict[str, Any], work_dir: Any, rule_params: dict[str, Any]
+    ) -> TaskExecutionResult:
+        """mock 模式规则任务：执行规则包自带参考实现（与 verify_code 异构，校验器另算）。"""
+        task_id = int(task["task_id"])
+        rule = ctx.pack.rule(str(rule_params.get("id", "")))
+        outcome = self.registry.call(
+            self.name,
+            "execute_python",
+            ctx,
+            _scope={"task_id": task_id, "grants": []},
+            code=rule.reference_code,
+            work_dir=work_dir,
+            timeout=self._task_timeout(ctx),
+            env={
+                "DATA_PATH": ctx.data_path,
+                "ARTIFACTS_DIR": str(ctx.artifacts_dir),
+            },
+        )
+        if outcome.success:
+            summary = self._parse_summary(outcome.stdout)
+            if (
+                summary
+                and not summary.get("error")
+                and isinstance(summary.get("rows"), int)
+            ):
+                return TaskExecutionResult(
+                    task_id=task_id,
+                    status="success",
+                    summary=summary,
+                    duration_seconds=outcome.duration_seconds,
+                    attempts=1,
+                )
+            return TaskExecutionResult(
+                task_id=task_id,
+                status="failed",
+                error=str((summary or {}).get("error") or "参考实现未输出有效结果")[:500],
+                error_class=ErrorClass.CODE_ERROR,
+                attempts=1,
+                suggestion=self._suggestion(ErrorClass.CODE_ERROR),
+            )
+        error_class, missing = self._classify_error(ctx, outcome)
+        return TaskExecutionResult(
+            task_id=task_id,
+            status="failed",
+            error=(outcome.stderr or "")[-500:],
+            error_class=error_class,
+            missing_columns=missing,
+            duration_seconds=outcome.duration_seconds,
+            attempts=1,
+            suggestion=self._suggestion(error_class),
         )
 
     # ------------------------------------------------------------ helpers
@@ -237,6 +301,21 @@ class ExecutorAgent(BaseAgent):
         constraints = getattr(ctx, "constraints", None)
         if constraints:
             parts.append(f"用户约束（必须遵守）：{json.dumps(constraints, ensure_ascii=False)}")
+        rule_params = task.get("rule_params") or {}
+        if rule_params and getattr(ctx, "pack", None) is not None:
+            # 场景包规则任务（real 模式）：检测标准来自规则包，LLM 只做实现，校验器独立把关
+            rule = ctx.pack.rule(str(rule_params.get("id", "")))
+            parts.append(
+                f"检测规则规格（必须严格按此实现，不得自行发明或修改检测标准）：{rule.detection_spec}"
+            )
+            parts.append(
+                "输出契约：除通用要求外，必须输出 \"findings\" 数组，每条为 "
+                "{\"rule_id\": \"" + rule.id + "\", \"subject\": \"...\", \"window_start\": \"...\", "
+                "\"window_end\": \"...\", \"metric\": \"...\", \"value\": 数值, \"evidence\": [至多5条原始日志行字典]}；"
+                "aggregate 必须含 {\"规则" + rule.id + "命中数\": findings数组长度}；"
+                "rows 写 findings 数组长度，columns 写 [\"rule_id\", \"subject\", \"value\"]，"
+                "head 每条含 rule_id/subject/value 三个键。"
+            )
         # 闭环回流契约（v1.2）：Inspector 的 suggestion 必须真实进入重做 prompt
         if task.get("_redo_suggestion"):
             parts.append(f"上轮审核未通过，审核建议：{task['_redo_suggestion']}")

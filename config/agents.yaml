@@ -28,7 +28,7 @@ agents:
     max_tokens: 2000
     # model: deepseek-coder   # 可选：单独给 Executor 指定模型（覆盖全局）
   inspector:
-    tools: [validate_rules, verify_aggregate]
+    tools: [validate_rules, verify_aggregate, verify_findings]
     temperature: 0.2
     max_tokens: 500
   visualizer:

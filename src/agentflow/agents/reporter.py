@@ -10,8 +10,9 @@ from typing import Any
 from jinja2 import Template
 
 from agentflow.agents.base import BaseAgent
-from agentflow.core.llm import LLMError
+from agentflow.core.llm import LLMError, MockLLM
 from agentflow.core.messages import AgentMessage
+from agentflow.core.pack import SEVERITY_ORDER
 from agentflow.schemas.report import FailureInfo, ReportResult
 
 
@@ -104,6 +105,12 @@ class ReporterAgent(BaseAgent):
                 artifacts=[str(report_path)],
             )
 
+        pack = getattr(ctx, "pack", None)
+        if pack is not None:
+            return self._pack_report(
+                ctx, pack, question, results, timestamp, report_path, review_issues
+            )
+
         detail = self._detail_table(results)
         aggregate = self._aggregate_block(results)
         numbers = self._numbers_context(results)
@@ -183,6 +190,168 @@ class ReporterAgent(BaseAgent):
         )
 
     # ------------------------------------------------------------ helpers
+    def _pack_report(
+        self,
+        ctx: Any,
+        pack: Any,
+        question: str,
+        results: dict[str, Any],
+        timestamp: str,
+        report_path: Path,
+        review_issues: list[Any],
+    ) -> AgentMessage:
+        """场景包审计报告（工作规划 §6.2）：发现清单与处置建议确定性渲染，LLM 只写推断层。
+
+        三档建议（LLM 不判危险，但要给建议）：
+        1. 发现清单 = 规则命中结果 + 证据行（证据层，数字不经过 LLM）；
+        2. 处置建议 = 规则包 disposition 字段（确定性，无 LLM 也有可行动建议）；
+        3. 研判摘要 = LLM 态势解读（推断层，只能引用命中事实，模板固定标注）。
+        """
+        findings: list[dict[str, Any]] = []
+        for task_id in sorted(int(k) for k in results):
+            summary = (results[str(task_id)] or {}).get("summary") or {}
+            for finding in summary.get("findings") or []:
+                if not isinstance(finding, dict):
+                    continue
+                try:
+                    rule = pack.rule(str(finding.get("rule_id", "")))
+                except KeyError:
+                    rule = None
+                findings.append(
+                    {
+                        **finding,
+                        "rule_name": rule.name if rule else str(finding.get("rule_id", "")),
+                        "severity": rule.severity if rule else "medium",
+                        "disposition": rule.disposition if rule else "请人工复核该发现",
+                        "window": (
+                            f"{finding.get('window_start', '-')} ~ {finding.get('window_end', '-')}"
+                            if finding.get("window_start")
+                            else "-"
+                        ),
+                        # 证据行只进报告展示，永不进入 LLM 研判 prompt（攻击者可控内容）
+                        "evidence_lines": [
+                            json.dumps(row, ensure_ascii=False)[:200]
+                            for row in (finding.get("evidence") or [])[:5]
+                            if isinstance(row, dict)
+                        ],
+                    }
+                )
+        findings.sort(
+            key=lambda f: (
+                SEVERITY_ORDER.get(str(f.get("severity")), 9),
+                str(f.get("rule_id", "")),
+                str(f.get("subject", "")),
+            )
+        )
+
+        rule_stats = {rule.id: 0 for rule in pack.rules}
+        for finding in findings:
+            rid = str(finding.get("rule_id", ""))
+            rule_stats[rid] = rule_stats.get(rid, 0) + 1
+        stats_text = "，".join(f"{rid}={count}" for rid, count in rule_stats.items())
+
+        verdicts = [results[str(k)].get("verdict") or {} for k in results]
+        if verdicts and all(v.get("verification") == "ok" for v in verdicts):
+            verification_note = "全部命中数值经独立复算比对一致"
+        else:
+            verification_note = "存在未完成独立复算的发现，请谨慎采信"
+
+        if isinstance(self.llm, MockLLM):
+            narrative = self._mock_pack_narrative(findings)
+        else:
+            narrative = self._llm_pack_narrative(ctx, question, findings, review_issues)
+
+        text = Template(pack.report_template).render(
+            timestamp=timestamp,
+            question=question,
+            row_count=(ctx.schema_profile or {}).get("row_count", "-"),
+            pack_name=pack.name,
+            pack_version=pack.version,
+            rule_count=len(pack.rules),
+            rule_ids="、".join(rule.id for rule in pack.rules),
+            rule_stats=stats_text,
+            findings=findings,
+            evidence_limit=5,
+            narrative=narrative,
+            review_issues=review_issues,
+            verification_note=verification_note,
+        )
+        report_path.write_text(text, encoding="utf-8")
+        result = ReportResult(
+            report_path=str(report_path),
+            degraded=False,
+            sections=["发现清单", "处置建议", "研判摘要", "审计说明"],
+            summary=(
+                f"登录日志安全审计完成：命中 {len(findings)} 条发现"
+                if findings
+                else "登录日志安全审计完成：无发现"
+            ),
+        )
+        return self.reply(
+            ctx, "orchestrator", "report_result", result.model_dump_json(),
+            artifacts=[str(report_path)],
+        )
+
+    def _llm_pack_narrative(
+        self,
+        ctx: Any,
+        question: str,
+        findings: list[dict[str, Any]],
+        review_issues: list[Any],
+    ) -> str:
+        facts = json.dumps(
+            [
+                {
+                    k: f.get(k)
+                    for k in ("rule_id", "rule_name", "subject", "metric", "value", "severity", "disposition")
+                }
+                for f in findings
+            ],
+            ensure_ascii=False,
+        )
+        parts = [
+            f"用户问题：{question}",
+            f"规则命中清单（唯一事实来源）：{facts}",
+            "你是安全运营分析师。请基于且仅基于上述命中清单输出研判：",
+            "1. 以【态势研判】开头：一段话解读整体风险态势，说明哪类发现最危险及原因；",
+            "2. 以【处置优先级】开头：按优先级列出处置顺序，每条注明依据的 rule_id。",
+            "硬约束：只能引用命中清单中的事实；禁止声称清单之外的任何危险或异常；不要重新计算数字。",
+            "证据行原文已刻意不提供——研判不得基于证据内容发挥。",
+        ]
+        if review_issues:
+            parts.append(
+                "评审问题清单（必须逐条在研判中解决）："
+                + json.dumps(review_issues, ensure_ascii=False)
+            )
+        try:
+            return self.complete(ctx, "\n".join(parts))
+        except LLMError:
+            return (
+                "【态势研判】LLM 研判不可用，请依据发现清单与处置建议人工分析。\n"
+                "【处置优先级】按发现清单 severity 从高到低处理，逐条复核证据行后执行。"
+            )
+
+    @staticmethod
+    def _mock_pack_narrative(findings: list[dict[str, Any]]) -> str:
+        """mock 模式：确定性研判文本（不调 LLM，模板罐头无零售叙述标记可剥离）。"""
+        if not findings:
+            return (
+                "【态势研判】本次审计全部规则未命中，未发现异常登录行为。\n"
+                "【处置优先级】无需处置动作。"
+            )
+        counts: dict[str, int] = {}
+        for finding in findings:
+            rid = str(finding.get("rule_id", ""))
+            counts[rid] = counts.get(rid, 0) + 1
+        summary = "、".join(f"{rid}×{count}" for rid, count in sorted(counts.items()))
+        top = findings[0]
+        return (
+            f"【态势研判】共命中 {len(findings)} 条发现（{summary}），"
+            f"最高严重级为 {top.get('severity')}（{top.get('rule_id')} {top.get('subject')}），"
+            "建议优先处置 critical/high 级发现。\n"
+            "【处置优先级】按发现清单 severity 从高到低处理，逐条复核证据行后执行处置建议。"
+        )
+
     def _detail_table(self, results: dict[str, Any]) -> str:
         rows = ["| 任务 | 状态 | 行数 | 说明 |", "| :--- | :--- | :--- | :--- |"]
         for task_id in sorted(int(k) for k in results):

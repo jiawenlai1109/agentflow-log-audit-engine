@@ -16,6 +16,7 @@ from agentflow.core.memory import (
     score_turn,
 )
 from agentflow.core.messages import AgentMessage
+from agentflow.core.pack import pack_plan_tasks
 from agentflow.schemas.clarify import ClarifyRequest
 from agentflow.schemas.plan import TaskList
 
@@ -43,6 +44,8 @@ class PlannerAgent(BaseAgent):
     METRIC_KEYWORDS = ("利润", "利润率", "销售额", "销量")
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
+        if getattr(ctx, "pack", None) is not None:
+            return self._pack_plan(ctx, message)
         if message.kind == "replan_request":
             return self._replan(ctx, message)
         question = message.content
@@ -75,6 +78,63 @@ class PlannerAgent(BaseAgent):
             kind="task_list",
             content=json.dumps(task_list, ensure_ascii=False),
             artifacts=[str(plan_path)],
+        )
+
+    # ------------------------------------------------------------ 场景包模式（工作规划 §6.2）
+    def _pack_plan(self, ctx: Any, message: AgentMessage) -> AgentMessage:
+        """场景包模式：按规则目录确定性规划，不调 LLM——检测标准来自规则包而非模型。
+
+        规划前预检数据约定必需列，缺列抛错 → Orchestrator 降级（诚实失败，不做半套审计）。
+        """
+        if message.kind == "replan_request":
+            return self._pack_replan(ctx, message)
+        pack = ctx.pack
+        columns = {col["name"] for col in (ctx.schema_profile or {}).get("columns", [])}
+        missing = [col for col in pack.required_columns if col not in columns]
+        if missing:
+            raise ValueError(
+                f"数据缺少场景包 {pack.name} 必需列：{'、'.join(missing)}"
+                f"（需要：{pack.required_columns}，见 packs/{pack.name}/data_convention.md）"
+            )
+        tasks = pack_plan_tasks(pack)
+        task_list = {
+            "question": ctx.question,
+            "time_base": None,
+            "constraints": None,
+            "tasks": tasks,
+        }
+        plan_path = ctx.outputs_dir / "plan.json"
+        plan_path.write_text(json.dumps(task_list, ensure_ascii=False), encoding="utf-8")
+        return self.reply(
+            ctx,
+            receiver="orchestrator",
+            kind="task_list",
+            content=json.dumps(task_list, ensure_ascii=False),
+            artifacts=[str(plan_path)],
+        )
+
+    def _pack_replan(self, ctx: Any, message: AgentMessage) -> AgentMessage:
+        """pack 模式重规划：确定性保留剩余规则任务，不让 LLM 修改检测标准。"""
+        data = json.loads(message.content)
+        remaining = data.get("remaining_tasks") or []
+        survivors = [task for task in remaining if task.get("rule_params")]
+        if not survivors:
+            clarify = ClarifyRequest(
+                reason="unrecoverable_plan",
+                missing_columns=[],
+                question="场景包规则任务无法继续执行。",
+                options=["改为普通分析模式（不使用 --pack）", "仅说明问题并结束"],
+                suggestion="检查数据格式是否符合场景包数据约定（packs/login_audit/data_convention.md）",
+            )
+            return self.reply(
+                ctx, "orchestrator", "clarify_request", clarify.model_dump_json()
+            )
+        revised = self._renumber(survivors)
+        return self.reply(
+            ctx,
+            receiver="orchestrator",
+            kind="revised_task_list",
+            content=json.dumps(revised, ensure_ascii=False),
         )
 
     # ------------------------------------------------------------ 重规划环 / 澄清（v1.2）

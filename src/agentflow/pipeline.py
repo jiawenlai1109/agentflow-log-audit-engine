@@ -81,10 +81,19 @@ def run_analysis(
     outputs_root: str | Path | None = None,
     session_id: str | None = None,
     on_event: Any | None = None,
+    pack: str | None = None,
 ) -> dict[str, Any]:
-    """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。"""
+    """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
+
+    pack：场景包名称（如 login_audit），装载 packs/<name>/ 并切换为领域规则包模式。
+    """
     config = load_config(config_path)
     registry = build_default_registry(config)
+    pack_obj = None
+    if pack:
+        from agentflow.core.pack import load_pack
+
+        pack_obj = load_pack(pack)
     if llm is None:
         llm_cfg = config.get("llm", {})
         llm = (
@@ -100,6 +109,9 @@ def run_analysis(
     outputs_root = (
         Path(outputs_root) if outputs_root else project_root / "outputs"
     )
+    # 相对路径必须先解析为绝对：产物内部的 ensure_allowed/ensure_within 会以
+    # outputs_dir 为根拼接路径，相对 outputs_dir 会造成双重拼接（Critic 读不到报告）
+    outputs_root = outputs_root.resolve()
     outputs_root.mkdir(parents=True, exist_ok=True)
 
     session = None
@@ -123,6 +135,7 @@ def run_analysis(
         data_path=str(Path(data_path).resolve()),
         outputs_root=outputs_root,
         session=session,
+        pack=pack_obj,
     )
     if session:
         _persist_session(session, question, result, llm=llm)

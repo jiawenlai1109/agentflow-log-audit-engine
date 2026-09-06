@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -26,6 +26,7 @@ class Task(BaseModel):
     chart_type: ChartType = "none"
     depends_on: list[int] = Field(default_factory=list)
     upstream_refs: list[str] = Field(default_factory=list)
+    rule_params: dict[str, Any] | None = None  # 场景包规则任务：{"id": "R1"}（工作规划 §6.2）
 
     @field_validator("depends_on")
     @classmethod

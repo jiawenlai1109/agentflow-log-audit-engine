@@ -1,0 +1,243 @@
+# 场景包 #1：登录日志安全审计（工作规划 §6.2）
+#
+# 设计原则：
+# 1. LLM 不判危险——检测标准全部来自本文件，LLM 只负责按 detection_spec 写实现（real）与写研判叙述；
+# 2. producer ≠ verifier——每条规则的 verify_code 必须与 reference_code 异构实现
+#    （reference_code 用 pandas 分组/滚动窗口，verify_code 用纯 Python 排序扫描/计数），
+#    两者对同一数据集的结论必须一致，不一致即 FAIL；
+# 3. 空结果语义反转——安全场景"无发现"是好消息，Inspector 对规则任务不做空结果 FAIL；
+# 4. 判定权不可注入——日志内容（含 message 字段）永远不进入任何判定路径。
+#
+# 窗口语义（与 data_convention.md 一致）：时间窗统一左开右闭 (t-W, t]。
+
+name: login_audit
+version: "1.0"
+description: 登录日志安全审计（日志平台导出 CSV：VPN/堡垒机/IAM）
+
+data_convention:
+  required_columns: [time, src_ip, account, auth_result, auth_method, service, message]
+  time_format: "%Y-%m-%d %H:%M:%S"
+  auth_result_values: [success, failure]
+  finding_subject_format: "R1/R2 = '<src_ip>-><account>'；R3 = '<account>'；R4 = '<src_ip>'"
+  evidence_limit: 5
+
+rules:
+  - id: R1
+    name: 登录爆破
+    severity: high
+    disposition: 建议立即封禁该源 IP，通知账号主人重置密码，并排查同网段账号是否有同类失败记录。
+    params:
+      window_minutes: 5
+      threshold: 10
+    detection_spec: |
+      登录爆破检测：对每对 (src_ip, account)，统计认证失败（auth_result == 'failure'）
+      在 5 分钟滚动窗口（左开右闭，即事件时刻往前推 5 分钟内，含事件本身）内的最大失败次数。
+      若最大值 >= 10，输出一条 finding：subject 为 '<src_ip>-><account>'，
+      metric 为 '5分钟失败次数'，value 为该最大失败次数，
+      window_start/window_end 为峰值窗口的起止时间，evidence 为窗口内最后 5 条原始日志行。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
+      df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+      fail = df[df["auth_result"] == "failure"].sort_values("time")
+      findings = []
+      for (ip, acc), sub in fail.groupby(["src_ip", "account"]):
+          series = sub.set_index("time")["auth_result"].rolling("5min").count()
+          peak = int(series.max()) if len(series) else 0
+          if peak >= 10:
+              wend = series.idxmax()
+              wstart = wend - pd.Timedelta(minutes=5)
+              ev = sub[(sub["time"] > wstart) & (sub["time"] <= wend)].tail(5)
+              findings.append({
+                  "rule_id": "R1", "subject": f"{ip}->{acc}",
+                  "window_start": str(wstart), "window_end": str(wend),
+                  "metric": "5分钟失败次数", "value": peak,
+                  "evidence": ev.assign(time=ev["time"].astype(str)).to_dict("records"),
+              })
+      out = {"rows": len(findings), "columns": ["rule_id", "subject", "value"],
+             "head": [{"rule_id": x["rule_id"], "subject": x["subject"], "value": x["value"]} for x in findings],
+             "aggregate": {"规则R1命中数": len(findings)}, "findings": findings}
+      print(json.dumps(out, ensure_ascii=False, default=str))
+    verify_code: |
+      import os, json, csv
+      from collections import defaultdict
+      from datetime import datetime, timedelta
+      fmt = "%Y-%m-%d %H:%M:%S"
+      events = defaultdict(list)
+      with open(os.environ["DATA_PATH"], encoding="utf-8-sig") as fh:
+          for row in csv.DictReader(fh):
+              if row["auth_result"] == "failure":
+                  events[(row["src_ip"], row["account"])].append(
+                      datetime.strptime(row["time"], fmt))
+      findings = []
+      window = timedelta(minutes=5)
+      for (ip, acc), times in events.items():
+          times.sort()
+          best, bj = 0, 0
+          for i, t in enumerate(times):
+              while t - times[bj] >= window:
+                  bj += 1
+              best = max(best, i - bj + 1)
+          if best >= 10:
+              findings.append({"rule_id": "R1", "subject": f"{ip}->{acc}",
+                               "metric": "5分钟失败次数", "value": best})
+      print(json.dumps({"findings": findings}, ensure_ascii=False))
+
+  - id: R2
+    name: 爆破后成功
+    severity: critical
+    disposition: 高危：疑似已失陷。建议立即冻结该账号、强制下线全部会话并重置密码，调查成功登录后的操作行为。
+    params:
+      min_failures: 5
+      success_window_minutes: 10
+    detection_spec: |
+      爆破后成功检测：对每对 (src_ip, account)，若认证失败总次数 >= 5，
+      且在最后一次失败之后的 10 分钟内（左开右闭）出现成功登录（auth_result == 'success'），
+      输出一条 finding：subject 为 '<src_ip>-><account>'，metric 为 '失败次数'，
+      value 为失败总次数，window_start 为首次失败时间，window_end 为该次成功登录时间，
+      evidence 为最后 3 条失败与命中成功的原始日志行（合并按时间取末 5 条）。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
+      df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+      findings = []
+      for (ip, acc), sub in df.groupby(["src_ip", "account"]):
+          f = sub[sub["auth_result"] == "failure"].sort_values("time")
+          s = sub[sub["auth_result"] == "success"].sort_values("time")
+          if len(f) < 5 or len(s) == 0:
+              continue
+          last_fail = f["time"].iloc[-1]
+          hit = s[(s["time"] > last_fail) & (s["time"] <= last_fail + pd.Timedelta(minutes=10))]
+          if len(hit) == 0:
+              continue
+          succ_t = hit["time"].iloc[0]
+          ev = pd.concat([f.tail(3), hit.head(2)]).sort_values("time").tail(5)
+          findings.append({
+              "rule_id": "R2", "subject": f"{ip}->{acc}",
+              "window_start": str(f["time"].iloc[0]), "window_end": str(succ_t),
+              "metric": "失败次数", "value": int(len(f)),
+              "evidence": ev.assign(time=ev["time"].astype(str)).to_dict("records"),
+          })
+      out = {"rows": len(findings), "columns": ["rule_id", "subject", "value"],
+             "head": [{"rule_id": x["rule_id"], "subject": x["subject"], "value": x["value"]} for x in findings],
+             "aggregate": {"规则R2命中数": len(findings)}, "findings": findings}
+      print(json.dumps(out, ensure_ascii=False, default=str))
+    verify_code: |
+      import os, json, csv
+      from collections import defaultdict
+      from datetime import datetime, timedelta
+      fmt = "%Y-%m-%d %H:%M:%S"
+      fails = defaultdict(list)
+      succs = defaultdict(list)
+      with open(os.environ["DATA_PATH"], encoding="utf-8-sig") as fh:
+          for row in csv.DictReader(fh):
+              key = (row["src_ip"], row["account"])
+              t = datetime.strptime(row["time"], fmt)
+              if row["auth_result"] == "failure":
+                  fails[key].append(t)
+              elif row["auth_result"] == "success":
+                  succs[key].append(t)
+      findings = []
+      for key, ft in fails.items():
+          if len(ft) < 5:
+              continue
+          ft.sort()
+          last_fail = ft[-1]
+          if any(last_fail < t <= last_fail + timedelta(minutes=10) for t in sorted(succs.get(key, []))):
+              findings.append({"rule_id": "R2", "subject": f"{key[0]}->{key[1]}",
+                               "metric": "失败次数", "value": len(ft)})
+      print(json.dumps({"findings": findings}, ensure_ascii=False))
+
+  - id: R3
+    name: 非常规时段登录
+    severity: medium
+    disposition: 建议与账号主人核实凌晨登录是否为本人操作，确认后检查该时段的访问内容与数据导出记录。
+    params:
+      start_hour: 2
+      end_hour: 5
+    detection_spec: |
+      非常规时段登录检测：统计成功登录（auth_result == 'success'）时间落在
+      [02:00, 05:00) 的记录，按 account 汇总。只要某账号该时段成功次数 >= 1，
+      输出一条 finding：subject 为 '<account>'，metric 为 '非常规时段成功次数'，
+      value 为该时段成功次数，window_start/window_end 为该账号该时段首末成功登录时间，
+      evidence 为其最后 5 条原始日志行。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
+      df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+      mask = (df["auth_result"] == "success") & (df["time"].dt.hour >= 2) & (df["time"].dt.hour < 5)
+      odd = df[mask].sort_values("time")
+      findings = []
+      for acc, sub in odd.groupby("account"):
+          findings.append({
+              "rule_id": "R3", "subject": str(acc),
+              "window_start": str(sub["time"].iloc[0]), "window_end": str(sub["time"].iloc[-1]),
+              "metric": "非常规时段成功次数", "value": int(len(sub)),
+              "evidence": sub.tail(5).assign(time=sub["time"].astype(str)).to_dict("records"),
+          })
+      out = {"rows": len(findings), "columns": ["rule_id", "subject", "value"],
+             "head": [{"rule_id": x["rule_id"], "subject": x["subject"], "value": x["value"]} for x in findings],
+             "aggregate": {"规则R3命中数": len(findings)}, "findings": findings}
+      print(json.dumps(out, ensure_ascii=False, default=str))
+    verify_code: |
+      import os, json, csv
+      from collections import defaultdict
+      from datetime import datetime
+      fmt = "%Y-%m-%d %H:%M:%S"
+      counts = defaultdict(list)
+      with open(os.environ["DATA_PATH"], encoding="utf-8-sig") as fh:
+          for row in csv.DictReader(fh):
+              if row["auth_result"] != "success":
+                  continue
+              t = datetime.strptime(row["time"], fmt)
+              if 2 <= t.hour < 5:
+                  counts[row["account"]].append(t)
+      findings = [{"rule_id": "R3", "subject": acc, "metric": "非常规时段成功次数",
+                   "value": len(ts)} for acc, ts in sorted(counts.items())]
+      print(json.dumps({"findings": findings}, ensure_ascii=False))
+
+  - id: R4
+    name: 多账号失败（口令喷洒）
+    severity: high
+    disposition: 疑似口令喷洒。建议封禁该源 IP，检查其尝试过的账号是否存在弱口令，启用登录失败告警联动。
+    params:
+      min_accounts: 5
+    detection_spec: |
+      口令喷洒检测：对每个 src_ip，统计出现认证失败（auth_result == 'failure'）的
+      去重账号数。若 >= 5，输出一条 finding：subject 为 '<src_ip>'，
+      metric 为 '失败账号数'，value 为去重账号数，
+      window_start/window_end 为该 IP 首末失败时间，evidence 为其最后 5 条失败日志行。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
+      df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+      fail = df[df["auth_result"] == "failure"].sort_values("time")
+      findings = []
+      for ip, sub in fail.groupby("src_ip"):
+          accounts = sorted(sub["account"].unique())
+          if len(accounts) >= 5:
+              findings.append({
+                  "rule_id": "R4", "subject": str(ip),
+                  "window_start": str(sub["time"].iloc[0]), "window_end": str(sub["time"].iloc[-1]),
+                  "metric": "失败账号数", "value": len(accounts),
+                  "evidence": sub.tail(5).assign(time=sub["time"].astype(str)).to_dict("records"),
+              })
+      out = {"rows": len(findings), "columns": ["rule_id", "subject", "value"],
+             "head": [{"rule_id": x["rule_id"], "subject": x["subject"], "value": x["value"]} for x in findings],
+             "aggregate": {"规则R4命中数": len(findings)}, "findings": findings}
+      print(json.dumps(out, ensure_ascii=False, default=str))
+    verify_code: |
+      import os, json, csv
+      from collections import defaultdict
+      counts = defaultdict(set)
+      with open(os.environ["DATA_PATH"], encoding="utf-8-sig") as fh:
+          for row in csv.DictReader(fh):
+              if row["auth_result"] == "failure":
+                  counts[row["src_ip"]].add(row["account"])
+      findings = [{"rule_id": "R4", "subject": ip, "metric": "失败账号数",
+                   "value": len(accs)} for ip, accs in sorted(counts.items()) if len(accs) >= 5]
+      print(json.dumps({"findings": findings}, ensure_ascii=False))

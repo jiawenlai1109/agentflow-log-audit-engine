@@ -14,6 +14,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# 独立校验 PASS 的检查名前缀：通用 aggregate 模板 + 场景包 finding 校验
+VERIFY_PASS_PREFIXES = ("aggregate_match_check:PASS", "finding_match_check:PASS")
+
 
 def collect(outputs_root: Path) -> list[dict]:
     runs: list[dict] = []
@@ -45,7 +48,7 @@ def summarize(runs: list[dict]) -> dict:
             verdict = result.get("verdict") or {}
             if verdict.get("verification") == "ok":
                 verify_checked += 1
-                if any(check.startswith("aggregate_match_check:PASS") for check in verdict.get("checks", [])):
+                if any(check.startswith(VERIFY_PASS_PREFIXES) for check in verdict.get("checks", [])):
                     verify_ok += 1
             redos += int(verdict.get("redos", 0) or 0)
     return {
@@ -84,7 +87,7 @@ def update_record(record_path: Path, batch: str, runs: list[dict]) -> None:
             1
             for verdict in verdicts
             if verdict.get("verification") == "ok"
-            and any(c.startswith("aggregate_match_check:PASS") for c in verdict.get("checks", []))
+            and any(c.startswith(VERIFY_PASS_PREFIXES) for c in verdict.get("checks", []))
         )
         usage = run.get("token_usage") or {}
         tokens = (

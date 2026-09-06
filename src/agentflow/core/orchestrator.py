@@ -51,6 +51,7 @@ class Orchestrator:
         outputs_root: str | Path,
         session: Any = None,
         max_review_rounds: int | None = None,
+        pack: Any = None,
     ) -> dict[str, Any]:
         run_id = new_run_id()
         outputs_dir = Path(outputs_root) / run_id
@@ -68,6 +69,7 @@ class Orchestrator:
             session=session,
             transcript=transcript,
             budget=budget,
+            pack=pack,
         )
         started = time.monotonic()
         self._started = started  # 墙钟守卫基准（total_budget_seconds 的执行点）
@@ -498,6 +500,7 @@ class Orchestrator:
                     "question": ctx.question,
                     "results": {str(k): v for k, v in ctx.results.items()},
                     "degraded": ctx.report.get("degraded", False),
+                    "sections": ctx.report.get("sections"),
                 },
                 ensure_ascii=False,
             )

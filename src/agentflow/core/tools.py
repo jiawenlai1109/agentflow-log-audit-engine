@@ -135,7 +135,7 @@ DEFAULT_TOOL_WHITELIST = {
     "explorer": ["profile_csv"],
     "planner": [],
     "executor": ["execute_python", "read_artifact"],
-    "inspector": ["validate_rules", "verify_aggregate"],
+    "inspector": ["validate_rules", "verify_aggregate", "verify_findings"],
     "visualizer": ["execute_python", "read_artifact"],
     "reporter": [],
     "critic": ["check_report"],
@@ -312,6 +312,8 @@ def _validate_rules(
 ) -> list[dict[str, str]]:
     """Inspector 确定性规则：空结果 / 列完整性 / 负值 / 行数合理性。"""
     checks: list[dict[str, str]] = []
+    if task.get("rule_params"):
+        return _validate_rule_task(result, task)
     summary = result.get("summary") or {}
     rows = summary.get("rows")
     # 防御脏数据：rows 必须是数字，LLM 可能输出数组/字符串，一律按"缺行数"处理，绝不抛异常
@@ -392,13 +394,58 @@ def _validate_rules(
     return checks
 
 
+def _validate_rule_task(
+    result: dict[str, Any], task: dict[str, Any]
+) -> list[dict[str, str]]:
+    """场景包规则任务的审核分支（工作规划 §6.2）。
+
+    与通用规则的两处语义差异：
+    - 空结果语义反转：安全审计"无发现"是好消息，rows==0 → PASS；
+    - required_columns 是输入列而 summary.columns 是输出列，
+      列完整性改由 pack 装载预检（planner 阶段）保证，此处跳过。
+    """
+    checks: list[dict[str, str]] = []
+    summary = result.get("summary") or {}
+    rows = summary.get("rows")
+    if not isinstance(rows, (int, float)) or isinstance(rows, bool):
+        rows = None
+    findings = summary.get("findings")
+    if rows is None:
+        checks.append(
+            {"rule": "empty_check", "level": "FAIL", "message": "规则任务未提供行数信息"}
+        )
+    elif rows == 0 and not findings:
+        checks.append(
+            {
+                "rule": "empty_check",
+                "level": "PASS",
+                "message": "安全审计无发现（空结果语义反转：规则未命中即通过）",
+            }
+        )
+    else:
+        checks.append({"rule": "empty_check", "level": "PASS", "message": f"命中 {rows} 条发现"})
+    if not summary.get("aggregate"):
+        checks.append(
+            {
+                "rule": "aggregate_check",
+                "level": "WARN",
+                "message": "规则任务未提供命中数（aggregate），无法进入报告数字核对",
+            }
+        )
+    return checks
+
+
 def _check_report(
     ctx: Any,
     report_path: str | Path,
     question: str,
     results: dict[int, dict[str, Any]],
+    sections: list[str] | None = None,
 ) -> list[dict[str, str]]:
-    """Critic 确定性检查：存在性 / 章节 / 图表路径 / 关键数字。"""
+    """Critic 确定性检查：存在性 / 章节 / 图表路径 / 关键数字。
+
+    sections 由报告方声明（场景包审计模板的章节与零售不同）；缺省保持零售四章节。
+    """
     import re
 
     issues: list[dict[str, str]] = []
@@ -406,7 +453,7 @@ def _check_report(
     if not path.exists():
         return [{"severity": "high", "section": "整体", "message": "报告文件不存在"}]
     text = path.read_text(encoding="utf-8")
-    for section in ("总体概况", "数据详情", "趋势分析", "结论与建议"):
+    for section in sections or ("总体概况", "数据详情", "趋势分析", "结论与建议"):
         if section not in text:
             issues.append({"severity": "medium", "section": section, "message": f"缺少章节：{section}"})
     for ref in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text):
@@ -455,6 +502,21 @@ def _verify_aggregate(
     )
 
 
+def _verify_findings(
+    ctx: Any,
+    task: dict[str, Any],
+    result: dict[str, Any],
+    data_path: str | Path,
+    pack: Any = None,
+) -> dict[str, Any]:
+    """独立校验（场景包，producer ≠ verifier）：规则 verify_code 异构重算 findings 比对。"""
+    from agentflow.core.pack import verify_findings as run_finding_verification
+
+    if pack is None:
+        return {"status": "skipped", "message": "未提供场景包，无法校验", "expected": None}
+    return run_finding_verification(pack=pack, task=task, result=result, data_path=str(data_path))
+
+
 def build_default_registry(config: dict[str, Any] | None = None) -> ToolRegistry:
     """注册全部内置工具（与 config/agents.yaml 白名单对应）。"""
     registry = ToolRegistry(config)
@@ -494,6 +556,13 @@ def build_default_registry(config: dict[str, Any] | None = None) -> ToolRegistry
             name="verify_aggregate",
             description="独立校验模板：重算关键指标并与上报 aggregate 容差比对",
             handler=_verify_aggregate,
+        )
+    )
+    registry.register(
+        Tool(
+            name="verify_findings",
+            description="场景包独立校验：规则 verify_code 异构重算 findings 并按 subject 比对",
+            handler=_verify_findings,
         )
     )
     registry.register(

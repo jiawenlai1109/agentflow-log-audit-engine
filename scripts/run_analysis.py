@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="会话 ID（多轮对话记忆，支持延续性提问）",
     )
+    parser.add_argument(
+        "--pack",
+        default=None,
+        help="场景包名称（如 login_audit 登录日志安全审计， packs/<name>/）",
+    )
     return parser
 
 
@@ -61,6 +66,7 @@ def main() -> int:
         mode=args.mode,
         outputs_root=args.output,
         session_id=args.session,
+        pack=args.pack,
     )
     report = result.get("report") or {}
     print("=" * 48)

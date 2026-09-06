@@ -32,6 +32,7 @@ class CriticAgent(BaseAgent):
             report_path=report_path,
             question=question,
             results=results,
+            sections=data.get("sections"),
         )
         if degraded:
             # 降级报告不检查标准章节/数字（预期缺失），只确认文件可读

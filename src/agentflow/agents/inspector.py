@@ -72,7 +72,10 @@ class InspectorAgent(BaseAgent):
         question: str,
         checks: list[dict[str, str]],
     ) -> tuple[list[dict[str, str]], str | None]:
-        """producer ≠ verifier：按任务类别用确定性模板独立重算，与上报 aggregate 容差比对。"""
+        """producer ≠ verifier：场景包走 finding 独立重算，通用任务走 aggregate 模板重算。"""
+        rule_params = task.get("rule_params") or {}
+        if getattr(ctx, "pack", None) is not None and rule_params:
+            return self._verify_findings(ctx, task, result, checks)
         try:
             outcome = self.registry.call(
                 self.name,
@@ -112,6 +115,61 @@ class InspectorAgent(BaseAgent):
             return checks, "ok"
         return checks, "skipped"
 
+    def _verify_findings(
+        self,
+        ctx: Any,
+        task: dict[str, Any],
+        result: dict[str, Any],
+        checks: list[dict[str, str]],
+    ) -> tuple[list[dict[str, str]], str | None]:
+        """场景包独立校验：规则 verify_code（纯 Python 异构实现）重算 findings 按 subject 比对。"""
+        try:
+            outcome = self.registry.call(
+                self.name,
+                "verify_findings",
+                ctx,
+                task=task,
+                result=result,
+                data_path=ctx.data_path,
+                pack=ctx.pack,
+            )
+        except Exception as exc:  # noqa: BLE001 - 校验器自身故障不阻塞主流程，留痕
+            checks.append(
+                {
+                    "rule": "finding_match_check",
+                    "level": "WARN",
+                    "message": f"独立校验不可用：{str(exc)[:120]}",
+                }
+            )
+            return checks, "skipped"
+        status = outcome.get("status")
+        if status == "fail":
+            checks.append(
+                {
+                    "rule": "finding_match_check",
+                    "level": "FAIL",
+                    "message": f"{outcome.get('message', '')}；独立重算={outcome.get('expected')}",
+                }
+            )
+            return checks, "ok"
+        if status == "skipped":
+            checks.append(
+                {
+                    "rule": "finding_match_check",
+                    "level": "WARN",
+                    "message": f"独立校验跳过：{outcome.get('message', '')}",
+                }
+            )
+            return checks, "skipped"
+        checks.append(
+            {
+                "rule": "finding_match_check",
+                "level": "PASS",
+                "message": outcome.get("message", "独立复算一致"),
+            }
+        )
+        return checks, "ok"
+
     # ------------------------------------------------------------ LLM 语义检查（v1.2 落地）
     def _semantic_check(
         self,
@@ -122,7 +180,8 @@ class InspectorAgent(BaseAgent):
         checks: list[dict[str, str]],
     ) -> list[dict[str, str]]:
         """仅"结果能否回答原始问题"一项语义判断；失败留痕不阻塞（fail-open 留痕）。"""
-        if isinstance(self.llm, MockLLM):
+        if isinstance(self.llm, MockLLM) or task.get("rule_params"):
+            # 规则任务能否回答用户问题由规则包定义，语义检查只服务开放式分析任务
             return checks
         from pydantic import BaseModel
 
