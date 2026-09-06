@@ -124,10 +124,18 @@ class ExecutorAgent(BaseAgent):
             if outcome.timed_out and not bumped_timeout:
                 bumped_timeout = True
                 timeout_seconds = min(timeout_seconds * 2, 120)
+            failure_text = (outcome.stderr or "")[:2000]
+            if not failure_text.strip():
+                # 非零退出但 stderr 为空：按提示词约定错误在 stdout 的 {"error": ...} 里，
+                # 丢弃它会让重做 prompt 变成空错误——自愈循环三轮盲飞（2026-09-06 real 批次实证）
+                parsed = self._parse_summary(outcome.stdout)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    failure_text = str(parsed["error"])[:2000]
+                    last_error_text = str(parsed["error"])[:500]
             history.append("assistant", code)
             history.append(
                 "user",
-                f"执行失败（第 {attempt} 次）：\n{outcome.stderr[:2000]}\n请修正代码后重新输出纯 Python 代码。",
+                f"执行失败（第 {attempt} 次）：\n{failure_text}\n请修正代码后重新输出纯 Python 代码。",
             )
             last_outcome = outcome
             # v1.2 错误路由：字段缺失是规划错误，改码自愈无解——首次分类即跳出，交 Orchestrator 路由
@@ -314,7 +322,8 @@ class ExecutorAgent(BaseAgent):
                 "\"window_end\": \"...\", \"metric\": \"...\", \"value\": 数值, \"evidence\": [至多5条原始日志行字典]}；"
                 "aggregate 必须含 {\"规则" + rule.id + "命中数\": findings数组长度}；"
                 "rows 写 findings 数组长度，columns 写 [\"rule_id\", \"subject\", \"value\"]，"
-                "head 每条含 rule_id/subject/value 三个键。"
+                "head 每条含 rule_id/subject/value 三个键；"
+                "window_start/window_end 使用 YYYY-MM-DD HH:MM:SS 格式（空格分隔，不用 ISO 的 T）。"
             )
         # 闭环回流契约（v1.2）：Inspector 的 suggestion 必须真实进入重做 prompt
         if task.get("_redo_suggestion"):

@@ -5,6 +5,10 @@
 > 审计范围：{{ row_count }} 条登录记录
 > 检测规则包：{{ pack_name }} v{{ pack_version }}（{{ rule_count }} 条规则：{{ rule_ids }}）
 > 规则命中统计：{{ rule_stats }}
+{% if aggregates_text %}> 任务关键指标：{{ aggregates_text }}
+{% endif %}{% if failed_rules %}
+> ⚠️ 未完成检测的规则：{{ failed_rules|join("、") }}（相关规则的结论缺失，请单独复核）
+{% endif %}
 
 ## 一、发现清单（证据层）
 

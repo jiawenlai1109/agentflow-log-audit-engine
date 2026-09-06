@@ -250,6 +250,24 @@ class ReporterAgent(BaseAgent):
             rule_stats[rid] = rule_stats.get(rid, 0) + 1
         stats_text = "，".join(f"{rid}={count}" for rid, count in rule_stats.items())
 
+        # 诚实性：未成功执行的规则任务必须显式披露，安全报告不允许静默缺规则
+        failed_rules = [
+            pack.rules[int(tid) - 1].id
+            for tid in sorted(int(k) for k in results)
+            if (results[str(tid)] or {}).get("status") != "success"
+            and 0 < int(tid) <= len(pack.rules)
+        ]
+
+        # aggregate 全量确定性渲染：Critic 数字核对要求关键指标全部出现在报告中
+        agg_lines = []
+        for task_id in sorted(int(k) for k in results):
+            agg = (results[str(task_id)] or {}).get("summary", {}).get("aggregate") or {}
+            if isinstance(agg, dict) and agg:
+                rid = pack.rules[task_id - 1].id if 0 < task_id <= len(pack.rules) else str(task_id)
+                pairs = "，".join(f"{k}={v}" for k, v in agg.items())
+                agg_lines.append(f"规则{rid}：{pairs}")
+        aggregates_text = "；".join(agg_lines)
+
         verdicts = [results[str(k)].get("verdict") or {} for k in results]
         if verdicts and all(v.get("verification") == "ok" for v in verdicts):
             verification_note = "全部命中数值经独立复算比对一致"
@@ -270,6 +288,8 @@ class ReporterAgent(BaseAgent):
             rule_count=len(pack.rules),
             rule_ids="、".join(rule.id for rule in pack.rules),
             rule_stats=stats_text,
+            failed_rules=failed_rules,
+            aggregates_text=aggregates_text,
             findings=findings,
             evidence_limit=5,
             narrative=narrative,

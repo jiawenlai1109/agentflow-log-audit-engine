@@ -501,6 +501,7 @@ class Orchestrator:
                     "results": {str(k): v for k, v in ctx.results.items()},
                     "degraded": ctx.report.get("degraded", False),
                     "sections": ctx.report.get("sections"),
+                    "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
                 },
                 ensure_ascii=False,
             )

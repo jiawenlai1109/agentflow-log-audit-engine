@@ -25,6 +25,8 @@ from agentflow.pipeline import run_analysis  # noqa: E402
 
 DATA = PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"
 DATA_PROFIT = PROJECT_ROOT / "demo" / "data" / "retail_sales_with_profit.csv"
+LOGIN_ATTACK = PROJECT_ROOT / "demo" / "data" / "login_auth.csv"
+LOGIN_NORMAL = PROJECT_ROOT / "demo" / "data" / "login_auth_normal.csv"
 
 # 默认批次 = 测试用例清单 M1~M5（mock 模式，离线确定性，可纵向对比）
 MOCK_CASES: list[dict[str, Any]] = [
@@ -35,12 +37,24 @@ MOCK_CASES: list[dict[str, Any]] = [
     {"id": "M5", "question": "分析一下上周的利润情况", "data": DATA},
 ]
 
+# 场景包批次（--suite pack）= 登录日志安全审计（攻击数据 4 规则命中 + 正常数据零发现）
+PACK_CASES: list[dict[str, Any]] = [
+    {"id": "P1", "question": "对2026-09-05的登录日志做安全审计", "data": LOGIN_ATTACK, "pack": "login_audit"},
+    {"id": "P2", "question": "对登录日志做安全审计", "data": LOGIN_NORMAL, "pack": "login_audit"},
+]
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="批量跑测并记录评估")
     parser.add_argument("--name", default=None, help="批次名（默认含日期时间）")
     parser.add_argument("--outputs", default=None, help="批次产物目录（默认 outputs/batch_<ts>）")
     parser.add_argument("--mode", default="mock", choices=["mock", "real"])
+    parser.add_argument(
+        "--suite",
+        default="mock",
+        choices=["mock", "pack"],
+        help="批次用例集：mock=M1~M5 零售；pack=场景包（登录日志安全审计）",
+    )
     parser.add_argument(
         "--env-file", default=None, help="real 模式的 .env 路径（默认取脚本所在项目根的 .env）"
     )
@@ -66,8 +80,9 @@ def main() -> int:
     outputs_root.mkdir(parents=True, exist_ok=True)
 
     print(f"批次：{batch_name}\n产物：{outputs_root}\n")
+    cases = PACK_CASES if args.suite == "pack" else MOCK_CASES
     failed = 0
-    for case in MOCK_CASES:
+    for case in cases:
         started = time.monotonic()
         try:
             result = run_analysis(
@@ -75,6 +90,7 @@ def main() -> int:
                 data_path=str(case["data"]),
                 mode=args.mode,
                 outputs_root=outputs_root,
+                pack=case.get("pack"),
             )
             status = result["status"]
         except Exception as exc:  # noqa: BLE001 - 单题异常不阻断批次
