@@ -22,3 +22,6 @@ artifacts/
 *.swp
 .DS_Store
 Thumbs.db
+
+# 本地面试材料（不入库）
+简历项目讲解文档.md
