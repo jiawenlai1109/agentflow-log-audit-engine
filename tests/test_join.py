@@ -286,6 +286,11 @@ def test_run_executes_healthy_join_and_number_matches_independent_merge(tmp_path
     assert join_results, f"跨表任务应成功执行：{evaluation['task_states']}"
     assert int(join_results[0]["summary"]["aggregate"]["join_行数"]) == truth
     assert all(check["ok"] for check in evaluation["join_preflight"].values())
+    # 三处同数：预检（value_counts 相乘）== 执行（LLM 写的 merge）== 校验器重放（另一条算法）
+    verdict = next(
+        r["verdict"] for r in evaluation["results"].values() if r.get("verdict")
+    )
+    assert "aggregate_match_check:PASS" in verdict["checks"], verdict["checks"]
 
 
 def test_single_table_run_records_no_join_preflight(tmp_path):

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from agentflow.agents.base import BaseAgent
+from agentflow.core import dataset_scope
 from agentflow.core.llm import LLMError, MockLLM, extract_json
 from agentflow.core.memory import clean_summary
 from agentflow.core.messages import AgentMessage
@@ -88,12 +89,16 @@ class ExecutorAgent(BaseAgent):
                 self.name,
                 "execute_python",
                 ctx,
-                _scope={"task_id": task_id, "grants": upstream["grants"]},
+                _scope={
+                    "task_id": task_id,
+                    "grants": upstream["grants"],
+                    "dataset_refs": self._refs(task),
+                },
                 code=code,
                 work_dir=work_dir,
                 timeout=timeout_seconds,
                 env={
-                    "DATA_PATH": ctx.data_path,
+                    "DATA_PATH": self._primary_path(ctx, task),
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),
                     **self._dataset_env(ctx, task),
                     **upstream["env"],
@@ -189,13 +194,14 @@ class ExecutorAgent(BaseAgent):
             self.name,
             "execute_python",
             ctx,
-            _scope={"task_id": task_id, "grants": []},
+            _scope={"task_id": task_id, "grants": [], "dataset_refs": self._refs(task)},
             code=rule.reference_code,
             work_dir=work_dir,
             timeout=self._task_timeout(ctx),
             env={
-                "DATA_PATH": ctx.data_path,
+                "DATA_PATH": self._primary_path(ctx, task),
                 "ARTIFACTS_DIR": str(ctx.artifacts_dir),
+                **self._dataset_env(ctx, task),
             },
         )
         if outcome.success:
@@ -294,29 +300,23 @@ class ExecutorAgent(BaseAgent):
             artifacts=[str(step_file)],
         )
 
+    # ------------------------------------------------------------ 表级作用域（#19，口径见 core/dataset_scope）
+    # 这些方法一律薄转发：executor / visualizer / inspector 必须问同一份"本任务能碰哪几张表"，
+    # 各算一遍迟早算出三种授权范围。
+
+    @staticmethod
+    def _refs(task: dict[str, Any]) -> list[str]:
+        return dataset_scope.scope_refs(task)
+
     @staticmethod
     def _tables(ctx: Any, task: dict[str, Any]) -> list[Any]:
-        """任务声明的表（按 dataset_refs 顺序）；未声明 = 单表语义，返回空。"""
-        refs = [str(ref) for ref in (task.get("dataset_refs") or [])]
-        if len(refs) < 2:
-            return []
-        by_id = {table.id: table for table in getattr(ctx.bundle, "tables", [])}
-        return [by_id[ref] for ref in refs if ref in by_id]
+        return dataset_scope.task_tables(ctx, task)
+
+    def _primary_path(self, ctx: Any, task: dict[str, Any]) -> str:
+        return dataset_scope.primary_path(ctx, task)
 
     def _available_columns(self, ctx: Any, task: dict[str, Any]) -> list[str]:
-        """可用列口径：单表沿用主表画像；跨表任务给"声明的这几张表的列并集"。
-
-        并集不是放宽——它只覆盖任务自己声明的表，未声明的表既不进 prompt 也不进 env。
-        """
-        tables = self._tables(ctx, task)
-        if not tables:
-            return [col["name"] for col in (ctx.schema_profile or {}).get("columns", [])]
-        ordered: list[str] = []
-        for table in tables:
-            for column in table.columns:
-                if column not in ordered:
-                    ordered.append(column)
-        return ordered
+        return dataset_scope.column_scope(ctx, task)
 
     def _join_lines(self, ctx: Any, task: dict[str, Any]) -> list[str]:
         tables = self._tables(ctx, task)
@@ -339,10 +339,10 @@ class ExecutorAgent(BaseAgent):
         return lines
 
     def _dataset_env(self, ctx: Any, task: dict[str, Any]) -> dict[str, str]:
-        """把声明表的归一化 CSV 路径注入 env（只注入声明过的，天然是一份窄授权）。"""
+        """声明表的归一化 CSV 路径注入 env：只注入声明过的，天然是一份窄授权。"""
         return {
-            f"DATA_PATH_{str(table.id).upper()}": str(table.path)
-            for table in self._tables(ctx, task)
+            f"DATA_PATH_{table_id.upper()}": path
+            for table_id, path in dataset_scope.table_paths(ctx, task).items()
         }
 
     def _task_prompt(self, ctx: Any, task: dict[str, Any]) -> str:

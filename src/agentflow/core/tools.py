@@ -18,6 +18,14 @@ class PathViolationError(ToolError):
     """路径越界：请求路径不在授权范围内。"""
 
 
+class TableViolationError(PathViolationError):
+    """表级越权（#19）：任务只准读它自己声明的 dataset_refs。
+
+    它是 PathViolationError 的子类——所有按"路径越界"处置的既有通道（自愈、审计、
+    错误路由）天然继续生效，不需要调用方改捕获。
+    """
+
+
 def ensure_within(root: Path, path: str | Path) -> Path:
     """校验 path 位于 root 之内（解析后），拒绝 .. 与越界绝对路径。"""
     root = Path(root).resolve()
@@ -53,6 +61,7 @@ def ensure_authorized(
     path: str | Path,
     task_id: int | None = None,
     grants: list[str] | None = None,
+    dataset_refs: list[str] | None = None,
 ) -> Path:
     """两级授权（安全与隔离设计 §3，v1.2）：
 
@@ -60,8 +69,12 @@ def ensure_authorized(
     2. 任务级（依赖边 = 授权边）：task-scoped 调用（executor/visualizer）不可读
        兄弟任务的 work/ 目录；其他任务的 artifacts 必须命中 grants 清单。
        task_id 为空 = 运行级角色（explorer/inspector/critic/reporter），维持运行级放行。
+    3. 表级（#19）：声明了 dataset_refs 的任务，只能读它点名的那几张表（含原件副本）；
+       越表在这里就拒，不给子进程"读了再说"的机会。
     """
     target = ensure_allowed(ctx, path)
+    if dataset_refs:
+        _ensure_table_granted(ctx, target, dataset_refs, path)
     run_root = Path(ctx.outputs_dir).resolve()
     work_root = run_root / "work"
     art_root = run_root / "artifacts"
@@ -86,6 +99,32 @@ def ensure_authorized(
                 f"路径越界：{path} 属于任务 {owner} 的产物，未在授权清单（grants）内——依赖边即授权边"
             )
     return target
+
+
+def _ensure_table_granted(
+    ctx: Any, target: Path, dataset_refs: list[str], raw: str | Path
+) -> None:
+    """表级放行判断：路径若属于 Bundle 里**未被声明**的表（或其原件副本），直接拒。
+
+    只约束"是 bundle 表"的那些路径——run 目录下的 work/artifacts 照常走任务级规则，
+    否则会把"写自己的中间结果"也一起拦掉。
+    """
+    bundle = getattr(ctx, "bundle", None)
+    tables = list(getattr(bundle, "tables", []) or [])
+    if not tables:
+        return
+    denied: set[Path] = set()
+    for table in tables:
+        if str(table.id) in {str(ref) for ref in dataset_refs}:
+            continue
+        denied.add(Path(table.path).resolve())
+        if table.source_path:
+            denied.add(Path(table.source_path).resolve())
+    if target in denied:
+        raise TableViolationError(
+            f"表级越权：任务声明的 dataset_refs={list(dataset_refs)} 不包含该表，"
+            f"却试图读 {raw}（未声明的表既不进 prompt 也不进 env，路径本身也不放行）"
+        )
 
 
 def _artifact_owner(target: Path) -> int | None:
@@ -215,10 +254,29 @@ class ToolRegistry:
         scope = _scope or {}
         task_id = scope.get("task_id")
         grants = scope.get("grants")
+        dataset_refs = scope.get("dataset_refs")
         guarded: dict[str, Any] = {}
         for key, value in params.items():
             if key in PATH_LIKE_KEYS and isinstance(value, (str, Path)):
-                guarded[key] = ensure_authorized(ctx, value, task_id=task_id, grants=grants)
+                try:
+                    guarded[key] = ensure_authorized(
+                        ctx, value, task_id=task_id, grants=grants, dataset_refs=dataset_refs
+                    )
+                except TableViolationError as error:
+                    # 越表是安全事件，不是普通失败：必须先留痕再抛（transcript 是事实层）
+                    self._audit(
+                        ctx,
+                        {
+                            "event": "tool_denied_table",
+                            "agent": agent_name,
+                            "tool": tool_name,
+                            "task_id": task_id,
+                            "declared_refs": list(dataset_refs or []),
+                            "path": str(value),
+                            "reason": str(error),
+                        },
+                    )
+                    raise
             else:
                 guarded[key] = value
         return tool.handler(ctx=ctx, **guarded)
@@ -545,12 +603,20 @@ def _verify_aggregate(
     task: dict[str, Any],
     data_path: str | Path,
     schema_profile: dict[str, Any] | None = None,
+    table_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """独立校验（v1.2，producer ≠ verifier）：按任务类别用确定性模板重算关键指标。"""
+    """独立校验（v1.2，producer ≠ verifier）：按任务类别用确定性模板重算关键指标。
+
+    跨表任务（#19）额外拿到 `table_paths` 后改走 join 重放，见 `verification.run_verification`。
+    """
     from agentflow.core.verification import run_verification
 
     return run_verification(
-        task=task, result=result, data_path=str(data_path), schema_profile=schema_profile
+        task=task,
+        result=result,
+        data_path=str(data_path),
+        schema_profile=schema_profile,
+        table_paths=table_paths,
     )
 
 

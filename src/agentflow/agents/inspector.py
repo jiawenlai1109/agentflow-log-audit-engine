@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from agentflow.agents.base import BaseAgent
+from agentflow.core import dataset_scope
 from agentflow.core.llm import MockLLM
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.verdict import CheckResult, Verdict
@@ -83,8 +84,10 @@ class InspectorAgent(BaseAgent):
                 ctx,
                 result=result,
                 task={**task, "_question": question},
-                data_path=ctx.data_path,
+                # 跨表任务按它自己声明的表重放（与执行器同一口径，见 core/dataset_scope）
+                data_path=dataset_scope.primary_path(ctx, task),
                 schema_profile=ctx.schema_profile or {},
+                table_paths=dataset_scope.table_paths(ctx, task),
             )
         except Exception as exc:  # noqa: BLE001 - 校验器自身故障不阻塞主流程，留痕
             checks.append(

@@ -7,6 +7,7 @@ from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.agents.executor import strip_code_fence
+from agentflow.core import dataset_scope
 from agentflow.core.llm import LLMError
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.figure import FigureResult
@@ -65,17 +66,23 @@ class VisualizerAgent(BaseAgent):
                     "grants": [result["intermediate_file"]]
                     if result.get("intermediate_file")
                     else [],
+                    "dataset_refs": dataset_scope.scope_refs(task),
                 },
                 code=code,
                 work_dir=ctx.task_work_dir(task_id),
                 timeout=self._timeout(ctx),
                 env={
-                    "DATA_PATH": ctx.data_path,
+                    # 跨表任务的 DATA_PATH 必须是本任务声明的第一张表，否则会画到主表上去
+                    "DATA_PATH": dataset_scope.primary_path(ctx, task),
                     "RESULT_PATH": result.get("intermediate_file") or "",
                     "CHART_PATH": str(chart_path),
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),
                     "CHART_TYPE": chart_type,
                     "MPLCONFIGDIR": str(ctx.task_work_dir(task_id) / "mplconfig"),
+                    **{
+                        f"DATA_PATH_{table_id.upper()}": path
+                        for table_id, path in dataset_scope.table_paths(ctx, task).items()
+                    },
                 },
             )
             if outcome.success and chart_path.exists() and chart_path.stat().st_size > 0:

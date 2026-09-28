@@ -317,17 +317,94 @@ def _run_template(
     return metrics, None
 
 
+def build_join_check_code(paths: list[str], key: str) -> str:
+    """多表任务的对照代码（#19）：**换一条算法**重放声明的 join。
+
+    行数用两侧键列 value_counts 相乘得到（与 `core/join.py` 预检同一公式，但与生产者写的
+    `merge` 不是同一条路径），同时把 `merge` 的行数一并上报——两个算法互为校验：
+    预检、重放、执行三处算出同一个数，这个数字才算立住。
+    """
+    return (
+        "import json\n"
+        "import pandas as pd\n"
+        f"_PATHS = {paths!r}\n"
+        f"_KEY = {key!r}\n"
+        "_LEFT = pd.read_csv(_PATHS[0])\n"
+        "_RIGHT = pd.read_csv(_PATHS[1])\n"
+        "_LC = _LEFT[_KEY].value_counts(dropna=False)\n"
+        "_RC = _RIGHT[_KEY].value_counts(dropna=False)\n"
+        "_COMMON = _LC.index.intersection(_RC.index)\n"
+        "_PRODUCT = int((_LC.loc[_COMMON] * _RC.loc[_COMMON]).sum()) if len(_COMMON) else 0\n"
+        "_MERGED = _LEFT.merge(_RIGHT, on=_KEY, how='inner')\n"
+        "metrics = [{'family': 'count', 'column': None, 'value': float(_PRODUCT), 'scope': 'join'}]\n"
+        "if len(_MERGED):\n"
+        "    metrics.append({'family': 'count', 'column': None, 'value': float(len(_MERGED)), 'scope': 'join_merge'})\n"
+        "    _NUM = next((c for c in _MERGED.select_dtypes(include='number').columns if c != _KEY), None)\n"
+        "    if _NUM is not None:\n"
+        "        _total = 0.0\n"
+        "        for _v in _MERGED[_NUM].tolist():\n"
+        "            _total += float(_v)\n"
+        "        metrics.append({'family': 'sum', 'column': _NUM, 'value': _total, 'scope': 'join'})\n"
+        "print(json.dumps({'metrics': metrics}) if metrics else json.dumps({'skipped': True}))\n"
+    )
+
+
+def _run_join_template(
+    paths: list[str], key: str
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """在独立子进程重放 join（与执行器的实现异构），返回 (metrics, 不可用原因)。"""
+    work_dir = Path(tempfile.mkdtemp(prefix="verify_join_"))
+    code = build_join_check_code(paths, key)
+    outcome = LocalBackend().execute(code, work_dir=work_dir, env={}, timeout=60)
+    if not outcome.success:
+        return None, f"join 对照模板执行失败：{(outcome.stderr or '')[-200:]}"
+    try:
+        start = outcome.stdout.index("{")
+        parsed = json.loads(outcome.stdout[start : outcome.stdout.rindex("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return None, "join 对照模板输出无法解析"
+    metrics = parsed.get("metrics") or []
+    if parsed.get("skipped") or not metrics:
+        return None, "join 重放没有产出可比指标"
+    return metrics, None
+
+
 def run_verification(
     task: dict[str, Any],
     result: dict[str, Any],
     data_path: str,
     schema_profile: dict[str, Any] | None = None,
+    table_paths: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """执行独立校验：返回 {status: pass|fail|skipped, message, expected}。"""
+    """执行独立校验：返回 {status: pass|fail|skipped, message, expected}。
+
+    `table_paths` 给出且声明了两张以上表 ⇒ 走多表 join 重放；否则维持单表类别模板。
+    """
     summary = (result or {}).get("summary") or {}
     reported = summary.get("aggregate") if isinstance(summary.get("aggregate"), dict) else {}
     if not reported:
         return {"status": "skipped", "message": "结果未提供 aggregate，无可校验指标", "expected": None}
+
+    refs = [str(ref) for ref in (task.get("dataset_refs") or [])]
+    if len(refs) >= 2 and table_paths:
+        keys = [str(key) for key in (task.get("join_keys") or [])]
+        paths = [str(table_paths[ref]) for ref in refs if ref in table_paths]
+        if len(paths) < 2:
+            return {"status": "skipped", "message": "声明的表路径不全，无法重放 join", "expected": None}
+        if not keys:
+            return {"status": "skipped", "message": "跨表任务未声明 join_keys，无确定作用域可重放", "expected": None}
+        columns = [str(c.get("name")) for c in ((schema_profile or {}).get("columns") or [])]
+        metrics, reason = _run_join_template(paths, keys[0])
+        if reason:
+            return {"status": "skipped", "message": reason, "expected": None}
+        status, message, comparable = _compare(reported, metrics, columns)
+        if comparable == 0:
+            return {
+                "status": "skipped",
+                "message": "上报指标与 join 重放无共同指标（命名/口径不同），无法独立校验",
+                "expected": metrics,
+            }
+        return {"status": status, "message": f"[join 重放] {message}", "expected": metrics}
 
     question = task.get("_question", "")
     task_text = f"{task.get('description', '')} {task.get('code_hint', '')}"
