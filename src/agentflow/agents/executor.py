@@ -202,6 +202,7 @@ class ExecutorAgent(BaseAgent):
                 "DATA_PATH": self._primary_path(ctx, task),
                 "ARTIFACTS_DIR": str(ctx.artifacts_dir),
                 **self._dataset_env(ctx, task),
+                **self._role_env(ctx, rule),
             },
         )
         if outcome.success:
@@ -358,6 +359,28 @@ class ExecutorAgent(BaseAgent):
             for table_id, path in dataset_scope.table_paths(ctx, task).items()
         }
 
+    @staticmethod
+    def _role_env(ctx: Any, rule: Any) -> dict[str, str]:
+        """规则按角色声明数据（`DATA_PATH_AUTH` / `DATA_PATH_ASSETS`）。
+
+        角色名比表 id 稳：id 取决于上传顺序，而规则写的"认证日志/资产台账"是领域事实。
+        """
+        from agentflow.core.pack import role_env
+
+        pack = getattr(ctx, "pack", None)
+        if pack is None or rule is None or getattr(ctx, "bundle", None) is None:
+            return {}
+        return role_env(pack, ctx.bundle, rule)
+
+    def _rule_role_lines(self, ctx: Any, rule: Any) -> list[str]:
+        env = self._role_env(ctx, rule)
+        if not env:
+            return []
+        return [
+            "本规则按角色读取以下数据（角色名即环境变量名，不要改用表 id 猜路径）："
+            + "；".join(f"{name} → os.environ[{key!r}]" for key, name in env.items())
+        ]
+
     def _task_prompt(self, ctx: Any, task: dict[str, Any]) -> str:
         schema = ctx.schema_profile or {}
         parts = [
@@ -384,6 +407,7 @@ class ExecutorAgent(BaseAgent):
             parts.append(
                 f"检测规则规格（必须严格按此实现，不得自行发明或修改检测标准）：{rule.detection_spec}"
             )
+            parts.extend(self._rule_role_lines(ctx, rule))
             parts.append(
                 "输出契约：除通用要求外，必须输出 \"findings\" 数组，每条为 "
                 "{\"rule_id\": \"" + rule.id + "\", \"subject\": \"...\", \"window_start\": \"...\", "

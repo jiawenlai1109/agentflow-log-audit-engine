@@ -21,7 +21,14 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
 @dataclass
 class PackRule:
-    """单条检测规则：判定标准（确定性）+ 处置建议 + 两套异构实现。"""
+    """单条检测规则：判定标准（确定性）+ 处置建议 + 两套异构实现。
+
+    `requires` 是跨表规则的关键设计：规则按**角色**声明它需要哪些列
+    （`{auth: [auth_result, account], assets: [是否生产]}`），系统在运行时把每个角色解析成
+    一张真实的表，并以 `DATA_PATH_<角色大写>` 注入实现与校验器。
+    规则里不写 t1/t2，也不写 DATA_PATH_T1——表 id 取决于用户先传哪个文件，
+    写死 id 的规则换一次上传顺序就静默指向别的表，而且没人会察觉。
+    """
 
     id: str
     name: str
@@ -31,6 +38,28 @@ class PackRule:
     detection_spec: str
     reference_code: str
     verify_code: str
+    requires: dict[str, list[str]] = field(default_factory=dict)
+    join_keys: list[str] = field(default_factory=list)
+
+    def resolve(self, pack: "ScenarioPack", bundle: Any) -> dict[str, Any] | None:
+        """角色 → 表对象。任一角色找不到承载表就返回 None（规则不可执行，不猜）。"""
+        if not self.requires or bundle is None:
+            return {}
+        resolved: dict[str, Any] = {}
+        for role, columns in self.requires.items():
+            wanted = {pack.canonical(column) for column in columns}
+            table = next(
+                (
+                    item
+                    for item in bundle.tables
+                    if wanted <= {pack.canonical(column) for column in item.columns}
+                ),
+                None,
+            )
+            if table is None:
+                return None
+            resolved[str(role)] = table
+        return resolved
 
 
 @dataclass
@@ -45,6 +74,12 @@ class ScenarioPack:
     rules: list[PackRule]
     report_template: str
     path: Path
+    # 领域措辞属于包，不属于框架：reporter 里硬编码"登录日志安全审计"时，
+    # 第二个场景包一接进来就会得到一份说错话的报告
+    subject_label: str = "审计"
+    report_sections: list[str] = field(
+        default_factory=lambda: ["发现清单", "处置建议", "研判摘要", "审计说明"]
+    )
     # 实际列名 → 规范名（M3-1）：跨源数据同一实体常有三种叫法
     column_aliases: dict[str, str] = field(default_factory=dict)
 
@@ -80,6 +115,11 @@ def load_pack(name: str) -> ScenarioPack:
             detection_spec=str(entry.get("detection_spec", "")).strip(),
             reference_code=str(entry.get("reference_code", "")).strip(),
             verify_code=str(entry.get("verify_code", "")).strip(),
+            requires={
+                str(role): [str(column) for column in (columns or [])]
+                for role, columns in (entry.get("requires") or {}).items()
+            },
+            join_keys=[str(k) for k in (entry.get("join_keys") or [])],
         )
         for entry in (data.get("rules") or [])
     ]
@@ -94,6 +134,9 @@ def load_pack(name: str) -> ScenarioPack:
         rules=rules,
         report_template=template_path.read_text(encoding="utf-8"),
         path=root,
+        subject_label=str(data.get("subject_label", "审计")),
+        report_sections=[str(s) for s in (data.get("report_sections") or [])]
+        or ["发现清单", "处置建议", "研判摘要", "审计说明"],
         # 别名按列名匹配，不按表 id：id 取决于用户先传哪个文件，按 id 写会静默失效
         column_aliases={
             str(actual): str(canonical)
@@ -102,21 +145,71 @@ def load_pack(name: str) -> ScenarioPack:
     )
 
 
-def pack_plan_tasks(pack: ScenarioPack) -> list[dict[str, Any]]:
-    """按规则目录确定性生成检测任务（不调 LLM——LLM 不判危险）。"""
-    return [
-        {
-            "task_id": index,
-            "description": f"检测规则{rule.id}：{rule.name}",
-            "required_columns": list(pack.required_columns),
-            "code_hint": f"rule_pack:{rule.id}",
-            "chart_type": "none",
-            "depends_on": [],
-            "upstream_refs": [],
-            "rule_params": {"id": rule.id},
-        }
-        for index, rule in enumerate(pack.rules, start=1)
-    ]
+def role_env(pack: ScenarioPack, bundle: Any, rule: PackRule) -> dict[str, str]:
+    """规则角色 → `DATA_PATH_<角色大写>`。执行器与校验器都靠它拿到表，
+    所以两边必须是同一个解析结果（同一函数），否则校验器在校验另一份数据。
+    """
+    resolved = rule.resolve(pack, bundle) or {}
+    return {
+        f"DATA_PATH_{str(role).upper()}": str(table.path)
+        for role, table in resolved.items()
+    }
+
+
+def available_columns(pack: ScenarioPack, bundle: Any) -> set[str]:
+    """这个 Bundle 能提供的规范列全集（跨所有表，按别名归一）。
+
+    场景包的必需列校验原先只看主表——多源输入下 `域` 在资产表、`auth_result` 在防火墙表，
+    只看主表会把合法的多源包判成"缺列"。
+    """
+    columns: set[str] = set()
+    for table in getattr(bundle, "tables", []) or []:
+        columns |= {pack.canonical(column) for column in table.columns}
+    return columns
+
+
+def pack_plan_tasks(pack: ScenarioPack, bundle: Any = None) -> list[dict[str, Any]]:
+    """按规则目录确定性生成检测任务（不调 LLM——LLM 不判危险）。
+
+    传 `bundle` 时，声明了 `requires` 的规则会解析出实际表并带上 `dataset_refs` /
+    `join_keys`，于是跨表规则走的是与通用跨表任务同一条通道：派发前基数预检、表级授权、
+    独立重放。解析不出来的规则不生成任务（宁缺毋滥：指向错表的规则比没有规则更危险）。
+    """
+    tasks: list[dict[str, Any]] = []
+    index = 0
+    for rule in pack.rules:
+        resolved = rule.resolve(pack, bundle) if bundle is not None else {}
+        if rule.requires and bundle is not None and not resolved:
+            continue  # 角色找不到承载表 ⇒ 这条规则在当前数据上不可执行
+        index += 1
+        refs = []
+        if resolved:
+            seen: list[str] = []
+            for table in resolved.values():
+                if str(table.id) not in seen:
+                    seen.append(str(table.id))
+            refs = seen if len(seen) >= 2 else []
+        tasks.append(
+            {
+                "task_id": index,
+                "description": f"检测规则{rule.id}：{rule.name}",
+                "required_columns": sorted(
+                    {column for columns in rule.requires.values() for column in columns}
+                )
+                or list(pack.required_columns),
+                "code_hint": f"rule_pack:{rule.id}",
+                "chart_type": "none",
+                "depends_on": [],
+                "upstream_refs": [],
+                "rule_params": {"id": rule.id, "roles": sorted(str(role) for role in resolved)},
+                "dataset_refs": refs,
+                # 单角色规则也要有确定主表：不写的话 DATA_PATH 会落到"按文件名排第一张"，
+                # 三源场景下那是资产台账，T1 会在错的数据上跑出空结果
+                "primary_ref": str(next(iter(resolved.values())).id) if resolved else "",
+                "join_keys": list(rule.join_keys),
+            }
+        )
+    return tasks
 
 
 def verify_findings(
@@ -124,6 +217,7 @@ def verify_findings(
     task: dict[str, Any],
     result: dict[str, Any],
     data_path: str,
+    bundle: Any = None,
 ) -> dict[str, Any]:
     """producer ≠ verifier（场景包版）：用规则自带 verify_code 独立重算并按 subject 比对。
 
@@ -139,7 +233,7 @@ def verify_findings(
     if not isinstance(reported, list):
         return {"status": "skipped", "message": "结果未提供 findings 数组，无法校验", "expected": None}
 
-    expected = _run_verify_code(rule, data_path)
+    expected = _run_verify_code(rule, data_path, pack=pack, bundle=bundle)
     if expected is None:
         return {"status": "skipped", "message": "独立校验器执行失败或输出不可解析", "expected": None}
 
@@ -175,20 +269,32 @@ def _close(actual: Any, expected: Any) -> bool:
     return math.isclose(a, b, rel_tol=0.0, abs_tol=max(1e-6, 0.001 * abs(b)))
 
 
-def _run_verify_code(rule: PackRule, data_path: str) -> list[Any] | None:
-    """子进程执行独立校验器，返回期望 findings 列表；失败返回 None（skipped 语义）。"""
+def _run_verify_code(
+    rule: PackRule,
+    data_path: str,
+    pack: ScenarioPack | None = None,
+    bundle: Any = None,
+) -> list[Any] | None:
+    """子进程执行独立校验器，返回期望 findings 列表；失败返回 None（skipped 语义）。
+
+    跨表规则的两个实现读的是**同一组角色路径**：校验器若只读主表，它算的就不是同一条判断，
+    "一致"也就没有意义。
+    """
     import tempfile
 
     from agentflow.core.executor import LocalBackend
 
     if not rule.verify_code.strip():
         return None
+    env = {"DATA_PATH": str(data_path)}
+    if pack is not None and bundle is not None:
+        env.update(role_env(pack, bundle, rule))
     work_dir = Path(tempfile.mkdtemp(prefix="pack_verify_"))
     backend = LocalBackend()
     outcome = backend.execute(
         rule.verify_code,
         work_dir=work_dir,
-        env={"DATA_PATH": str(data_path)},
+        env=env,
         timeout=60,
     )
     if not outcome.success:

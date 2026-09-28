@@ -1,0 +1,221 @@
+# 场景包 #2：SOC 多源告警分诊（M3 · 场景 S1）
+#
+# 这个包存在的理由不是"又能查几条规则"，而是证明一件事：
+# **跨源的判断在单表上根本写不出来**。「生产域主机的异常登录」需要认证日志（auth.csv）
+# 提供失败次数、资产台账（assets.csv）提供 `是否生产`——两份文件、两套列名。
+#
+# 三条纪律沿用 login_audit，并新增第四条：
+# 1. LLM 不判危险：检测标准全部来自本文件，模型只写实现与研判叙述；
+# 2. producer ≠ verifier：每条规则的 verify_code 与 reference_code 异构
+#    （pandas 分组 vs 纯 Python 字典扫描），结论不一致即 FAIL；
+# 3. 空结果语义反转：无发现是好消息，规则任务不因空 findings 判 FAIL；
+# 4. **跨表规则声明"需要哪些列"而不是"哪几张表"**（`requires: {角色: [列名]}`）：表 id 由上传顺序
+#    决定，写死 id 的规则换一次上传顺序就静默指向别的表。解析成表由系统做，
+#    能不能连、连上膨胀多少由 `core/join.py` 的派发前预检判定。
+
+name: sigma_triage
+version: "1.0"
+description: SOC 多源告警分诊（认证日志 × 资产台账 × EDR 告警，三源列名不统一）
+subject_label: 多源告警分诊
+# 三档分离：事实（分诊队列 / 证据链）→ 建议（处置）→ 推断（研判）。
+# 模板里刻意把"研判"放在最后，且叙述只能引用队列里已有的事实——防的是把猜测写成结论。
+report_sections: [分诊队列, 证据链, 处置建议, 研判摘要, 分诊说明]
+
+data_convention:
+  # 必需列按**规范名**声明：`src_ip` 经别名映射后就是 `主机`，列在这里会永远校验不过
+  required_columns: [time, account, auth_result, service, 主机, 是否生产, 严重级]
+  time_format: "%Y-%m-%d %H:%M:%S"
+  # 跨源同一实体的三种叫法。只用于"认出来"，不改写归一化 CSV 的列名（I1 原文可追）
+  column_aliases:
+    src_ip: 主机
+    host: 主机
+  finding_subject_format: "T1 = '<src_ip>-><account>'；T3/T4 = '<主机>'"
+  evidence_limit: 5
+  note: >
+    阈值取自实测背景噪声：非生产域主机也有 6 次失败、有 high 告警的主机也有 1 次偶发失败，
+    这两条是故意埋的误报陷阱——阈值若贴着噪声取，规则就会把它们报成事件。
+
+rules:
+  - id: T1
+    name: 认证爆破
+    severity: high
+    disposition: 建议封禁该源 IP 并重置目标账号口令；同网段其他账号需回查是否有同期失败记录。
+    # 规则一律按角色寻址数据：T1 虽只用到一张表，但"哪张表"必须由列签名决定，
+    # 不能靠"主表"——三源里主表是按上传顺序排第一张（这次是 assets），用它跑 T1 会得到空结果。
+    requires:
+      auth: [auth_result, account, time]
+    params:
+      min_failures: 8
+      max_span_minutes: 5
+    detection_spec: |
+      认证爆破检测（单表 auth）：按 (src_ip, account) 统计 auth_result == 'failed' 的次数，
+      仅当次数 >= 8 且这些失败的时间跨度 <= 5 分钟时输出一条 finding。
+      subject 为 '<src_ip>-><account>'，metric 为 '窗口内失败次数'，value 为该次数，
+      window_start/window_end 为首/末次失败时间，evidence 为窗口内最后 5 条原始日志行字典。
+      输出必须含 aggregate {"规则T1命中数": findings 长度}，rows 写 findings 长度。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      df = pd.read_csv(os.environ['DATA_PATH_AUTH'], parse_dates=['time'])
+      failed = df[df['auth_result'] == 'failed']
+      findings = []
+      for (src_ip, account), group in failed.groupby(['src_ip', 'account']):
+          ordered = group.sort_values('time')
+          span = (ordered['time'].max() - ordered['time'].min()).total_seconds() / 60.0
+          if len(ordered) >= 8 and span <= 5:
+              findings.append({
+                  'rule_id': 'T1', 'subject': f'{src_ip}->{account}',
+                  'window_start': str(ordered['time'].min()), 'window_end': str(ordered['time'].max()),
+                  'metric': '窗口内失败次数', 'value': int(len(ordered)),
+                  'evidence': ordered.tail(5).astype(str).to_dict(orient='records'),
+              })
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'rows': len(findings), 'columns': ['rule_id', 'subject', 'value'],
+                        'head': findings[:5], 'aggregate': {'规则T1命中数': len(findings)},
+                        'findings': findings}, ensure_ascii=False))
+    verify_code: |
+      import os, json
+      import csv
+      from datetime import datetime
+      rows = list(csv.DictReader(open(os.environ['DATA_PATH_AUTH'], encoding='utf-8-sig')))
+      buckets = {}
+      for row in rows:
+          if row.get('auth_result') != 'failed':
+              continue
+          buckets.setdefault((row['src_ip'], row['account']), []).append(row['time'])
+      findings = []
+      for (src_ip, account), stamps in buckets.items():
+          moments = sorted(datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S') for stamp in stamps)
+          span = (moments[-1] - moments[0]).total_seconds() / 60.0
+          if len(moments) >= 8 and span <= 5:
+              findings.append({'rule_id': 'T1', 'subject': f'{src_ip}->{account}',
+                               'value': len(moments),
+                               'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
+                               'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'findings': findings}, ensure_ascii=False))
+
+  - id: T3
+    name: 生产域主机大量认证失败（资产加权）
+    severity: critical
+    disposition: 生产域主机优先：立即隔离该主机网络出口、导出近 24 小时进程清单，并通知资产责任人现场确认。
+    requires:
+      auth: [auth_result, time]
+      assets: [是否生产]
+    join_keys: [主机]
+    params:
+      min_failures: 3
+    detection_spec: |
+      生产域主机大量认证失败（跨表 auth ⋈ assets）：先把 auth 的 src_ip 与 assets 的 主机
+      视为同一实体（规范名 主机），筛出 是否生产 == 'Y' 的主机，统计每台主机的
+      auth_result == 'failed' 次数；次数 >= 3 才输出 finding。
+      subject 为主机地址，metric 为 '生产域失败次数'，value 为该次数，
+      window_start/window_end 为该机首/末次失败时间，evidence 为最后 5 条原始认证日志。
+      非生产域主机即使失败次数更多也不得输出——这条规则的意义就是资产加权。
+      输出必须含 aggregate {"规则T3命中数": findings 长度}，rows 写 findings 长度。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      auth = pd.read_csv(os.environ['DATA_PATH_AUTH'], parse_dates=['time'])
+      assets = pd.read_csv(os.environ['DATA_PATH_ASSETS'])
+      auth = auth.rename(columns={'src_ip': '主机'})
+      production = assets.loc[assets['是否生产'] == 'Y', '主机']
+      failed = auth[auth['auth_result'] == 'failed'].merge(
+          pd.DataFrame({'主机': production.tolist()}), on='主机', how='inner')
+      findings = []
+      for host, group in failed.groupby('主机'):
+          ordered = group.sort_values('time')
+          if len(ordered) >= 3:
+              findings.append({
+                  'rule_id': 'T3', 'subject': str(host),
+                  'window_start': str(ordered['time'].min()), 'window_end': str(ordered['time'].max()),
+                  'metric': '生产域失败次数', 'value': int(len(ordered)),
+                  'evidence': ordered.tail(5).astype(str).to_dict(orient='records'),
+              })
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'rows': len(findings), 'columns': ['rule_id', 'subject', 'value'],
+                        'head': findings[:5], 'aggregate': {'规则T3命中数': len(findings)},
+                        'findings': findings}, ensure_ascii=False))
+    verify_code: |
+      import os, json
+      import csv
+      from datetime import datetime
+      auth_path, assets_path = os.environ['DATA_PATH_AUTH'], os.environ['DATA_PATH_ASSETS']
+      production = {row['主机'] for row in csv.DictReader(open(assets_path, encoding='utf-8-sig'))
+                    if row.get('是否生产') == 'Y'}
+      buckets = {}
+      for row in csv.DictReader(open(auth_path, encoding='utf-8-sig')):
+          if row.get('auth_result') != 'failed' or row.get('src_ip') not in production:
+              continue
+          buckets.setdefault(row['src_ip'], []).append(row['time'])
+      findings = []
+      for host, stamps in buckets.items():
+          moments = sorted(datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S') for stamp in stamps)
+          if len(moments) >= 3:
+              findings.append({'rule_id': 'T3', 'subject': host, 'value': len(moments),
+                               'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
+                               'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'findings': findings}, ensure_ascii=False))
+
+  - id: T4
+    name: EDR 高危告警且伴随认证失败
+    severity: critical
+    disposition: 视为已入侵候选：立即阻断该主机、吊销其全部会话令牌，并把 EDR 原始告警与认证记录一并交人工研判。
+    requires:
+      edr: [严重级]
+      auth: [auth_result, time]
+    join_keys: [主机]
+    params:
+      min_failures: 2
+    detection_spec: |
+      EDR 高危 ∧ 认证失败（跨表 edr ⋈ auth）：取 edr 中 严重级 == 'high' 的主机，
+      关联 auth（src_ip 与 主机 视为同一实体），仅当该主机 auth_result == 'failed' 的
+      次数 >= 2 时输出 finding。阈值取 2 而不是 1：背景噪声里偶发一次失败属常态，
+      贴着噪声取阈值会把正常主机升级为 critical。
+      subject 为主机地址，metric 为 '高危告警伴随失败次数'，value 为该次数，
+      window_start/window_end 为该机首/末次失败时间，evidence 为最后 5 条认证日志。
+      输出必须含 aggregate {"规则T4命中数": findings 长度}，rows 写 findings 长度。
+    reference_code: |
+      import os, json
+      import pandas as pd
+      auth = pd.read_csv(os.environ['DATA_PATH_AUTH'], parse_dates=['time']).rename(columns={'src_ip': '主机'})
+      edr = pd.read_csv(os.environ['DATA_PATH_EDR'])
+      hosts = edr.loc[edr['严重级'] == 'high', '主机']
+      failed = auth[auth['auth_result'] == 'failed'].merge(
+          pd.DataFrame({'主机': hosts.tolist()}), on='主机', how='inner')
+      findings = []
+      for host, group in failed.groupby('主机'):
+          ordered = group.sort_values('time')
+          if len(ordered) >= 2:
+              findings.append({
+                  'rule_id': 'T4', 'subject': str(host),
+                  'window_start': str(ordered['time'].min()), 'window_end': str(ordered['time'].max()),
+                  'metric': '高危告警伴随失败次数', 'value': int(len(ordered)),
+                  'evidence': ordered.tail(5).astype(str).to_dict(orient='records'),
+              })
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'rows': len(findings), 'columns': ['rule_id', 'subject', 'value'],
+                        'head': findings[:5], 'aggregate': {'规则T4命中数': len(findings)},
+                        'findings': findings}, ensure_ascii=False))
+    verify_code: |
+      import os, json
+      import csv
+      from datetime import datetime
+      auth_path, edr_path = os.environ['DATA_PATH_AUTH'], os.environ['DATA_PATH_EDR']
+      high = {row['主机'] for row in csv.DictReader(open(edr_path, encoding='utf-8-sig'))
+              if row.get('严重级') == 'high'}
+      buckets = {}
+      for row in csv.DictReader(open(auth_path, encoding='utf-8-sig')):
+          if row.get('auth_result') != 'failed' or row.get('src_ip') not in high:
+              continue
+          buckets.setdefault(row['src_ip'], []).append(row['time'])
+      findings = []
+      for host, stamps in buckets.items():
+          moments = sorted(datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S') for stamp in stamps)
+          if len(moments) >= 2:
+              findings.append({'rule_id': 'T4', 'subject': host, 'value': len(moments),
+                               'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
+                               'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
+      findings.sort(key=lambda item: (-item['value'], item['subject']))
+      print(json.dumps({'findings': findings}, ensure_ascii=False))

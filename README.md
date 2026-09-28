@@ -2,12 +2,15 @@
 
 本地、可验证、可扩展的多智能体数据分析/审计运行时：自然语言提问 + 本地数据文件，七个 Agent（探查 → 规划 → 执行 → 审核 → 可视化 → 报告 → 评审）协作产出图文报告或安全审计报告。核心是 **harness engineering**——用确定性工程外壳（自愈执行、独立校验 producer≠verifier、错误路由、grants 授权、全量审计）包住概率性的 LLM 输出。
 
-**两个内置场景**（场景包架构，换场景只加配置不改框架）：
+**三个内置场景**（场景包架构，换场景只加配置不改框架）：
 
 | 场景 | 数据 | 产出 |
 | :--- | :--- | :--- |
 | 零售数据分析 | 门店销售 CSV | 图文分析报告（数字 + 趋势图） |
-| **登录日志安全审计** | 日志平台导出的登录 CSV | 审计报告（发现清单 + 证据行 + 处置建议 + 研判摘要） |
+| 登录日志安全审计 | 日志平台导出的登录 CSV | 审计报告（发现清单 + 证据行 + 处置建议 + 研判摘要） |
+| **SOC 多源告警分诊** | 认证日志 CSV + 资产台账 CSV + EDR 告警 CSV（三源列名不统一） | 分诊报告（分诊队列 + 证据链 + 处置建议 + 研判摘要 + 分诊说明） |
+
+第三个场景是**跨表**的：「生产域主机的异常告警」这句话在只有认证日志的世界里无法回答——`是否生产` 在资产台账里。这类判断无法靠给通用 agent 加一句 prompt 得到，因为需要的列不在它拿到的那张表上。
 
 支持离线 Mock 模式（无需 API Key，确定性可复现）与真实 LLM 模式（OpenAI 兼容协议）。
 
@@ -18,9 +21,10 @@
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -e .
 
-# 2. 生成 demo 数据（零售 + 登录日志两套，seed=42 可复现）
+# 2. 生成 demo 数据（零售 + 登录日志 + SOC 三源，seed 固定可复现）
 .\.venv\Scripts\python.exe scripts\generate_demo_data.py
 .\.venv\Scripts\python.exe scripts\generate_login_data.py
+.\.venv\Scripts\python.exe scripts\generate_triage_data.py
 
 # 3a. 零售分析（mock 离线）
 .\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\retail_sales.csv --question "总销售额是多少？" --mode mock
@@ -28,15 +32,18 @@ python -m venv .venv
 # 3b. 登录日志安全审计（mock 离线，约 10 秒）
 .\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\login_auth.csv --question "对今天的登录日志做安全审计" --pack login_audit
 
-# 3c. 真实 LLM 模式（先配置 .env：OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）
+# 3c. SOC 多源分诊（一次传三份异构文件，跨表规则按角色寻址）
+.\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\triage\auth.csv demo\data\triage\assets.csv demo\data\triage\edr.csv --question "生产域主机的异常告警有哪些？哪些需要立刻处置" --pack sigma_triage
+
+# 3d. 真实 LLM 模式（先配置 .env：OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）
 .\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\login_auth.csv --question "对今天的登录日志做安全审计" --mode real --pack login_audit
 
-# 4. 运行测试（161 个用例）与批量评估
+# 4. 运行测试与批量评估
 .\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe scripts\run_batch.py --suite pack --mode mock   # 场景包批次
+.\.venv\Scripts\python.exe scripts\run_batch.py --suite pack --mode mock   # 场景包批次（P1/P2 登录审计 + P3 多源分诊）
 .\.venv\Scripts\python.exe scripts\evaluate.py                             # 聚合入评估记录.md
 
-# 5. 冻结评测集门禁（17 题 mock 全量，破了 exit 1）
+# 5. 冻结评测集门禁（20 题 mock 全量，破了 exit 1）
 .\.venv\Scripts\python.exe scripts\run_eval.py                             # 与 evals\baseline.json 比对
 .\.venv\Scripts\python.exe scripts\run_eval.py --check-golden              # 只核对 golden 是否漂移
 ```
@@ -48,12 +55,13 @@ python -m venv .venv
 场景 = `packs/<名称>/` 三件套，框架只提供机制，领域知识全部在包内：
 
 ```text
-packs/login_audit/
-├── rules.yaml            # 检测规则目录：R1 爆破 / R2 爆破后成功 / R3 非常规时段 / R4 口令喷洒
-│                         #   每条含 severity、确定性处置建议、检测规格、
+packs/<名称>/
+├── rules.yaml            # 检测规则目录：每条含 severity、确定性处置建议（disposition）、检测规格、
 │                         #   reference_code（pandas 生产参考实现）+ verify_code（纯 Python 异构独立校验器）
-├── report_template.md    # 审计报告模板（发现清单/处置建议/研判摘要/审计说明）
-└── data_convention.md    # 数据约定（列映射、时间格式、窗口语义、subject 格式）
+│                         #   登录审计 4 条：R1 爆破 / R2 爆破后成功 / R3 非常规时段 / R4 口令喷洒
+│                         #   多源分诊 3 条：T1 认证爆破 / T3 生产域大量失败（资产加权）/ T4 EDR 高危 ∧ 认证失败
+├── report_template.md    # 报告模板（登录审计：发现清单/处置建议/研判摘要/审计说明；分诊：五档见下）
+└── data_convention.md    # 数据约定（列映射、时间格式、窗口语义、subject 格式；多源包另有 column_aliases）
 ```
 
 三条核心设计原则：
@@ -61,6 +69,8 @@ packs/login_audit/
 1. **LLM 不判危险**——检测标准来自确定性规则包，Planner 不调 LLM，LLM 只按规格写实现和写叙述；日志是攻击者可控输入（威胁模型 T4），判定权不放在攻击者可写的文本下游；
 2. **producer ≠ verifier**——每条 finding 由算法路径异构的独立校验器重算比对，数值不一致直接 FAIL 并留重算值；
 3. **空结果语义反转**——安全场景"无发现"是好消息（rows==0 → PASS），由规则包重载通用审核语义。
+
+多源场景再加一条：**规则按角色寻址数据，不按表 id**。规则写 `requires: {auth: [auth_result, time], assets: [是否生产]}`，运行时把角色解析成真实表并注入 `DATA_PATH_AUTH` / `DATA_PATH_ASSETS`；实现与校验器共用同一个解析函数，所以两侧不可能各读一份数据。表 id（`t1`/`t2`）取决于用户先上传哪个文件——写死 id 的规则换一次上传顺序就静默指向别的表，而"静默失效的授权规则比没有规则更糟"。跨表连接在派发前经过基数预检，`src_ip` 与 `主机` 由包内列别名认定为同一实体（别名只用于识别，不改写归一化 CSV 的列名）。
 
 报告建议分三档：发现清单（证据层，数字确定性渲染）/ 处置建议（规则包 disposition）/ 研判摘要（LLM 推断，强制标注"处置前请人工复核证据行"）。
 
@@ -71,11 +81,11 @@ packs/login_audit/
 自动化评估是这套运行时的一部分，不是事后补的报表：
 
 ```text
-evals/suite.yaml        # 冻结评测集 17 题（评估方案 §7 的 15 题 + 空语义 + 一致性）
+evals/suite.yaml        # 冻结评测集 20 题（评估方案 §7 的 15 题 + 空语义 + 一致性 + 3 道多源题）
 evals/baseline.json     # 基线：逐题结论 + 聚合指标 + 指纹
 scripts/run_eval.py     # runner → 断言 → 基线比对 → exit code（CI 门禁）
-src/agentflow/core/grading.py  # 20 个确定性谓词 + 数字可追溯率 + 归因指纹
-tests/test_grading.py   # 给尺子本身写的 58 个用例
+src/agentflow/core/grading.py  # 21 个确定性谓词 + 数字可追溯率 + 归因指纹
+tests/test_grading.py   # 给尺子本身写的 63 个用例
 .github/workflows/ci.yml # push/PR：golden 自检 → pytest → mock 评测集门禁
 ```
 
@@ -95,6 +105,8 @@ tests/test_grading.py   # 给尺子本身写的 58 个用例
 | TC-03 | 零售 CSV + "分析一下上周的利润情况"（无利润列） | degraded，提示字段缺失（错误路由→重规划→澄清） |
 | 场景包 E2E | 登录日志（含植入攻击）+ `--pack login_audit` | success，4 规则命中且独立校验一致 |
 | 场景包空语义 | 登录日志（无攻击）+ `--pack login_audit` | success，"无发现" PASS |
+| 多源跨表 | 三张表（认证 / 资产 / EDR）+ `--pack sigma_triage` | success，命中集合 == 从原始 CSV 独立数出的集合；两类误报陷阱均不报 |
+| 上传顺序无关 | 同一批三份文件换两种顺序上传 | 分诊队列逐行一致（表 id 变了，角色解析没变） |
 | 注入防线 | 日志 message 字段含提示词注入文本 | 检测结论不变，注入文本作为证据行留档 |
 | 鉴权 401 | 匿名请求 15 个受保护端点 | 全部 401（`/api/health`、`/api/auth/login` 除外） |
 | 归属隔离 | 用户 B 访问用户 A 的数据集 / 会话 / 任务 / 报告 | 全部 404，不泄露资源是否存在 |
@@ -127,12 +139,12 @@ src/agentflow/
 ├── agents/     # 七个角色 Agent（explorer/planner/executor/inspector/visualizer/reporter/critic）
 ├── schemas/    # pydantic 模型（对应《输出格式设计.md》）
 └── pipeline.py # 端到端组装 run_analysis（支持 pack 参数）
-packs/          # 场景包（领域规则包 + 报告模板 + 数据约定）
-evals/          # 冻结评测集 suite.yaml（17 题）+ 基线 baseline.json
-scripts/        # CLI 入口、demo 数据生成（零售/登录日志）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
+packs/          # 场景包（login_audit 单表 4 规则 / sigma_triage 三源 3 规则，含跨表加权）
+evals/          # 冻结评测集 suite.yaml（20 题）+ 基线 baseline.json
+scripts/        # CLI 入口、demo 数据生成（零售/登录日志/SOC 三源）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
 .github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
-demo/data/      # 固定验收数据集
-tests/          # 161 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/配置接线）
+demo/data/      # 固定验收数据集（含 triage/ 三源）
+tests/          # 268 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包）
 outputs/        # 运行产物（不入 git）
 ```
 
@@ -143,8 +155,8 @@ outputs/        # 运行产物（不入 git）
 ## 测试与质量
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q     # 248 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 268 passed
 .\.venv\Scripts\python.exe scripts\run_eval.py   # 20/20 pass，gate 断言 76 全绿
 ```
 
-测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。
+测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。

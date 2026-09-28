@@ -98,13 +98,21 @@ def canonical_column_of(left: Any, right: Any, aliases: dict[str, str]) -> str |
 
 
 def primary_path(ctx: Any, task: dict[str, Any]) -> str:
-    """本任务的"主表"路径：跨表任务 = 它点名的第一张表，否则 = Bundle 主表。
+    """本任务的"主表"路径：跨表任务 = 它点名的第一张表；规则任务 = 解析出的第一个角色表；
+    其余 = Bundle 主表。
 
     这一条是"授权真的生效"的关键：prompt 与 `DATA_PATH_<id>` 都收窄了，但若 `DATA_PATH`
     仍递未声明的主表，等于放行只在文档上成立。
     """
     tables = task_tables(ctx, task)
-    return str(tables[0].path) if tables else str(ctx.data_path)
+    if tables:
+        return str(tables[0].path)
+    ref = str(task.get("primary_ref") or "")
+    if ref:
+        for table in getattr(getattr(ctx, "bundle", None), "tables", []) or []:
+            if str(table.id) == ref:
+                return str(table.path)
+    return str(ctx.data_path)
 
 
 def column_scope(ctx: Any, task: dict[str, Any]) -> list[str]:

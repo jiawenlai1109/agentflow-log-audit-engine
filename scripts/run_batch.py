@@ -27,6 +27,7 @@ DATA = PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"
 DATA_PROFIT = PROJECT_ROOT / "demo" / "data" / "retail_sales_with_profit.csv"
 LOGIN_ATTACK = PROJECT_ROOT / "demo" / "data" / "login_auth.csv"
 LOGIN_NORMAL = PROJECT_ROOT / "demo" / "data" / "login_auth_normal.csv"
+TRIAGE = PROJECT_ROOT / "demo" / "data" / "triage"
 
 # 默认批次 = 测试用例清单 M1~M5（mock 模式，离线确定性，可纵向对比）
 MOCK_CASES: list[dict[str, Any]] = [
@@ -38,9 +39,16 @@ MOCK_CASES: list[dict[str, Any]] = [
 ]
 
 # 场景包批次（--suite pack）= 登录日志安全审计（攻击数据 4 规则命中 + 正常数据零发现）
+#                            + SOC 多源分诊（三张表、两套列名，P3 是第一个多文件用例）
 PACK_CASES: list[dict[str, Any]] = [
     {"id": "P1", "question": "对2026-09-05的登录日志做安全审计", "data": LOGIN_ATTACK, "pack": "login_audit"},
     {"id": "P2", "question": "对登录日志做安全审计", "data": LOGIN_NORMAL, "pack": "login_audit"},
+    {
+        "id": "P3",
+        "question": "生产域主机的异常告警有哪些？哪些需要立刻处置",
+        "data": [TRIAGE / "auth.csv", TRIAGE / "assets.csv", TRIAGE / "edr.csv"],
+        "pack": "sigma_triage",
+    },
 ]
 
 

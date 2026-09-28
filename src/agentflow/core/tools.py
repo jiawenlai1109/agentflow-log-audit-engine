@@ -679,7 +679,9 @@ def _verify_findings(
 
     if pack is None:
         return {"status": "skipped", "message": "未提供场景包，无法校验", "expected": None}
-    return run_finding_verification(pack=pack, task=task, result=result, data_path=str(data_path))
+    return run_finding_verification(
+        pack=pack, task=task, result=result, data_path=str(data_path), bundle=ctx.bundle
+    )
 
 
 def build_default_registry(config: dict[str, Any] | None = None) -> ToolRegistry:

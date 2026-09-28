@@ -13,6 +13,8 @@
 name: login_audit
 version: "1.0"
 description: 登录日志安全审计（日志平台导出 CSV：VPN/堡垒机/IAM）
+# 报告里的领域措辞（"本次XX全部规则未命中"）由包给出，框架不替包说话
+subject_label: 登录日志安全审计
 
 data_convention:
   required_columns: [time, src_ip, account, auth_result, auth_method, service, message]

@@ -16,6 +16,7 @@ from agentflow.core.memory import (
     score_turn,
 )
 from agentflow.core.messages import AgentMessage
+from agentflow.core.pack import available_columns as pack_available_columns
 from agentflow.core.pack import pack_plan_tasks
 from agentflow.schemas.clarify import ClarifyRequest
 from agentflow.schemas.plan import TaskList
@@ -91,14 +92,14 @@ class PlannerAgent(BaseAgent):
         if message.kind == "replan_request":
             return self._pack_replan(ctx, message)
         pack = ctx.pack
-        columns = {col["name"] for col in (ctx.schema_profile or {}).get("columns", [])}
-        missing = [col for col in pack.required_columns if col not in columns]
+        available = pack_available_columns(pack, ctx.bundle)
+        missing = [col for col in pack.required_columns if col not in available]
         if missing:
             raise ValueError(
                 f"数据缺少场景包 {pack.name} 必需列：{'、'.join(missing)}"
                 f"（需要：{pack.required_columns}，见 packs/{pack.name}/data_convention.md）"
             )
-        tasks = pack_plan_tasks(pack)
+        tasks = pack_plan_tasks(pack, ctx.bundle)
         task_list = {
             "question": ctx.question,
             "time_base": None,

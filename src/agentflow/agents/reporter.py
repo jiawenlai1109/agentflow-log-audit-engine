@@ -274,8 +274,17 @@ class ReporterAgent(BaseAgent):
         else:
             verification_note = "存在未完成独立复算的发现，请谨慎采信"
 
+        # 数据源清单：报告头部说"读的是哪几份文件、各多少行"，而不是替多源场景猜一张"主表"。
+        # 原先这里写死"主表记录数：N 条认证日志"，而主表按文件名排出来是资产台账——
+        # 一份安全报告的开场就把口径说错，比不说更糟。
+        data_sources = "、".join(
+            f"{table.get('source_file') or Path(str(table.get('file_path', ''))).name}"
+            f" {table.get('row_count')} 行"
+            for table in (ctx.schema_profile or {}).get("tables") or []
+        )
+
         if isinstance(self.llm, MockLLM):
-            narrative = self._mock_pack_narrative(findings)
+            narrative = self._mock_pack_narrative(findings, pack)
         else:
             narrative = self._llm_pack_narrative(ctx, question, findings, review_issues)
 
@@ -283,6 +292,7 @@ class ReporterAgent(BaseAgent):
             timestamp=timestamp,
             question=question,
             row_count=(ctx.schema_profile or {}).get("row_count", "-"),
+            data_sources=data_sources,
             pack_name=pack.name,
             pack_version=pack.version,
             rule_count=len(pack.rules),
@@ -300,11 +310,11 @@ class ReporterAgent(BaseAgent):
         result = ReportResult(
             report_path=str(report_path),
             degraded=False,
-            sections=["发现清单", "处置建议", "研判摘要", "审计说明"],
+            sections=list(getattr(pack, "report_sections", []) or ["发现清单"]),
             summary=(
-                f"登录日志安全审计完成：命中 {len(findings)} 条发现"
+                f"{pack.subject_label}完成：命中 {len(findings)} 条发现"
                 if findings
-                else "登录日志安全审计完成：无发现"
+                else f"{pack.subject_label}完成：无发现"
             ),
         )
         return self.reply(
@@ -352,11 +362,12 @@ class ReporterAgent(BaseAgent):
             )
 
     @staticmethod
-    def _mock_pack_narrative(findings: list[dict[str, Any]]) -> str:
+    def _mock_pack_narrative(findings: list[dict[str, Any]], pack: Any) -> str:
         """mock 模式：确定性研判文本（不调 LLM，模板罐头无零售叙述标记可剥离）。"""
+        label = getattr(pack, "subject_label", "审计")
         if not findings:
             return (
-                "【态势研判】本次审计全部规则未命中，未发现异常登录行为。\n"
+                f"【态势研判】本次{label}全部规则未命中，没有主体越过阈值。\n"
                 "【处置优先级】无需处置动作。"
             )
         counts: dict[str, int] = {}
