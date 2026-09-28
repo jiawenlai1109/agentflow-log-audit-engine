@@ -95,6 +95,7 @@ class ExecutorAgent(BaseAgent):
                 env={
                     "DATA_PATH": ctx.data_path,
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),
+                    **self._dataset_env(ctx, task),
                     **upstream["env"],
                 },
             )
@@ -293,14 +294,68 @@ class ExecutorAgent(BaseAgent):
             artifacts=[str(step_file)],
         )
 
+    @staticmethod
+    def _tables(ctx: Any, task: dict[str, Any]) -> list[Any]:
+        """任务声明的表（按 dataset_refs 顺序）；未声明 = 单表语义，返回空。"""
+        refs = [str(ref) for ref in (task.get("dataset_refs") or [])]
+        if len(refs) < 2:
+            return []
+        by_id = {table.id: table for table in getattr(ctx.bundle, "tables", [])}
+        return [by_id[ref] for ref in refs if ref in by_id]
+
+    def _available_columns(self, ctx: Any, task: dict[str, Any]) -> list[str]:
+        """可用列口径：单表沿用主表画像；跨表任务给"声明的这几张表的列并集"。
+
+        并集不是放宽——它只覆盖任务自己声明的表，未声明的表既不进 prompt 也不进 env。
+        """
+        tables = self._tables(ctx, task)
+        if not tables:
+            return [col["name"] for col in (ctx.schema_profile or {}).get("columns", [])]
+        ordered: list[str] = []
+        for table in tables:
+            for column in table.columns:
+                if column not in ordered:
+                    ordered.append(column)
+        return ordered
+
+    def _join_lines(self, ctx: Any, task: dict[str, Any]) -> list[str]:
+        tables = self._tables(ctx, task)
+        if not tables:
+            return []
+        keys = [str(key) for key in (task.get("join_keys") or [])]
+        lines = [
+            f"多表关联（本任务读 {len(tables)} 张表，各表路径已注入环境变量，只允许读下列出的表）："
+        ]
+        for index, table in enumerate(tables):
+            lines.append(
+                f"- 表 {table.id}（{table.source_file}，{table.row_count} 行）"
+                f"列 {list(table.columns)} → os.environ['DATA_PATH_{str(table.id).upper()}']"
+            )
+        lines.append(
+            "- join 键："
+            + (", ".join(keys) if keys else "（未声明，取两表同名列中重叠最高的那个）")
+            + "（inner join；结果行数已由预检确认，禁止无键笛卡尔关联）"
+        )
+        return lines
+
+    def _dataset_env(self, ctx: Any, task: dict[str, Any]) -> dict[str, str]:
+        """把声明表的归一化 CSV 路径注入 env（只注入声明过的，天然是一份窄授权）。"""
+        return {
+            f"DATA_PATH_{str(table.id).upper()}": str(table.path)
+            for table in self._tables(ctx, task)
+        }
+
     def _task_prompt(self, ctx: Any, task: dict[str, Any]) -> str:
         schema = ctx.schema_profile or {}
         parts = [
             f"任务：{task.get('description')}",
             f"任务编号：{task.get('task_id')}",
             f"必需列：{task.get('required_columns')}",
-            f"可用列：{[c['name'] for c in schema.get('columns', [])]}",
+            f"可用列：{self._available_columns(ctx, task)}",
         ]
+        join_lines = self._join_lines(ctx, task)
+        if join_lines:
+            parts.extend(join_lines)
         refs = task.get("upstream_refs") or []
         if refs:
             parts.append(

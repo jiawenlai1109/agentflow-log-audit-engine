@@ -264,6 +264,32 @@ class MockLLM(BaseLLM):
         if required and any(col not in available for col in required):
             missing = next(col for col in required if col not in available)
             return header + f"print(df[{missing!r}].sum())\n"
+        # 跨表任务（M2-3）：prompt 里列出了几张表的 env 路径与 join 键，确定性做真 join。
+        # 必须排在"总/合计"分支之前——"汇总"里含"总"，否则会被单表求和抢走。
+        refs = re.findall(r"os\.environ\['DATA_PATH_(T\d+)'\]", first)
+        key_match = re.search(r"join 键：([^（\n,]+)", first)
+        if len(refs) == 2 and key_match:
+            return (
+                "import json, os\n"
+                "import pandas as pd\n"
+                f"_LEFT = pd.read_csv(os.environ['DATA_PATH_{refs[0]}'])\n"
+                f"_RIGHT = pd.read_csv(os.environ['DATA_PATH_{refs[1]}'])\n"
+                f"_KEY = {key_match.group(1).strip()!r}\n"
+                "merged = _LEFT.merge(_RIGHT, on=_KEY, how='inner')\n"
+                "num = next((c for c in merged.select_dtypes(include='number').columns if c != _KEY), None)\n"
+                "cats = [c for c in merged.select_dtypes(include=['object']).columns\n"
+                "          if c != _KEY and not any(k in str(c) for k in ('日期', 'date', '时间'))]\n"
+                "out = {'rows': int(len(merged)), 'columns': list(merged.columns),\n"
+                "       'head': merged.head(5).astype(str).to_dict(orient='records'),\n"
+                "       'aggregate': {'join_行数': int(len(merged))}}\n"
+                "if num is not None and cats:\n"
+                "    agg = merged.groupby(cats[0])[num].sum().sort_values(ascending=False)\n"
+                "    out = {'rows': int(len(agg)), 'columns': [cats[0], num],\n"
+                "           'head': [{cats[0]: str(k), num: float(v)} for k, v in agg.items()],\n"
+                "           'aggregate': {'join_行数': int(len(merged)), '合计_' + num: float(merged[num].sum()),\n"
+                "                           '最高_' + cats[0]: str(agg.index[0])}}\n"
+                "print(json.dumps(out, ensure_ascii=False))\n"
+            )
         if any(k in desc for k in ("总", "合计", "sum")):
             return (
                 header

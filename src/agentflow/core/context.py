@@ -88,6 +88,7 @@ class RunContext:
     constraints: dict[str, Any] | None = None  # v1.2：用户约束（一等公民，注入下游全部 Agent）
     pack: Any = None  # 场景包（ScenarioPack）：登录审计等领域规则包（工作规划 §6.2）
     clarify: dict[str, Any] | None = None  # v1.2：非阻塞澄清请求
+    join_preflight: dict[str, Any] = field(default_factory=dict)  # M2-3：派发前 join 预检留痕
     replan_used: int = 0  # v1.2：重规划预算（每 run ≤ max_replan_rounds）
     wall_clock_timeout: bool = False  # v1.2：运行墙钟超时标记
     results: dict[int, dict[str, Any]] = field(default_factory=dict)

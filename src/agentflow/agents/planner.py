@@ -26,12 +26,14 @@ PLANNER_SYSTEM = """你是一位资深的数据分析规划师。把用户的业
 {"question": "...", "time_base": {...} 或 null,
  "constraints": {"time_scope": null 或 "时间范围约束", "display": ["展示约束"], "scope": ["范围约束"], "custom": ["口径约定"]} 或 null,
  "tasks": [
-  {"task_id": 1, "description": "...", "required_columns": ["..."], "code_hint": "...", "chart_type": "none|line|bar|pie|hist", "depends_on": [], "upstream_refs": []}
+  {"task_id": 1, "description": "...", "required_columns": ["..."], "code_hint": "...", "chart_type": "none|line|bar|pie|hist", "depends_on": [], "upstream_refs": [], "dataset_refs": ["t1"], "join_keys": []}
 ]}
 规则：
 - required_columns 必须来自"可用列"，不得臆造列名；
 - task_id 从 1 递增；depends_on 为空表示无依赖（可并行），只能引用更小的 task_id；
 - upstream_refs 只能引用 depends_on 中任务的产物（artifacts/step_<task_id>_result.json），供下游任务消费上游结果；
+- dataset_refs 只能引用"可用表"里列出的表 id；单表任务省略或写一张；需要跨表的任务必须写明这几张表，
+  并在 join_keys 给出连接键（必须是两侧同名的列，且出现在"join 候选"里）；不得为了关联而臆造表 id 或键名；
 - 从问题与会话记忆中抽取用户约束写入 constraints（抽不到就为 null，禁止臆造）；
 - 相对时间（最近7天/上周）在 time_base 中注明以数据集最大日期为基准；
 - 业务常识提示：退款/退货通常表现为金额为负的记录，涉及"退款金额/退货"的问题应先筛选负值记录再按类别汇总。"""
@@ -147,10 +149,13 @@ class PlannerAgent(BaseAgent):
         missing = data.get("missing_columns") or []
         remaining = data.get("remaining_tasks") or []
         disable_memory = bool(data.get("disable_memory"))
+        join_rejects = data.get("join_rejects") or []
         failed_desc = str((data.get("failed_task") or {}).get("description", ""))
 
         if isinstance(self.llm, MockLLM):
-            revised = self._mock_replan(question, schema, remaining, missing, disable_memory)
+            revised = self._mock_replan(
+                question, schema, remaining, missing, disable_memory, join_rejects
+            )
         else:
             revised = self._llm_replan(
                 ctx, question, columns, missing, failed_desc, remaining, disable_memory
@@ -188,20 +193,45 @@ class PlannerAgent(BaseAgent):
         remaining: list[dict[str, Any]],
         missing: list[str],
         disable_memory: bool,
+        join_rejects: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]] | None:
-        """确定性修订：丢弃依赖缺失列的任务；其余保持原样（等 orchestrator 重新派发）。"""
+        """确定性修订：丢弃依赖缺失列的任务；其余保持原样（等 orchestrator 重新派发）。
+
+        M2-3：预检已判定连不上的那组表，剩余任务里再声明同一组 refs 的一并剔掉——
+        重复派发只会再算一次同样的基数，浪费一次执行还把 run 拖向超时。
+        """
         columns = {col["name"] for col in schema.get("columns", [])}
+        rejected_refs = {
+            tuple(sorted(str(ref) for ref in (item.get("refs") or [])))
+            for item in (join_rejects or [])
+            if item.get("refs")
+        }
         survivors: list[dict[str, Any]] = []
         for task in remaining:
             if disable_memory and task.get("code_hint") == "memory_answer":
                 continue
+            refs = tuple(sorted(str(ref) for ref in (task.get("dataset_refs") or [])))
+            if len(refs) > 1 and refs in rejected_refs:
+                continue
             required = task.get("required_columns") or []
             if missing and any(col in missing for col in required):
                 continue
-            if required and not all(col in columns for col in required):
+            if required and not all(col in self._column_scope(schema, task) for col in required):
                 continue
             survivors.append(task)
         return survivors or None
+
+    @staticmethod
+    def _column_scope(schema: dict[str, Any], task: dict[str, Any]) -> set[str]:
+        """任务的列域：单表 = 主表列；跨表 = 所声明那几张表的列并集（不放宽到未声明的表）。"""
+        columns = {col["name"] for col in schema.get("columns", [])}
+        refs = [str(ref) for ref in (task.get("dataset_refs") or [])]
+        if len(refs) < 2:
+            return columns
+        by_id = {str(item.get("id")): item for item in schema.get("tables") or []}
+        for ref in refs:
+            columns |= {str(col) for col in (by_id.get(ref) or {}).get("columns") or []}
+        return columns
 
     def _llm_replan(
         self,
@@ -325,10 +355,43 @@ class PlannerAgent(BaseAgent):
                     }
                 )
                 break
+        join_task = self._mock_join_task(schema)
+        if join_task is not None:
+            join_task["task_id"] = len(tasks) + 1
+            tasks.append(join_task)
         return {
             "question": question,
             "time_base": {"type": "data_max_date"} if date_col else None,
             "tasks": tasks,
+        }
+
+    @staticmethod
+    def _mock_join_task(schema: dict[str, Any]) -> dict[str, Any] | None:
+        """多源 Bundle 的确定性跨表任务：取 join 候选里重叠率最高且可用的一对表。
+
+        只在 `multi_table` 为真时出现——单表计划的形状一个字节都不变。
+        """
+        if not schema.get("multi_table"):
+            return None
+        candidate = next(
+            (item for item in schema.get("join_candidates") or [] if item.get("usable")), None
+        )
+        if candidate is None:
+            return None
+        tables = {str(item.get("id")): item for item in schema.get("tables") or []}
+        left, right = str(candidate["left"]), str(candidate["right"])
+        if left not in tables or right not in tables:
+            return None
+        key = str(candidate["column"])
+        return {
+            "task_id": 1,
+            "description": f"按{key}关联 {left}×{right} 后汇总（跨表）",
+            "required_columns": [key],
+            "code_hint": "join",
+            "chart_type": "bar",
+            "depends_on": [],
+            "dataset_refs": [left, right],
+            "join_keys": [key],
         }
 
     def _pick_numeric(self, schema: dict[str, Any], question: str) -> str:
@@ -388,14 +451,19 @@ class PlannerAgent(BaseAgent):
             if recall
             else ""
         )
+        schema = ctx.schema_profile or {}
         user_content = (
             f"用户问题：{question}\n"
             f"可用列：{columns}\n"
+            f"{self._tables_hint(schema)}"
             f"会话记忆：{session_memory}\n"
             f"{recall_hint}\n"
             "请输出任务清单 JSON。"
         )
         messages = [{"role": "user", "content": user_content}]
+        known_refs = {
+            str(item.get("id")) for item in (schema.get("tables") or [])
+        } or {"t1"}
         for _ in range(3):
             task_list = self.complete_structured(
                 ctx,
@@ -409,7 +477,13 @@ class PlannerAgent(BaseAgent):
                 for col in task.required_columns
                 if col not in columns
             ]
-            if not missing:
+            bad_refs = [
+                ref
+                for task in task_list.tasks
+                for ref in task.dataset_refs
+                if ref not in known_refs
+            ]
+            if not missing and not bad_refs:
                 if recall:
                     # 回忆问题：只保留记忆回答任务，不重新计算
                     return {
@@ -422,11 +496,43 @@ class PlannerAgent(BaseAgent):
                 {"role": "assistant", "content": task_list.model_dump_json()},
                 {
                     "role": "user",
-                    "content": f"列名校验失败：以下列不存在 {missing}，请使用可用列重新规划。",
+                    "content": (
+                        f"列名校验失败：以下列不存在 {missing}，请使用可用列重新规划。"
+                        if missing
+                        else f"表 id 校验失败：以下引用不在可用表里 {bad_refs}，请只引用"
+                        f"清单里列出的表 id，或改为单表任务。"
+                    ),
                 },
             ]
         # 兜底：LLM 连续失败时退化为 mock 计划
         return self._mock_plan(question, ctx.schema_profile or {}, recall=recall)
+
+    @staticmethod
+    def _tables_hint(schema: dict[str, Any]) -> str:
+        """多源时把"可用表 + join 候选"写进 prompt——这是确定性预检算出来的事实，
+        不是让 LLM 自己猜哪两张表连得上（I2：判定权不下放）。
+        """
+        tables = schema.get("tables") or []
+        if len(tables) < 2:
+            return ""
+        lines = ["可用表（id、来源文件、行数、列）："]
+        for item in tables:
+            lines.append(
+                f"- {item.get('id')}：{item.get('source_file')}，{item.get('row_count')} 行，"
+                f"列 {item.get('columns')}"
+            )
+        candidates = schema.get("join_candidates") or []
+        lines.append(
+            "join 候选（同名列 + 取值重叠率，usable=可用作键）："
+            + (
+                "；".join(
+                    f"{c['left']}↔{c['right']} on {c['column']}（重叠 {c['overlap']}）"
+                    for c in candidates[:6]
+                )
+                or "无（这些表之间没有同名列，不要规划跨表 join）"
+            )
+        )
+        return "\n".join(lines) + "\n"
 
     def _load_session_memory(self, ctx: Any, question: str) -> str:
         if not ctx.session:

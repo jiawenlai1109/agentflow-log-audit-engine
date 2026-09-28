@@ -143,6 +143,52 @@ class Orchestrator:
         reply = self.agents["planner"].run(ctx, message)
         ctx.task_list = json.loads(reply.content)
 
+    def _preflight_joins(self, ctx: RunContext, pending: list[int]) -> list[int]:
+        """派发前 join 预检（M2-3）：返回被拒任务 id。
+
+        判定完全确定性——任务声明的 `dataset_refs` / `join_keys` 交给 `core/join.py`
+        算基数，LLM 不参与"这个 join 好不好"的判断（I2）。被拒任务不进 DAG：一次笛卡尔积
+        一旦执行，代价是内存与一条已被下游引用的错误结果，而拦它只需要两个键列的计数。
+        """
+        from agentflow.core.join import preflight
+
+        rejected: list[int] = []
+        for task in (ctx.task_list or {}).get("tasks", []):
+            tid = int(task.get("task_id", 0))
+            refs = list(task.get("dataset_refs") or [])
+            if tid not in pending or len(refs) < 2:
+                continue
+            check = preflight(ctx.bundle, refs, list(task.get("join_keys") or []))
+            ctx.join_preflight[str(tid)] = check.as_dict()
+            if ctx.transcript is not None:
+                ctx.transcript.write(
+                    {"event": "join_preflight", "task_id": tid, **check.as_dict()}
+                )
+            self._emit(
+                {
+                    "type": "join_preflight",
+                    "task_id": tid,
+                    "refs": refs,
+                    "ok": check.ok,
+                    "reason": check.reason_code,
+                }
+            )
+            if check.ok:
+                continue
+            rejected.append(tid)
+            ctx.results[tid] = {
+                "task_id": tid,
+                "status": "failed",
+                "error": str(check),
+                "error_class": "JOIN_PRECHECK",
+                "missing_columns": [],
+                "suggestion": (
+                    "改用两表共有的键列，或在场景包 data_convention 里补列映射"
+                    "（如 src_ip → 主机）后重新提问"
+                ),
+            }
+        return rejected
+
     def _execute_dag(self, ctx: RunContext) -> None:
         """DAG 调度（v1.2）：波次并行 + 墙钟守卫 + 波次末错误路由（MISSING_COLUMN → 重规划）。"""
         max_workers = max(
@@ -155,6 +201,12 @@ class Orchestrator:
             task_by_id = {int(t["task_id"]): t for t in tasks}
             for tid in task_by_id:
                 states.setdefault(tid, "PENDING")
+
+            # 派发前 join 预检（M2-3）：坏 join 不进 DAG，标 FAILED 后交给错误路由
+            for tid in self._preflight_joins(
+                ctx, [t for t, state in states.items() if state == "PENDING"]
+            ):
+                states[tid] = "FAILED"
             pending = {tid for tid, s in states.items() if s == "PENDING"}
 
             # 墙钟守卫：每次派发前检查 deadline（恢复与回滚设计 §4.2）
@@ -203,15 +255,19 @@ class Orchestrator:
     def _route_planning_failures(self, ctx: RunContext, states: dict[int, str]) -> bool:
         """错误路由（v1.2）：MISSING_COLUMN 是规划错误，路由给 Planner 增量修订剩余任务。
 
-        返回 True 表示计划已修订、调度器应重建结构继续；不可修订时产出非阻塞澄清请求。
+        M2-3 起 JOIN_PRECHECK 走同一条通道：坏 join 同样是规划错误（键选错/列名不统一），
+        不该由执行器去试错——派发前已经算准了它连不上或会膨胀。
+
+        返回 True 表示计划已修订、调度器应重建结构进入下一波；不可修订时产出非阻塞澄清请求。
         """
         if ctx.replan_used >= self._max_replan(ctx):
             return False
+        routable = ("MISSING_COLUMN", "JOIN_PRECHECK")
         fresh = [
             tid
             for tid, s in states.items()
             if s == "FAILED"
-            and (ctx.results.get(tid) or {}).get("error_class") == "MISSING_COLUMN"
+            and (ctx.results.get(tid) or {}).get("error_class") in routable
             and not (ctx.results[tid].get("_routed"))
         ]
         if not fresh:
@@ -224,6 +280,16 @@ class Orchestrator:
             if states.get(int(task["task_id"])) == "PENDING"
         ]
         missing = (ctx.results.get(tid) or {}).get("missing_columns") or []
+        join_rejects = [
+            {
+                "task_id": int(key),
+                "refs": check.get("refs"),
+                "reason": check.get("reason"),
+                "detail": check.get("detail"),
+            }
+            for key, check in ctx.join_preflight.items()
+            if not check.get("ok")
+        ]
         payload = {
             "question": ctx.question,
             "failed_task": next(
@@ -231,20 +297,26 @@ class Orchestrator:
             ),
             "missing_columns": missing,
             "remaining_tasks": remaining,
+            "join_rejects": join_rejects,
         }
         ctx.replan_used += 1
         self._emit(
             {
                 "type": "error_routed",
                 "task_id": tid,
-                "error_class": "MISSING_COLUMN",
+                "error_class": (ctx.results[tid] or {}).get("error_class", "MISSING_COLUMN"),
                 "action": "replan",
                 "missing_columns": missing,
             }
         )
         if ctx.transcript is not None:
             ctx.transcript.write(
-                {"event": "error_routed", "task_id": tid, "error_class": "MISSING_COLUMN", "action": "replan"}
+                {
+                    "event": "error_routed",
+                    "task_id": tid,
+                    "error_class": (ctx.results[tid] or {}).get("error_class", "MISSING_COLUMN"),
+                    "action": "replan",
+                }
             )
         reply = self.agents["planner"].run(
             ctx,
@@ -574,6 +646,8 @@ class Orchestrator:
             "token_usage": getattr(ctx.budget, "token_stats", None),
             "replan_used": ctx.replan_used,
             "clarify": ctx.clarify,
+            # M2-3：派发前 join 预检的逐任务判定（含基数与被拒原因），数字可追回键列计数
+            "join_preflight": ctx.join_preflight,
             "task_states": ctx.task_states,
             "degraded_reason": ctx.degraded_reason,
             "chart_success": chart_success if chart_attempted else None,
