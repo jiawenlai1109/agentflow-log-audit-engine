@@ -80,6 +80,9 @@ class ScenarioPack:
     report_sections: list[str] = field(
         default_factory=lambda: ["发现清单", "处置建议", "研判摘要", "审计说明"]
     )
+    # 报告分档承诺（M3-3）：{"fact": [...], "action": [...], "inference": [...]}
+    # 没承诺分档的包（如零售报告）不会被检查——检查一个没做承诺的结构等于凭空加判据
+    report_layers: dict[str, list[str]] = field(default_factory=dict)
     # 实际列名 → 规范名（M3-1）：跨源数据同一实体常有三种叫法
     column_aliases: dict[str, str] = field(default_factory=dict)
 
@@ -125,6 +128,20 @@ def load_pack(name: str) -> ScenarioPack:
     ]
     if not rules:
         raise ValueError(f"场景包 {name} 未定义检测规则")
+    template_text = template_path.read_text(encoding="utf-8")
+    layers = {
+        str(kind): [str(name) for name in (names or [])]
+        for kind, names in (data.get("report_layers") or {}).items()
+    }
+    # 声明了档但模板里没有 ⇒ 那一档永远不会被读到，分档检查会静默变成空检查。
+    # 这种不一致必须在装载时报出来，不能等到报告出问题再猜。
+    for names in layers.values():
+        for layer in names:
+            if layer not in template_text:
+                raise ValueError(
+                    f"场景包 {name} 的 report_layers 声明了「{layer}」，"
+                    f"但 report_template.md 里没有这一档"
+                )
     return ScenarioPack(
         name=str(data.get("name", name)),
         version=str(data.get("version", "1")),
@@ -132,11 +149,12 @@ def load_pack(name: str) -> ScenarioPack:
         required_columns=[str(c) for c in (conv.get("required_columns") or [])],
         time_format=str(conv.get("time_format", "%Y-%m-%d %H:%M:%S")),
         rules=rules,
-        report_template=template_path.read_text(encoding="utf-8"),
+        report_template=template_text,
         path=root,
         subject_label=str(data.get("subject_label", "审计")),
         report_sections=[str(s) for s in (data.get("report_sections") or [])]
         or ["发现清单", "处置建议", "研判摘要", "审计说明"],
+        report_layers=layers,
         # 别名按列名匹配，不按表 id：id 取决于用户先传哪个文件，按 id 写会静默失效
         column_aliases={
             str(actual): str(canonical)

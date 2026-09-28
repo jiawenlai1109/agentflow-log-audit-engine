@@ -15,6 +15,12 @@ version: "1.0"
 description: 登录日志安全审计（日志平台导出 CSV：VPN/堡垒机/IAM）
 # 报告里的领域措辞（"本次XX全部规则未命中"）由包给出，框架不替包说话
 subject_label: 登录日志安全审计
+# 三档承诺：事实（发现清单+证据行）→ 建议（规则包 disposition）→ 推断（LLM 研判）。
+# 声明了就得被检查（core/report_lint.py）：模板改坏、叙述造数都会在 Critic 与门禁两侧报红
+report_layers:
+  fact: [发现清单]
+  action: [处置建议]
+  inference: [研判摘要]
 
 data_convention:
   required_columns: [time, src_ip, account, auth_result, auth_method, service, message]

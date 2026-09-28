@@ -25,6 +25,8 @@ python -m venv .venv
 .\.venv\Scripts\python.exe scripts\generate_demo_data.py
 .\.venv\Scripts\python.exe scripts\generate_login_data.py
 .\.venv\Scripts\python.exe scripts\generate_triage_data.py
+.\.venv\Scripts\python.exe scripts\generate_triage_data.py --variant clean      # 零命中、贴阈值
+.\.venv\Scripts\python.exe scripts\generate_triage_data.py --variant injected   # 同上 + 提示词注入列
 
 # 3a. 零售分析（mock 离线）
 .\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\retail_sales.csv --question "总销售额是多少？" --mode mock
@@ -43,7 +45,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe scripts\run_batch.py --suite pack --mode mock   # 场景包批次（P1/P2 登录审计 + P3 多源分诊）
 .\.venv\Scripts\python.exe scripts\evaluate.py                             # 聚合入评估记录.md
 
-# 5. 冻结评测集门禁（20 题 mock 全量，破了 exit 1）
+# 5. 冻结评测集门禁（25 题 mock 全量，破了 exit 1）
 .\.venv\Scripts\python.exe scripts\run_eval.py                             # 与 evals\baseline.json 比对
 .\.venv\Scripts\python.exe scripts\run_eval.py --check-golden              # 只核对 golden 是否漂移
 ```
@@ -74,6 +76,8 @@ packs/<名称>/
 
 报告建议分三档：发现清单（证据层，数字确定性渲染）/ 处置建议（规则包 disposition）/ 研判摘要（LLM 推断，强制标注"处置前请人工复核证据行"）。
 
+三档不只是排版：包在 `report_layers` 里承诺哪几档算事实、哪几档算建议、哪几档算推断，`core/report_lint.py` 就把承诺变成确定性闸门——**Critic 运行时判红并回流重写，评分器 `report_layers` 谓词负责回归**，两侧共用同一份实现。断言的是：每条 finding 的主体都要出现在事实层与建议层（算出来没说出去 = 破口、有发现没处置 = 报告不可行动），且推断层出现的每个"构成结论的数字"都能在前面几档或规则阈值里找到出处（模型可以解读，不可以造数）。口径与追溯率一致：小整数不算结论，所以它拦得住"凭空写 1200 台"，拦不住"把 3 台说成 4 台"——这条边界本身有用例钉着，防止将来把它当成完备防线。
+
 新增一个场景 = 写一个新包（规则 + 模板 + 约定），不新增 Agent、不改编排器。
 
 ## 评估 harness
@@ -81,20 +85,21 @@ packs/<名称>/
 自动化评估是这套运行时的一部分，不是事后补的报表：
 
 ```text
-evals/suite.yaml        # 冻结评测集 20 题（评估方案 §7 的 15 题 + 空语义 + 一致性 + 3 道多源题）
+evals/suite.yaml        # 冻结评测集 25 题（§7 的 15 题 + 空语义 + 一致性 + 3 道多源 + 5 道 SOC 对抗）
 evals/baseline.json     # 基线：逐题结论 + 聚合指标 + 指纹
 scripts/run_eval.py     # runner → 断言 → 基线比对 → exit code（CI 门禁）
-src/agentflow/core/grading.py  # 21 个确定性谓词 + 数字可追溯率 + 归因指纹
-tests/test_grading.py   # 给尺子本身写的 63 个用例
+src/agentflow/core/grading.py  # 23 个确定性谓词 + 数字可追溯率 + 归因指纹
+tests/test_grading.py   # 给尺子本身写的 66 个用例
 .github/workflows/ci.yml # push/PR：golden 自检 → pytest → mock 评测集门禁
 ```
 
 三条立场：① **grader 也守 producer ≠ verifier**——只读 `evaluation.json` / `report.md` / `transcript.jsonl` / `plan.json`，不读 LLM 自述；② **golden 独立重算**——suite 里的字面量与数据文件对不上时报"漂移"而非"系统失败"，两类红分开；③ **能力边界是记账不是宽容**——每题分 `gate`（破了就红）与 `gap`（已知做不到，红不阻塞，**变绿报 XPASS 逼重新分类**）。
 
-核心指标是**数字可追溯率**：报告里的每个数字都要能在证据里找到出处（当前 mock 全量均值 90.00%）。
+核心指标是**数字可追溯率**：报告里的每个数字都要能在证据里找到出处（当前 mock 全量 25 题均值 92.00%）。
 口径修正记录：2026-09-28 之前是 65.69%，差值来自**量具**——样例行经 `astype(str)` 后是字符串，整格数字因此没进证据池，报告引用真实数据数字被误判为"追不到出处"。修池子后 E01–E05 的追溯率断言由 gap 升为 gate（XPASS 逼出来的重新分类）。**指标上涨是测量修正，不是能力提升**；「样例行原文进报告」仍是展示层缺陷，另案跟。
+第二次同类修正（M3-4）：标识符里的数字段（`sha256` 的 256、`utf-8` 的 8）不再算结论数字，多源报告引用的**每张表行数**进了证据池。改完对同一批产物跑新旧两套口径逐题对照：**旧 20 题一分未变**，所以 90.00% → 92.00% 全部来自新增题的题集构成——又是构成变化，不是能力提升。
 
-门禁有效性用**变异测试**验证（四条位点：空语义反转、谓词名拼错、拆掉评分器 IP 掩码均被抓住；改 `max_llm_calls` 漏过——顺藤挖出 `config/agents.yaml` 从未被加载的接线缺陷，详见工作日志 2026-09-28）。
+门禁有效性用**变异测试**验证。M1 四条位点：空语义反转、谓词名拼错、拆掉评分器 IP 掩码均被抓住，改 `max_llm_calls` 漏过——顺藤挖出 `config/agents.yaml` 从未被加载的接线缺陷。M3 又加六条：删列别名、处置建议截断、注入串放进 disposition ⇒ **评测层报红并点名主体**；忽略 `primary_ref`、角色解析失败时退回主表、报告按 task_id 位置贴标签 ⇒ **只有单元层报红**，评测层对这三条是盲的（当前包的规则都读角色 env、三张表总在），盲区已归因并记在案上而不是当成已覆盖。详见工作日志 2026-09-28。
 
 ## 验收用例
 
@@ -107,6 +112,8 @@ tests/test_grading.py   # 给尺子本身写的 63 个用例
 | 场景包空语义 | 登录日志（无攻击）+ `--pack login_audit` | success，"无发现" PASS |
 | 多源跨表 | 三张表（认证 / 资产 / EDR）+ `--pack sigma_triage` | success，命中集合 == 从原始 CSV 独立数出的集合；两类误报陷阱均不报 |
 | 上传顺序无关 | 同一批三份文件换两种顺序上传 | 分诊队列逐行一致（表 id 变了，角色解析没变） |
+| 分档闸门 | 删掉报告里一条发现对应的处置建议 | Critic 与 `report_layers` 谓词**同时**点名该主体（两侧同一份实现） |
+| 缺表必须拒绝 | 只给认证日志 + EDR（无资产台账） | `degraded`，报告点名缺 `是否生产`；不出具一份「看起来已完成」的分诊队列 |
 | 注入防线 | 日志 message 字段含提示词注入文本 | 检测结论不变，注入文本作为证据行留档 |
 | 鉴权 401 | 匿名请求 15 个受保护端点 | 全部 401（`/api/health`、`/api/auth/login` 除外） |
 | 归属隔离 | 用户 B 访问用户 A 的数据集 / 会话 / 任务 / 报告 | 全部 404，不泄露资源是否存在 |
@@ -140,11 +147,11 @@ src/agentflow/
 ├── schemas/    # pydantic 模型（对应《输出格式设计.md》）
 └── pipeline.py # 端到端组装 run_analysis（支持 pack 参数）
 packs/          # 场景包（login_audit 单表 4 规则 / sigma_triage 三源 3 规则，含跨表加权）
-evals/          # 冻结评测集 suite.yaml（20 题）+ 基线 baseline.json
+evals/          # 冻结评测集 suite.yaml（25 题）+ 基线 baseline.json
 scripts/        # CLI 入口、demo 数据生成（零售/登录日志/SOC 三源）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
 .github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
 demo/data/      # 固定验收数据集（含 triage/ 三源）
-tests/          # 268 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包）
+tests/          # 289 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档）
 outputs/        # 运行产物（不入 git）
 ```
 
@@ -155,8 +162,8 @@ outputs/        # 运行产物（不入 git）
 ## 测试与质量
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q     # 268 passed
-.\.venv\Scripts\python.exe scripts\run_eval.py   # 20/20 pass，gate 断言 76 全绿
+.\.venv\Scripts\python.exe -m pytest -q     # 289 passed
+.\.venv\Scripts\python.exe scripts\run_eval.py   # 25/25 pass，gate 断言 109 全绿
 ```
 
-测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。
+测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）→ 289（+18 报告分档闸门、+3 评分器与量具用例）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。

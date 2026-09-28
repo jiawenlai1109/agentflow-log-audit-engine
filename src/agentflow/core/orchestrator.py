@@ -656,6 +656,13 @@ class Orchestrator:
             "critic_pass": ctx.critic_passed,
             # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
             "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
+            # 多源报告头部会逐张表报行数（"auth.csv 282 行、assets.csv 24 行…"）。
+            # 这些数由画像器真读出来，属证据；不落到 evaluation.json 的话，
+            # 追溯率会把"报告引用了每张表的行数"判成造数——那是量具的洞，不是系统的洞。
+            "dataset_tables": [
+                {"source_file": table.get("source_file"), "row_count": table.get("row_count")}
+                for table in ((ctx.schema_profile or {}).get("tables") or [])
+            ],
             "results": {str(k): v for k, v in ctx.results.items()},
         }
         (ctx.outputs_dir / "evaluation.json").write_text(

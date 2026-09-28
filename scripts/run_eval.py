@@ -107,6 +107,57 @@ def derive_goldens(data_dir: Path) -> dict[str, Any]:
         "peak_day_sales": round(float(by_day.loc[peak, "销售额"]), 2),
         "peak_day_profit": round(float(by_day.loc[peak, "利润"]), 2),
         **_multi_goldens(data_dir / "multi"),
+        **_triage_goldens(data_dir),
+    }
+
+
+def _triage_goldens(data_dir: Path) -> dict[str, Any]:
+    """SOC 三源题的 golden：pandas 独立重算三条规则的命中主体集合。
+
+    与 `tests/test_sigma_pack.py` 里用 stdlib 数出来的那份是**两条独立路径**——
+    两边都对得上，才说得上"数据的形状是我们说的那个形状"。
+    """
+    import pandas as pd
+
+    def hits(dir_name: str) -> dict[str, Any]:
+        root = data_dir / dir_name
+        auth = pd.read_csv(root / "auth.csv", parse_dates=["time"])
+        assets = pd.read_csv(root / "assets.csv")
+        edr = pd.read_csv(root / "edr.csv")
+        failed = auth[auth["auth_result"] == "failed"]
+
+        burst = []
+        for (src_ip, account), group in failed.groupby(["src_ip", "account"]):
+            span = (group["time"].max() - group["time"].min()).total_seconds() / 60.0
+            if len(group) >= 8 and span <= 5:
+                burst.append(f"{src_ip}->{account}")
+        production = set(assets.loc[assets["是否生产"] == "Y", "主机"])
+        high = set(edr.loc[edr["严重级"] == "high", "主机"])
+        by_host = failed.groupby("src_ip").size()
+        weighted = sorted(host for host, count in by_host.items() if host in production and count >= 3)
+        correlated = sorted(host for host, count in by_host.items() if host in high and count >= 2)
+        return {
+            "T1": sorted(burst),
+            "T3": weighted,
+            "T4": correlated,
+            "total": len(burst) + len(weighted) + len(correlated),
+            "max_host_failures": int(by_host.max()) if len(by_host) else 0,
+        }
+
+    attack, clean, injected = hits("triage"), hits("triage_clean"), hits("triage_injected")
+    return {
+        "sigma_attack_t1": attack["T1"],
+        "sigma_attack_t3": attack["T3"],
+        "sigma_attack_t4": attack["T4"],
+        "sigma_attack_total": attack["total"],
+        # 注入变体与 attack 的命中集合必须逐项相同：这条 golden 本身就是"注入没改变判定"的证据
+        "sigma_injected_t1": injected["T1"],
+        "sigma_injected_t3": injected["T3"],
+        "sigma_injected_t4": injected["T4"],
+        "sigma_injected_total": injected["total"],
+        "sigma_clean_total": clean["total"],
+        # 零命中不是"数据本来就安静"：最大失败次数恰好等于阈值减一，是被构造出来的贴边
+        "sigma_clean_max_host_failures": clean["max_host_failures"],
     }
 
 

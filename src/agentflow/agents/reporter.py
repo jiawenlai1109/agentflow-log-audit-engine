@@ -244,29 +244,7 @@ class ReporterAgent(BaseAgent):
             )
         )
 
-        rule_stats = {rule.id: 0 for rule in pack.rules}
-        for finding in findings:
-            rid = str(finding.get("rule_id", ""))
-            rule_stats[rid] = rule_stats.get(rid, 0) + 1
-        stats_text = "，".join(f"{rid}={count}" for rid, count in rule_stats.items())
-
-        # 诚实性：未成功执行的规则任务必须显式披露，安全报告不允许静默缺规则
-        failed_rules = [
-            pack.rules[int(tid) - 1].id
-            for tid in sorted(int(k) for k in results)
-            if (results[str(tid)] or {}).get("status") != "success"
-            and 0 < int(tid) <= len(pack.rules)
-        ]
-
-        # aggregate 全量确定性渲染：Critic 数字核对要求关键指标全部出现在报告中
-        agg_lines = []
-        for task_id in sorted(int(k) for k in results):
-            agg = (results[str(task_id)] or {}).get("summary", {}).get("aggregate") or {}
-            if isinstance(agg, dict) and agg:
-                rid = pack.rules[task_id - 1].id if 0 < task_id <= len(pack.rules) else str(task_id)
-                pairs = "，".join(f"{k}={v}" for k, v in agg.items())
-                agg_lines.append(f"规则{rid}：{pairs}")
-        aggregates_text = "；".join(agg_lines)
+        rule_stats, failed_rules, aggregates_text = self._rule_rollup(pack, results, findings)
 
         verdicts = [results[str(k)].get("verdict") or {} for k in results]
         if verdicts and all(v.get("verification") == "ok" for v in verdicts):
@@ -297,7 +275,7 @@ class ReporterAgent(BaseAgent):
             pack_version=pack.version,
             rule_count=len(pack.rules),
             rule_ids="、".join(rule.id for rule in pack.rules),
-            rule_stats=stats_text,
+            rule_stats=rule_stats,
             failed_rules=failed_rules,
             aggregates_text=aggregates_text,
             findings=findings,
@@ -321,6 +299,45 @@ class ReporterAgent(BaseAgent):
             ctx, "orchestrator", "report_result", result.model_dump_json(),
             artifacts=[str(report_path)],
         )
+
+    @staticmethod
+    def _rule_rollup(
+        pack: Any, results: dict[str, Any], findings: list[dict[str, Any]]
+    ) -> tuple[str, list[str], str]:
+        """规则命中统计 / 未出结论的规则 / 关键指标行——三档报告头的数字，全部确定性。
+
+        这里刻意**不按 task_id 位置对号入座**：角色解析失败的规则根本不生成任务，
+        任务号与规则号于是错位，用 `pack.rules[task_id - 1]` 会把 T4 的命中数标成 T3。
+        报告标签说错话和被修掉的"24 条认证日志"是同一类缺陷：数字对、指代错。
+        """
+        stats = {rule.id: 0 for rule in pack.rules}
+        for finding in findings:
+            rid = str(finding.get("rule_id", ""))
+            stats[rid] = stats.get(rid, 0) + 1
+        stats_text = "，".join(f"{rid}={count}" for rid, count in stats.items())
+
+        # "这条规则留下过自己的输出吗"——aggregate 键名或 finding 的 rule_id 任一命中即算出过结论
+        spoke: set[str] = set()
+        for entry in results.values():
+            summary = (entry or {}).get("summary") or {}
+            for key in (summary.get("aggregate") or {}):
+                for rule in pack.rules:
+                    if f"规则{rule.id}" in str(key):
+                        spoke.add(rule.id)
+            for finding in summary.get("findings") or []:
+                if isinstance(finding, dict):
+                    spoke.add(str(finding.get("rule_id", "")))
+        silent_rules = [rule.id for rule in pack.rules if rule.id not in spoke]
+
+        agg_lines = [
+            "，".join(f"{key}={value}" for key, value in agg.items())
+            for agg in (
+                ((results[str(tid)] or {}).get("summary") or {}).get("aggregate") or {}
+                for tid in sorted(int(k) for k in results)
+            )
+            if isinstance(agg, dict) and agg
+        ]
+        return stats_text, silent_rules, "；".join(agg_lines)
 
     def _llm_pack_narrative(
         self,

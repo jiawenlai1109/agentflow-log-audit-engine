@@ -634,6 +634,20 @@ def _check_report(
             issues.append(
                 {"severity": "medium", "section": "数据详情", "message": f"关键数字 {number} 未出现在报告中"}
             )
+
+    # 分档结构检查（M3-3）：只对声明了 report_layers 的场景包生效
+    from agentflow.core.report_lint import lint_report, declared_layers, pack_thresholds
+
+    pack = getattr(ctx, "pack", None)
+    layers = declared_layers(pack)
+    if layers:
+        findings = [
+            finding
+            for result in results.values()
+            for finding in ((result or {}).get("summary") or {}).get("findings") or []
+            if isinstance(finding, dict)
+        ]
+        issues.extend(lint_report(text, findings, layers, pack_thresholds(pack)))
     return issues
 
 
