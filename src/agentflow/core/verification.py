@@ -317,26 +317,41 @@ def _run_template(
     return metrics, None
 
 
-def build_join_check_code(paths: list[str], key: str) -> str:
+def build_join_check_code(
+    paths: list[str],
+    key: str,
+    left_column: str | None = None,
+    right_column: str | None = None,
+) -> str:
     """多表任务的对照代码（#19）：**换一条算法**重放声明的 join。
 
     行数用两侧键列 value_counts 相乘得到（与 `core/join.py` 预检同一公式，但与生产者写的
     `merge` 不是同一条路径），同时把 `merge` 的行数一并上报——两个算法互为校验：
     预检、重放、执行三处算出同一个数，这个数字才算立住。
+
+    `left_column` / `right_column` 是两侧实际列名（包内别名场景）。校验器若按规范名去读列，
+    会在这里 KeyError 并被降级成"无法校验"——那样三处同数的断言就悄悄失效了。
+    乘积法只在两侧列名相同时给出（它没有 rename 后的对照意义）。
     """
+    left_column = left_column or key
+    right_column = right_column or key
     return (
         "import json\n"
         "import pandas as pd\n"
         f"_PATHS = {paths!r}\n"
         f"_KEY = {key!r}\n"
-        "_LEFT = pd.read_csv(_PATHS[0])\n"
-        "_RIGHT = pd.read_csv(_PATHS[1])\n"
-        "_LC = _LEFT[_KEY].value_counts(dropna=False)\n"
-        "_RC = _RIGHT[_KEY].value_counts(dropna=False)\n"
-        "_COMMON = _LC.index.intersection(_RC.index)\n"
-        "_PRODUCT = int((_LC.loc[_COMMON] * _RC.loc[_COMMON]).sum()) if len(_COMMON) else 0\n"
+        f"_LCOL = {left_column!r}\n"
+        f"_RCOL = {right_column!r}\n"
+        "_LEFT = pd.read_csv(_PATHS[0]).rename(columns={_LCOL: _KEY})\n"
+        "_RIGHT = pd.read_csv(_PATHS[1]).rename(columns={_RCOL: _KEY})\n"
+        "metrics = []\n"
+        "if _LCOL == _RCOL:\n"
+        "    _LC = _LEFT[_KEY].value_counts(dropna=False)\n"
+        "    _RC = _RIGHT[_KEY].value_counts(dropna=False)\n"
+        "    _COMMON = _LC.index.intersection(_RC.index)\n"
+        "    _PRODUCT = int((_LC.loc[_COMMON] * _RC.loc[_COMMON]).sum()) if len(_COMMON) else 0\n"
+        "    metrics.append({'family': 'count', 'column': None, 'value': float(_PRODUCT), 'scope': 'join'})\n"
         "_MERGED = _LEFT.merge(_RIGHT, on=_KEY, how='inner')\n"
-        "metrics = [{'family': 'count', 'column': None, 'value': float(_PRODUCT), 'scope': 'join'}]\n"
         "if len(_MERGED):\n"
         "    metrics.append({'family': 'count', 'column': None, 'value': float(len(_MERGED)), 'scope': 'join_merge'})\n"
         "    _NUM = next((c for c in _MERGED.select_dtypes(include='number').columns if c != _KEY), None)\n"
@@ -350,11 +365,14 @@ def build_join_check_code(paths: list[str], key: str) -> str:
 
 
 def _run_join_template(
-    paths: list[str], key: str
+    paths: list[str],
+    key: str,
+    left_column: str | None = None,
+    right_column: str | None = None,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """在独立子进程重放 join（与执行器的实现异构），返回 (metrics, 不可用原因)。"""
     work_dir = Path(tempfile.mkdtemp(prefix="verify_join_"))
-    code = build_join_check_code(paths, key)
+    code = build_join_check_code(paths, key, left_column, right_column)
     outcome = LocalBackend().execute(code, work_dir=work_dir, env={}, timeout=60)
     if not outcome.success:
         return None, f"join 对照模板执行失败：{(outcome.stderr or '')[-200:]}"
@@ -375,10 +393,12 @@ def run_verification(
     data_path: str,
     schema_profile: dict[str, Any] | None = None,
     table_paths: dict[str, str] | None = None,
+    pairs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """执行独立校验：返回 {status: pass|fail|skipped, message, expected}。
 
     `table_paths` 给出且声明了两张以上表 ⇒ 走多表 join 重放；否则维持单表类别模板。
+    `pairs` 是 `dataset_scope.join_pairs()` 的结果，提供两侧**实际列名**（包内别名场景）。
     """
     summary = (result or {}).get("summary") or {}
     reported = summary.get("aggregate") if isinstance(summary.get("aggregate"), dict) else {}
@@ -394,7 +414,13 @@ def run_verification(
         if not keys:
             return {"status": "skipped", "message": "跨表任务未声明 join_keys，无确定作用域可重放", "expected": None}
         columns = [str(c.get("name")) for c in ((schema_profile or {}).get("columns") or [])]
-        metrics, reason = _run_join_template(paths, keys[0])
+        pair = (pairs or [{}])[0] if pairs else {}
+        metrics, reason = _run_join_template(
+            paths,
+            keys[0],
+            left_column=pair.get("left_column") or keys[0],
+            right_column=pair.get("right_column") or keys[0],
+        )
         if reason:
             return {"status": "skipped", "message": reason, "expected": None}
         status, message, comparable = _compare(reported, metrics, columns)

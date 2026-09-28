@@ -58,6 +58,50 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+def canonical_column(column: str, aliases: dict[str, str] | None = None) -> str:
+    """列的规范名：包内别名映射到规范名，没映射的沿用原名。"""
+    if not aliases:
+        return str(column)
+    return str(aliases.get(str(column), column))
+
+
+def column_for_canonical(
+    columns: list[str], canonical: str, aliases: dict[str, str] | None = None
+) -> str | None:
+    """给定规范名，在这张表的实际列名里找出承载它的那一列。
+
+    先精确命中再走别名：`主机` 这一列本身存在时不该被别名规则改写语义。
+    """
+    if canonical in columns:
+        return canonical
+    for actual, target in (aliases or {}).items():
+        if target == canonical and actual in columns:
+            return actual
+    return None
+
+
+def _shared_keys(
+    left: "Table", right: "Table", aliases: dict[str, str] | None
+) -> list[tuple[str, str, str]]:
+    """两张表可用的连接键：返回 (规范名, 左表实际列, 右表实际列)。
+
+    跨源数据最常见的形状就是"同一实体三种叫法"（`src_ip` / `主机` / `host`）。
+    只认同名会漏掉全部跨表规则；认别名又必须按列名匹配，因为表 id 取决于上传顺序。
+    """
+    pairs: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for left_column in left.columns:
+        canonical = canonical_column(left_column, aliases)
+        right_column = column_for_canonical(right.columns, canonical, aliases)
+        if right_column is None:
+            continue
+        triple = (canonical, left_column, right_column)
+        if triple not in seen:
+            seen.add(triple)
+            pairs.append(triple)
+    return pairs
+
+
 @dataclass
 class Table:
     """一张可分析的表：原件引用 + 归一化 CSV + 结构元数据。"""
@@ -141,17 +185,19 @@ class Bundle:
 
     # ------------------------------------------------------------------ 联表候选
 
-    def join_candidates(self) -> list[dict[str, Any]]:
-        """确定性给出"哪两张表可能连得上"：同名列 + 取值重叠率抽样。
+    def join_candidates(self, aliases: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        """确定性给出"哪两张表可能连得上"：同名列（或包内别名认定的同名列）+ 取值重叠率抽样。
 
         这里只做候选提示，不做放行——放行由任务的 dataset_refs 与 join 预检器决定。
+        `aliases`（实际列名 → 规范名）来自场景包的 data_convention：跨源数据最常见的
+        形状就是"同一个实体三种叫法"（`src_ip` / `主机` / `host`），只认同名会漏掉全部
+        跨表规则；但别名只用于"认出来"，**不改写归一化 CSV 的列名**——原文可追是 I1 的地基。
         """
         out: list[dict[str, Any]] = []
         for index, left in enumerate(self.tables):
             for right in self.tables[index + 1 :]:
-                shared = [c for c in left.columns if c in right.columns]
-                for column in shared:
-                    overlap = self._overlap(left, right, column)
+                for column, left_column, right_column in _shared_keys(left, right, aliases):
+                    overlap = self._overlap(left, right, left_column, right_column)
                     if overlap is None:
                         continue
                     out.append(
@@ -159,6 +205,8 @@ class Bundle:
                             "left": left.id,
                             "right": right.id,
                             "column": column,
+                            "left_column": left_column,
+                            "right_column": right_column,
                             "overlap": round(overlap, 3),
                             "usable": overlap >= JOIN_OVERLAP_FLOOR,
                         }
@@ -166,14 +214,23 @@ class Bundle:
         return sorted(out, key=lambda item: item["overlap"], reverse=True)
 
     @staticmethod
-    def _overlap(left: Table, right: Table, column: str) -> float | None:
-        """两表同列取值重叠率（左表取值中能在右表找到的比例）。"""
+    def _overlap(
+        left: Table, right: Table, left_column: str, right_column: str | None = None
+    ) -> float | None:
+        """两表键列取值重叠率（左列取值中能在右列找到的比例）。"""
+        right_column = right_column or left_column
         try:
             import pandas as pd
 
-            left_values = pd.read_csv(left.path, usecols=[column], nrows=JOIN_SAMPLE_VALUES)[column]
+            left_values = pd.read_csv(
+                left.path, usecols=[left_column], nrows=JOIN_SAMPLE_VALUES
+            )[left_column]
             right_values = set(
-                pd.read_csv(right.path, usecols=[column], nrows=JOIN_SAMPLE_VALUES)[column].dropna().astype(str)
+                pd.read_csv(right.path, usecols=[right_column], nrows=JOIN_SAMPLE_VALUES)[
+                    right_column
+                ]
+                .dropna()
+                .astype(str)
             )
         except Exception:  # noqa: BLE001 - 读不动就当作无候选，不猜
             return None

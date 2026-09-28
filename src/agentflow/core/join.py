@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agentflow.core.bundle import canonical_column, column_for_canonical
+
 # 结果膨胀比上界：join 后行数 / 两侧最大行数。合法的多对一汇总通常 <2，
 # 4 倍已经足够宽松地放行"一个主机多条事件"这类真实多对一
 MAX_EXPANSION_RATIO = 4.0
@@ -46,12 +48,21 @@ class PairCheck:
     ok: bool
     reason_code: str = "ok"
     detail: str = ""
+    # 规范名之外的实际列名（包内别名场景：t1.src_ip ↔ t2.主机，规范名 主机）
+    left_column: str = ""
+    right_column: str = ""
+
+    def __post_init__(self) -> None:
+        self.left_column = self.left_column or self.key
+        self.right_column = self.right_column or self.key
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "left": self.left,
             "right": self.right,
             "key": self.key,
+            "left_column": self.left_column,
+            "right_column": self.right_column,
             "left_rows": self.left_rows,
             "right_rows": self.right_rows,
             "expected_rows": self.expected_rows,
@@ -138,11 +149,19 @@ def check_pair(
     *,
     left_columns: list[str] | None = None,
     right_columns: list[str] | None = None,
+    left_column: str | None = None,
+    right_column: str | None = None,
 ) -> PairCheck:
-    """一对表在 `key` 上的精确基数预检。"""
+    """一对表在 `key` 上的精确基数预检。
+
+    `key` 是规范名；两表的实际列名由 `left_column` / `right_column` 给出（包内别名场景）。
+    不传就要求两侧都存在同名的 `key`——这是没有别名时的旧语义，一个字节没变。
+    """
     left_columns = left_columns or []
     right_columns = right_columns or []
-    if key not in left_columns or key not in right_columns:
+    left_column = left_column or (key if key in left_columns else "")
+    right_column = right_column or (key if key in right_columns else "")
+    if not left_column or not right_column:
         return PairCheck(
             left=left_id,
             right=right_id,
@@ -156,14 +175,16 @@ def check_pair(
             right_key_unique=0.0,
             ok=False,
             reason_code="no_key",
+            left_column=left_column or key,
+            right_column=right_column or key,
             detail=(
                 f"键列 {key} 不是两表共有：{left_id} 有 {left_columns}，{right_id} 有 {right_columns}"
-                "（跨表列名不统一时需要包内列映射）"
+                "（跨表列名不统一时需要在场景包 data_convention.column_aliases 里给出映射）"
             ),
         )
 
-    left_keys, left_rows = _read_keys(left_path, key)
-    right_keys, right_rows = _read_keys(right_path, key)
+    left_keys, left_rows = _read_keys(left_path, left_column)
+    right_keys, right_rows = _read_keys(right_path, right_column)
 
     if left_rows == 0 or right_rows == 0:
         # 空表是合法输入（空语义反转靠它）：join 恒为空不是计划错误
@@ -180,6 +201,8 @@ def check_pair(
             right_key_unique=0.0,
             ok=True,
             reason_code="empty_side",
+            left_column=left_column,
+            right_column=right_column,
             detail=f"{left_id if left_rows == 0 else right_id} 是空表（0 行），该 join 恒为空——按空语义放行",
         )
 
@@ -197,9 +220,12 @@ def check_pair(
             right_key_unique=0.0,
             ok=False,
             reason_code="dtype_mismatch",
+            left_column=left_column,
+            right_column=right_column,
             detail=(
-                f"{left_id}.{key} 是 {left_keys.dtype} 而 {right_id}.{key} 是 {right_keys.dtype}："
-                "数值键与文本键在 pandas 里无法 join（执行期会直接报错），需要先在包内做列映射/归一"
+                f"{left_id}.{left_column} 是 {left_keys.dtype} 而 {right_id}.{right_column} 是 "
+                f"{right_keys.dtype}：数值键与文本键在 pandas 里无法 join（执行期会直接报错），"
+                "需要先在包内做列映射/归一"
             ),
         )
 
@@ -218,19 +244,23 @@ def check_pair(
     overlap = len(left_values & right_values) / left_unique if left_unique else 0.0
     baseline = max(left_rows, right_rows, 1)
     ratio = expected_rows / baseline
+    # 消息里点名实际列名：别名场景下只说规范名，读的人无法判断哪一侧叫什么
+    label = f"{left_id}.{left_column} ↔ {right_id}.{right_column}" + (
+        f"（规范名 {key}）" if left_column != right_column else ""
+    )
     # 一行的表（汇总/单例）不该因"整表复制到每一行"被判膨胀
     if baseline > 1 and ratio > MAX_EXPANSION_RATIO:
         ok, code, detail = False, "expansion", (
-            f"{left_id}⋈{right_id} on {key}：期望 {expected_rows} 行 = 两侧最大行数 {baseline} 的 "
+            f"{label}：期望 {expected_rows} 行 = 两侧最大行数 {baseline} 的 "
             f"{ratio:.2f} 倍（上界 {MAX_EXPANSION_RATIO}x）——键在多侧都不唯一，接近笛卡尔积"
         )
     elif expected_rows > MAX_JOIN_ROWS:
         ok, code, detail = False, "expansion", (
-            f"{left_id}⋈{right_id} on {key}：期望 {expected_rows} 行超过 join 上界 {MAX_JOIN_ROWS}"
+            f"{label}：期望 {expected_rows} 行超过 join 上界 {MAX_JOIN_ROWS}"
         )
     elif expected_rows == 0:
         ok, code, detail = False, "no_overlap", (
-            f"{left_id}⋈{right_id} on {key}：键值零重叠"
+            f"{label}：键值零重叠"
             f"（左表非空键值 {left_unique} 个，无一命中右表{'' if left_unique else '或键列全为空值'}），"
             "该 join 恒为空——通常是键选错或跨表列名不统一"
         )
@@ -253,12 +283,20 @@ def check_pair(
         ok=ok,
         reason_code=code,
         detail=detail,
+        left_column=left_column,
+        right_column=right_column,
     )
 
 
-def resolve_key(bundle: Any, refs: list[str], keys: list[str] | None = None) -> str | None:
-    """任务声明的 join_keys 优先；没声明时确定性给出候选键：优先在所有 refs 表里共有、
-    且取值重叠最高的列（与 Bundle.join_candidates 同一口径，不另起一套判断）。
+def resolve_key(
+    bundle: Any,
+    refs: list[str],
+    keys: list[str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """任务声明的 join_keys 优先；没声明时确定性给出候选键：优先在所有 refs 表里共有（含包内
+    别名认定的同义列）、且取值重叠最高的规范名（与 Bundle.join_candidates 同一口径，
+    不另起一套判断）。
     """
     declared = [key for key in (keys or []) if key]
     if declared:
@@ -266,38 +304,38 @@ def resolve_key(bundle: Any, refs: list[str], keys: list[str] | None = None) -> 
     tables = [table for table in bundle.tables if table.id in refs]
     if len(tables) < 2:
         return None
-    shared = list(tables[0].columns)
+    # 规范名集合的交集：别名让 `src_ip` 与 `主机` 算同一个实体
+    canonicals = {canonical_column(column, aliases) for column in tables[0].columns}
     for table in tables[1:]:
-        shared = [column for column in shared if column in table.columns]
-    if shared:
-        # Bundle 的候选表是方法不是属性；口径与它一致，别在这里再算一遍重叠率
-        candidates_all = bundle.join_candidates()
+        canonicals &= {canonical_column(column, aliases) for column in table.columns}
+    candidates_all = bundle.join_candidates(aliases)
+    if canonicals:
         candidates = [
-            candidate for candidate in candidates_all if candidate["column"] in shared
+            candidate
+            for candidate in candidates_all
+            if candidate["column"] in canonicals
+            and {candidate["left"], candidate["right"]} <= set(refs)
         ]
         usable = [candidate for candidate in candidates if candidate["usable"]]
         if usable:
             return str(usable[0]["column"])
         if candidates:
             return str(candidates[0]["column"])
-        return str(shared[0])
-    # 无共有列：用 join_candidates 里最高重叠的那对（多半是别名缺失，交给预检报 no_key）
-    pair = next(
-        (
-            candidate
-            for candidate in bundle.join_candidates()
-            if candidate["left"] in refs and candidate["right"] in refs
-        ),
-        None,
-    )
-    return str(pair["column"]) if pair else None
+        return str(sorted(canonicals)[0])
+    return None
 
 
-def preflight(bundle: Any, refs: list[str], keys: list[str] | None = None) -> JoinPreflight:
+def preflight(
+    bundle: Any,
+    refs: list[str],
+    keys: list[str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> JoinPreflight:
     """按任务的 dataset_refs / join_keys 做派发前预检。
 
     多表（refs ≥ 3）按"声明顺序的两两相邻配对"检查：这是配对级基数的上界估计，
     不是整条 join 链的精确行数——链式基数需要物化中间结果，代价与收益不匹配。
+    `aliases`（实际列名 → 规范名）来自场景包，让 `src_ip ↔ 主机` 这类跨源同义键可被认出来。
     """
     declared = list(refs or [])
     if len(declared) < 2:
@@ -313,7 +351,7 @@ def preflight(bundle: Any, refs: list[str], keys: list[str] | None = None) -> Jo
 
     table_by_id = {table.id: table for table in bundle.tables}
     key_list = [key for key in (keys or []) if key]
-    fallback_key = resolve_key(bundle, declared, [])
+    fallback_key = resolve_key(bundle, declared, [], aliases)
     pairs: list[PairCheck] = []
     for index in range(len(declared) - 1):
         left = table_by_id[declared[index]]
@@ -328,7 +366,10 @@ def preflight(bundle: Any, refs: list[str], keys: list[str] | None = None) -> Jo
                 refs=declared,
                 ok=False,
                 reason_code="no_key",
-                detail=f"{left.id} 与 {right.id} 没有同名键列，任务也未声明 join_keys",
+                detail=(
+                    f"{left.id} 与 {right.id} 没有可对应的键列（含包内别名后仍无交集），"
+                    "任务也未声明 join_keys"
+                ),
             )
         pairs.append(
             check_pair(
@@ -339,6 +380,8 @@ def preflight(bundle: Any, refs: list[str], keys: list[str] | None = None) -> Jo
                 key,
                 left_columns=left.columns,
                 right_columns=right.columns,
+                left_column=column_for_canonical(left.columns, key, aliases),
+                right_column=column_for_canonical(right.columns, key, aliases),
             )
         )
 

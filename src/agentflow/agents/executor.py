@@ -322,20 +322,33 @@ class ExecutorAgent(BaseAgent):
         tables = self._tables(ctx, task)
         if not tables:
             return []
-        keys = [str(key) for key in (task.get("join_keys") or [])]
+        pairs = dataset_scope.join_pairs(ctx, task)
         lines = [
             f"多表关联（本任务读 {len(tables)} 张表，各表路径已注入环境变量，只允许读下列出的表）："
         ]
-        for index, table in enumerate(tables):
+        for table in tables:
             lines.append(
                 f"- 表 {table.id}（{table.source_file}，{table.row_count} 行）"
                 f"列 {list(table.columns)} → os.environ['DATA_PATH_{str(table.id).upper()}']"
             )
-        lines.append(
-            "- join 键："
-            + (", ".join(keys) if keys else "（未声明，取两表同名列中重叠最高的那个）")
-            + "（inner join；结果行数已由预检确认，禁止无键笛卡尔关联）"
-        )
+        for pair in pairs:
+            if pair["left_column"] != pair["right_column"]:
+                # 列名不同是跨源数据的常态；不说清 rename，模型就会 merge 出空表或报错
+                lines.append(
+                    f"- join 键：{pair['canonical']}（{pair['left']} 侧列名 {pair['left_column']!r}、"
+                    f"{pair['right']} 侧列名 {pair['right_column']!r}）——两侧列名不同，"
+                    f"先把 {pair['left_column']!r} 重命名为 {pair['canonical']!r} 再 inner join"
+                )
+            else:
+                lines.append(
+                    f"- join 键：{pair['canonical']}（{pair['left']} ↔ {pair['right']}，inner join；"
+                    "结果行数已由预检确认，禁止无键笛卡尔关联）"
+                )
+        if not pairs:
+            lines.append(
+                "- join 键：（未声明，取两表同名列中重叠最高的那个；inner join，"
+                "结果行数已由预检确认，禁止无键笛卡尔关联）"
+            )
         return lines
 
     def _dataset_env(self, ctx: Any, task: dict[str, Any]) -> dict[str, str]:

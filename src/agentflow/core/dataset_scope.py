@@ -47,6 +47,56 @@ def table_paths(ctx: Any, task: dict[str, Any]) -> dict[str, str]:
     return {str(table.id): str(table.path) for table in task_tables(ctx, task)}
 
 
+def aliases_of(ctx: Any) -> dict[str, str]:
+    """包内列别名（实际列名 → 规范名）；通用分析没有领域知识判断同义列，故为空前。"""
+    return dict(getattr(getattr(ctx, "pack", None), "column_aliases", {}) or {})
+
+
+def join_pairs(ctx: Any, task: dict[str, Any]) -> list[dict[str, Any]]:
+    """把 (声明顺序相邻的表对, 规范键) 落到两侧**实际列名**。
+
+    这是别名机制唯一被消费的地方：执行器据此写"先 rename 再 merge"的指令，
+    校验器据此重放。列名对不上时预检已经报 `no_key`，所以这里不做二次判断。
+    """
+    from agentflow.core.bundle import column_for_canonical
+
+    tables = task_tables(ctx, task)
+    if len(tables) < 2:
+        return []
+    aliases = aliases_of(ctx)
+    keys = [str(key) for key in (task.get("join_keys") or []) if key]
+    out: list[dict[str, Any]] = []
+    for index in range(len(tables) - 1):
+        left, right = tables[index], tables[index + 1]
+        canonical = (
+            keys[index] if index < len(keys) else (keys[-1] if keys else None)
+        ) or canonical_column_of(left, right, aliases)
+        if canonical is None:
+            continue
+        out.append(
+            {
+                "left": str(left.id),
+                "right": str(right.id),
+                "canonical": str(canonical),
+                "left_column": column_for_canonical(left.columns, str(canonical), aliases)
+                or str(canonical),
+                "right_column": column_for_canonical(right.columns, str(canonical), aliases)
+                or str(canonical),
+            }
+        )
+    return out
+
+
+def canonical_column_of(left: Any, right: Any, aliases: dict[str, str]) -> str | None:
+    """两张表在别名口径下的第一个共有规范名。"""
+    from agentflow.core.bundle import canonical_column
+
+    left_names = {canonical_column(column, aliases) for column in left.columns}
+    right_names = {canonical_column(column, aliases) for column in right.columns}
+    shared = sorted(left_names & right_names)
+    return shared[0] if shared else None
+
+
 def primary_path(ctx: Any, task: dict[str, Any]) -> str:
     """本任务的"主表"路径：跨表任务 = 它点名的第一张表，否则 = Bundle 主表。
 

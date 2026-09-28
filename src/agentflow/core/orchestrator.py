@@ -152,13 +152,15 @@ class Orchestrator:
         """
         from agentflow.core.join import preflight
 
+        # 别名只来自场景包：通用分析没有领域知识判断"src_ip 就是主机"，猜出来等于编造
+        aliases = getattr(ctx.pack, "column_aliases", None) or None
         rejected: list[int] = []
         for task in (ctx.task_list or {}).get("tasks", []):
             tid = int(task.get("task_id", 0))
             refs = list(task.get("dataset_refs") or [])
             if tid not in pending or len(refs) < 2:
                 continue
-            check = preflight(ctx.bundle, refs, list(task.get("join_keys") or []))
+            check = preflight(ctx.bundle, refs, list(task.get("join_keys") or []), aliases)
             ctx.join_preflight[str(tid)] = check.as_dict()
             if ctx.transcript is not None:
                 ctx.transcript.write(

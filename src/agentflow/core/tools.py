@@ -31,7 +31,7 @@ _WIN_EXTENDED = re.compile(r"^\\\\[\?\\]\\")
 
 
 def _resolve(path: str | Path) -> Path:
-    """解析路径（真值，用于放行/读写）。**不做形态归一**——
+    r"""解析路径（真值，用于放行/读写）。**不做形态归一**——
     超过 260 字符的路径确实需要 `\\?\` 前缀才能打开，剥掉会把真能力弄坏。
     比较一律走 `_key()`。
     """
@@ -39,7 +39,7 @@ def _resolve(path: str | Path) -> Path:
 
 
 def _key(path: str | Path) -> str:
-    """比较用的规范形态：解析 + 去掉 Windows 扩展长度前缀 + 大小写归一。
+    r"""比较用的规范形态：解析 + 去掉 Windows 扩展长度前缀 + 大小写归一。
 
     Windows 上 `Path.resolve()` 会偶发返回 `\\?\D:\...`（走 `GetFinalPathNameByHandle`），
     而另一条兜底路径返回 `D:\...`。同一个目录于是有两种字符串形态，直接比 `==`
@@ -435,7 +435,11 @@ def _profile_bundle(ctx: Any) -> dict[str, Any]:
         **primary,
         "tables": tables,
         "documents": documents,
-        "join_candidates": bundle.join_candidates(),
+        # 别名让"src_ip 与 主机 是同一实体"成为确定性事实，Planner 据此才能提跨表任务
+        "join_candidates": bundle.join_candidates(
+            getattr(getattr(ctx, "pack", None), "column_aliases", None)
+        ),
+        "column_aliases": dict(getattr(getattr(ctx, "pack", None), "column_aliases", {}) or {}),
         "multi_table": len(tables) > 1,
     }
 
@@ -645,6 +649,7 @@ def _verify_aggregate(
     data_path: str | Path,
     schema_profile: dict[str, Any] | None = None,
     table_paths: dict[str, str] | None = None,
+    pairs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """独立校验（v1.2，producer ≠ verifier）：按任务类别用确定性模板重算关键指标。
 
@@ -658,6 +663,7 @@ def _verify_aggregate(
         data_path=str(data_path),
         schema_profile=schema_profile,
         table_paths=table_paths,
+        pairs=pairs,
     )
 
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -45,12 +45,18 @@ class ScenarioPack:
     rules: list[PackRule]
     report_template: str
     path: Path
+    # 实际列名 → 规范名（M3-1）：跨源数据同一实体常有三种叫法
+    column_aliases: dict[str, str] = field(default_factory=dict)
 
     def rule(self, rule_id: str) -> PackRule:
         for rule in self.rules:
             if rule.id == rule_id:
                 return rule
         raise KeyError(f"场景包 {self.name} 中不存在规则 {rule_id}")
+
+    def canonical(self, column: str) -> str:
+        """列的规范名（用于报告与规则表达），没有别名映射时就是原名。"""
+        return str(self.column_aliases.get(str(column), column))
 
 
 def load_pack(name: str) -> ScenarioPack:
@@ -88,6 +94,11 @@ def load_pack(name: str) -> ScenarioPack:
         rules=rules,
         report_template=template_path.read_text(encoding="utf-8"),
         path=root,
+        # 别名按列名匹配，不按表 id：id 取决于用户先传哪个文件，按 id 写会静默失效
+        column_aliases={
+            str(actual): str(canonical)
+            for actual, canonical in (conv.get("column_aliases") or {}).items()
+        },
     )
 
 

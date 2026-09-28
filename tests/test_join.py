@@ -129,7 +129,8 @@ def test_missing_key_column_reports_no_key(tmp_path):
     )
     assert check.ok is False
     assert check.reason_code == "no_key"
-    assert "包内列映射" in check.detail
+    # 拒绝理由必须指出修复入口，否则用户只知道连不上、不知道去哪儿连
+    assert "column_aliases" in check.detail
 
 
 # ---------------------------------------------------------------- Bundle 级
@@ -317,3 +318,114 @@ def _read_json(path):
     import json
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------- 包内列别名（M3-1）
+
+ALIAS = {"src_ip": "主机", "host": "主机"}
+
+
+@pytest.fixture()
+def aliased_bundle(tmp_path):
+    """防火墙叫 src_ip、资产表叫 主机 —— 同一实体两种叫法（SOC 三源的真实形状）。"""
+    from agentflow.core.ingest import build_bundle
+
+    events = _write(
+        tmp_path,
+        "firewall.csv",
+        "time,src_ip,account\n2026-09-05 20:00:01,10.0.0.1,u1\n"
+        "2026-09-05 20:00:02,10.0.0.2,u2\n2026-09-05 20:00:03,10.0.0.1,u3\n",
+    )
+    assets = _write(
+        tmp_path, "assets.tsv", "主机\t域\n10.0.0.1\t生产\n10.0.0.2\t测试\n"
+    )
+    return build_bundle([events, assets], tmp_path / "bd_alias", strict=True)
+
+
+def test_candidates_without_alias_find_nothing(aliased_bundle):
+    """没有别名时两表确实连不上——这条是"别名不是装饰"的前提事实。"""
+    assert aliased_bundle.join_candidates() == []
+
+
+def test_candidates_with_alias_propose_canonical_key(aliased_bundle):
+    candidates = aliased_bundle.join_candidates(ALIAS)
+    assert len(candidates) == 1
+    item = candidates[0]
+    assert item["column"] == "主机"
+    assert item["left_column"] == "src_ip" and item["right_column"] == "主机"
+    assert item["usable"] is True
+
+
+def test_preflight_accepts_aliased_pair_and_counts_exactly(aliased_bundle):
+    check = preflight(aliased_bundle, ["t1", "t2"], ["主机"], ALIAS)
+    assert check.ok is True, check.detail
+    pair = check.pairs[0]
+    assert (pair.left_column, pair.right_column) == ("src_ip", "主机")
+    import pandas as pd
+
+    truth = len(
+        pd.read_csv(aliased_bundle.tables[0].path)
+        .rename(columns={"src_ip": "主机"})
+        .merge(pd.read_csv(aliased_bundle.tables[1].path), on="主机")
+    )
+    assert pair.expected_rows == truth == 3
+
+
+def test_preflight_canonical_name_wins_over_alias(aliased_bundle):
+    """两侧都有同名 `主机` 列时不该被别名规则改语义（先精确命中再走别名）。"""
+    from agentflow.core.bundle import column_for_canonical
+
+    assert column_for_canonical(["主机", "src_ip"], "主机", ALIAS) == "主机"
+    assert column_for_canonical(["src_ip"], "主机", ALIAS) == "src_ip"
+    assert column_for_canonical(["其他"], "主机", ALIAS) is None
+
+
+def test_executor_prompt_states_the_rename(tmp_path, aliased_bundle):
+    """别名只有落到"先 rename 再 merge"这句指令上，执行器才真的用得上。"""
+    from types import SimpleNamespace
+
+    from agentflow.agents.executor import ExecutorAgent
+    from agentflow.core.llm import MockLLM
+
+    ctx = SimpleNamespace(
+        bundle=aliased_bundle,
+        schema_profile={"columns": [{"name": "time"}, {"name": "src_ip"}]},
+        pack=SimpleNamespace(column_aliases=ALIAS),
+    )
+    task = {"task_id": 1, "dataset_refs": ["t1", "t2"], "join_keys": ["主机"], "description": "关联"}
+    lines = ExecutorAgent(llm=MockLLM())._join_lines(ctx, task)
+    joined = "\n".join(lines)
+    assert "侧列名 'src_ip'" in joined and "侧列名 '主机'" in joined
+    assert "先把 'src_ip' 重命名为 '主机'" in joined
+
+
+def test_mock_generated_code_renames_before_merge(tmp_path, aliased_bundle):
+    """mock 生成的代码必须真的 rename：否则 join 出空表，三处同数就成了三处同错。"""
+    from types import SimpleNamespace
+
+    from agentflow.agents.executor import ExecutorAgent
+    from agentflow.core.llm import MockLLM
+
+    ctx = SimpleNamespace(
+        bundle=aliased_bundle,
+        schema_profile={"columns": [{"name": "time"}, {"name": "src_ip"}]},
+        pack=SimpleNamespace(column_aliases=ALIAS),
+    )
+    task = {"task_id": 1, "dataset_refs": ["t1", "t2"], "join_keys": ["主机"], "description": "关联"}
+    prompt = ExecutorAgent(llm=MockLLM())._task_prompt(ctx, task)
+    code = MockLLM()._executor_code([{"role": "user", "content": prompt}])
+    assert "rename(columns=" in code and "_KEY" in code
+    work = tmp_path / "run" / "work" / "1"
+    work.mkdir(parents=True)
+    env = {
+        "DATA_PATH_T1": aliased_bundle.tables[0].path,
+        "DATA_PATH_T2": aliased_bundle.tables[1].path,
+    }
+    from agentflow.core.executor import LocalBackend
+
+    outcome = LocalBackend().execute(code, work_dir=work, env=env, timeout=60)
+    assert outcome.success, outcome.stderr[-300:]
+    import json
+
+    payload = json.loads(outcome.stdout[outcome.stdout.index("{") : outcome.stdout.rindex("}") + 1])
+    assert payload["aggregate"]["join_行数"] == 3

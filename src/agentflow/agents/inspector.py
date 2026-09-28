@@ -88,6 +88,7 @@ class InspectorAgent(BaseAgent):
                 data_path=dataset_scope.primary_path(ctx, task),
                 schema_profile=ctx.schema_profile or {},
                 table_paths=dataset_scope.table_paths(ctx, task),
+                pairs=dataset_scope.join_pairs(ctx, task),
             )
         except Exception as exc:  # noqa: BLE001 - 校验器自身故障不阻塞主流程，留痕
             checks.append(

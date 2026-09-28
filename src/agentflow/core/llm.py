@@ -268,14 +268,28 @@ class MockLLM(BaseLLM):
         # 必须排在"总/合计"分支之前——"汇总"里含"总"，否则会被单表求和抢走。
         refs = re.findall(r"os\.environ\['DATA_PATH_(T\d+)'\]", first)
         key_match = re.search(r"join 键：([^（\n,]+)", first)
+        side_columns = re.findall(r"侧列名 '([^']+)'", first)
         if len(refs) == 2 and key_match:
+            key = key_match.group(1).strip()
+            # 两侧实际列名（包内别名场景：t1 的 src_ip ↔ t2 的 主机）。不 rename 直接 merge
+            # 会得到空表或 KeyError——别名机制到这一步才算真的被执行器用上。
+            left_column = side_columns[0] if len(side_columns) == 2 else key
+            right_column = side_columns[1] if len(side_columns) == 2 else key
+            renames = ""
+            if left_column != key:
+                renames += f"_LEFT = _LEFT.rename(columns={{{left_column!r}: _KEY}})\n"
+            if right_column != key:
+                renames += f"_RIGHT = _RIGHT.rename(columns={{{right_column!r}: _KEY}})\n"
             return (
                 "import json, os\n"
                 "import pandas as pd\n"
                 f"_LEFT = pd.read_csv(os.environ['DATA_PATH_{refs[0]}'])\n"
                 f"_RIGHT = pd.read_csv(os.environ['DATA_PATH_{refs[1]}'])\n"
-                f"_KEY = {key_match.group(1).strip()!r}\n"
-                "merged = _LEFT.merge(_RIGHT, on=_KEY, how='inner')\n"
+                f"_KEY = {key!r}\n"
+                f"_LCOL = {left_column!r}\n"
+                f"_RCOL = {right_column!r}\n"
+                + renames
+                + "merged = _LEFT.merge(_RIGHT, on=_KEY, how='inner')\n"
                 "num = next((c for c in merged.select_dtypes(include='number').columns if c != _KEY), None)\n"
                 "cats = [c for c in merged.select_dtypes(include=['object']).columns\n"
                 "          if c != _KEY and not any(k in str(c) for k in ('日期', 'date', '时间'))]\n"
