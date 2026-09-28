@@ -6,6 +6,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,7 @@ from app.config import OUTPUTS_ROOT
 from app.db import execute, query_one
 from app.deps import get_current_user
 from app.jobs import JobManager
+from app.routers.bundles import load_bundle_for_analysis
 from app.schemas import AnalyzeRequest, JobOut
 from agentflow.pipeline import run_analysis
 
@@ -40,8 +42,9 @@ def _owned_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
 
 
 def submit_analysis(
-    question: str, dataset_path: str, mode: str, session_id: str | None, user_id: int
+    question: str, sources: Any, mode: str, session_id: str | None, user_id: int
 ) -> str:
+    """sources 可以是文件路径，也可以是 Bundle——pipeline 里 `as_bundle` 会归一化。"""
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     execute(
         "INSERT INTO jobs (job_id, user_id, question, mode, session_id, status) VALUES (?, ?, ?, ?, ?, 'pending')",
@@ -73,7 +76,7 @@ def submit_analysis(
         try:
             result = run_analysis(
                 question=question,
-                sources=dataset_path,
+                sources=sources,
                 mode=mode,
                 outputs_root=OUTPUTS_ROOT,
                 session_id=session_id,
@@ -105,18 +108,24 @@ def submit_analysis(
 
 @router.post("/analyze", response_model=JobOut)
 def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> dict:
-    dataset = query_one(
-        "SELECT * FROM datasets WHERE id = ? AND user_id = ?", (payload.dataset_id, user["id"])
-    )
-    if not dataset:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    if payload.bundle_id:
+        # 归属、状态、目录包含、快照可读——四步都在 bundles 模块里做一次（同一个 BUNDLES_DIR）
+        sources = load_bundle_for_analysis(payload.bundle_id, user)
+    else:
+        dataset = query_one(
+            "SELECT * FROM datasets WHERE id = ? AND user_id = ?",
+            (payload.dataset_id, user["id"]),
+        )
+        if not dataset:
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        sources = dataset["path"]
     if payload.session_id and not query_one(
         "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
         (payload.session_id, user["id"]),
     ):
         raise HTTPException(status_code=404, detail="会话不存在")
     job_id = submit_analysis(
-        payload.question, dataset["path"], payload.mode, payload.session_id, user["id"]
+        payload.question, sources, payload.mode, payload.session_id, user["id"]
     )
     return _owned_job(job_id, user)
 

@@ -54,15 +54,65 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
+-- Bundle 三表（#20）：一次上传是一个 Bundle，逐文件一条 bundle_files（含被拒原因），
+-- 成表的再落一条 bundle_tables——前端"逐文件状态 + 表预览"要的就是这三层。
+-- 命名用 bundle_tables 而不是 tables：读 SQL 的人不必去猜它跟 sqlite 的表元数据有没有关系。
+CREATE TABLE IF NOT EXISTS bundles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bundle_id TEXT UNIQUE NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 1,
+    name TEXT NOT NULL,
+    root TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready',
+    error TEXT,
+    file_count INTEGER NOT NULL DEFAULT 0,
+    table_count INTEGER NOT NULL DEFAULT 0,
+    document_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+CREATE TABLE IF NOT EXISTS bundle_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bundle_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 1,
+    filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'skipped',
+    table_ref TEXT,
+    reason TEXT,
+    hint TEXT,
+    risk TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+CREATE TABLE IF NOT EXISTS bundle_tables (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bundle_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 1,
+    table_ref TEXT NOT NULL,
+    source_file TEXT NOT NULL,
+    path TEXT NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    columns TEXT NOT NULL DEFAULT '[]',
+    encoding TEXT,
+    sha256 TEXT NOT NULL DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
 CREATE INDEX IF NOT EXISTS idx_datasets_user ON datasets (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_run ON jobs (run_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id, id);
+CREATE INDEX IF NOT EXISTS idx_bundles_user ON bundles (user_id, id);
+CREATE INDEX IF NOT EXISTS idx_bundle_files_bundle ON bundle_files (bundle_id, id);
+CREATE INDEX IF NOT EXISTS idx_bundle_tables_bundle ON bundle_tables (bundle_id, table_ref);
 """
 
 # 本地已有库的增量列（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，先查 PRAGMA）
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "users": {"role": "TEXT NOT NULL DEFAULT 'user'"},
+    # Bundle 子表带 user_id：归属谓词要能写进每一条子表查询，而不是靠"先查父行"
+    "bundle_files": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
+    "bundle_tables": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
 }
 
 

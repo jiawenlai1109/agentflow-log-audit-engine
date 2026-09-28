@@ -11,14 +11,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import APP_DATA_DIR, DATASETS_DIR, OUTPUTS_ROOT, SESSIONS_ROOT
+from app.config import APP_DATA_DIR, BUNDLES_DIR, DATASETS_DIR, OUTPUTS_ROOT, SESSIONS_ROOT
 from app.db import init_db
-from app.routers import auth, datasets, jobs, media, reports, sessions
+from app.routers import auth, bundles, datasets, jobs, media, reports, sessions
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
     SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
     init_db()
@@ -48,6 +49,7 @@ def health() -> dict:
 
 app.include_router(auth.router)
 app.include_router(datasets.router)
+app.include_router(bundles.router)
 app.include_router(jobs.router)
 app.include_router(sessions.router)
 app.include_router(reports.router)
