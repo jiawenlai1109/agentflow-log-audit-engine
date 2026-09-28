@@ -180,12 +180,16 @@ def _artifact_owner(target: Path) -> int | None:
 
 @dataclass
 class Tool:
-    """工具定义：名称、描述、参数 JSON Schema、处理函数。"""
+    """工具定义：名称、描述、参数 JSON Schema、处理函数。
+
+    `tier` 只对 MCP 工具有意义（read/compute/write/network）；本地工具一律 local。
+    """
 
     name: str
     description: str
     handler: Callable[..., Any]
     parameters: dict[str, Any] = field(default_factory=dict)
+    tier: str = "local"
 
 
 PATH_LIKE_KEYS = {
@@ -237,6 +241,11 @@ DEFAULT_TOOL_WHITELIST = {
 class ToolRegistry:
     """统一工具注册表：实现一次，按 Agent 白名单注入可见性并运行时强制（v1.2）。"""
 
+    # handler 侧取"当前调用者"用的线程本地标签。为什么不用参数传：
+    # `call()` 的签名是 (agent_name, tool_name, ctx, **params)，而 params 会原样进 handler，
+    # 让模型可写的 params 里混一个 `_agent` 就等于把"我是谁"交给被调用方声明。
+    call_local = threading.local()
+
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._tools: dict[str, Tool] = {}
         self._config = config
@@ -245,6 +254,41 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise ToolError(f"工具重复注册：{tool.name}")
         self._tools[tool.name] = tool
+
+    def register_mcp_tool(
+        self,
+        name: str,
+        description: str,
+        handler: Callable[..., Any],
+        tier: str = "read",
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        """注册一个外部（MCP）工具：名字必须是 `mcp:<server>:<tool>` 三段式。
+
+        命名空间不是装饰——白名单里 `mcp:` 前缀就是"这是外部能力"的标记，
+        审计与授权都按它分流。名字写成 `execute_python2` 这种会把外部能力伪装成本地能力。
+        """
+        parts = name.split(":")
+        if len(parts) != 3 or parts[0] != "mcp" or not all(parts[1:]):
+            raise ToolError(
+                f"MCP 工具名必须是 mcp:<server>:<tool> 三段式，收到 {name}"
+            )
+        self.register(
+            Tool(
+                name=name,
+                description=description,
+                handler=handler,
+                parameters=parameters or {"type": "object", "properties": {}},
+                tier=tier,
+            )
+        )
+
+    def current_agent(self) -> str:
+        """当前正在被调用的角色名（handler 侧只读，用于审计归因）。"""
+        return getattr(self.call_local, "agent", "unknown")
+
+    def is_mcp(self, name: str) -> bool:
+        return name.startswith("mcp:")
 
     def get(self, name: str) -> Tool:
         try:
@@ -269,6 +313,14 @@ class ToolRegistry:
                 return list(entry)
         # 未声明时回落默认白名单——配置缺 agents 段不应导致全员被拒
         return list(DEFAULT_TOOL_WHITELIST.get(agent_name, []))
+
+    def whitelist_for(self, agent_name: str) -> list[str]:
+        """某角色的工具白名单（公开口径）。
+
+        skill 装载前的权限预检必须调这个函数，而不是自己再读一遍配置：判"能不能装"和
+        判"能不能用"若是两套逻辑，就会出现装得上、跑不动（或反过来）的裂缝。
+        """
+        return self._whitelist_for(agent_name)
 
     def _check_whitelist(self, agent_name: str, tool_name: str, ctx: Any) -> None:
         if tool_name in self._whitelist_for(agent_name):
@@ -320,7 +372,11 @@ class ToolRegistry:
                     raise
             else:
                 guarded[key] = value
-        return tool.handler(ctx=ctx, **guarded)
+        self.call_local.agent = agent_name
+        try:
+            return tool.handler(ctx=ctx, **guarded)
+        finally:
+            self.call_local.agent = "unknown"
 
 
 # ---------------------------------------------------------------- handlers

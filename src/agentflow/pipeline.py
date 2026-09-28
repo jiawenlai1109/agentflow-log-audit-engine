@@ -27,9 +27,23 @@ from agentflow.core.memory import (
     extract_key_numbers,
     merge_summary_mock,
 )
+from agentflow.core.mcp import attach_tools as attach_mcp_tools
 from agentflow.core.orchestrator import Orchestrator
 from agentflow.schemas.summary import SessionSummary
+from agentflow.core.skill import load_skill_set
 from agentflow.core.tools import build_default_registry
+
+# 端到端跑起来的七个角色。skill 的 applies_to 点了不在名单里的角色 = 拒装：
+# "方法安静地没生效"比"方法被拒装并写明原因"难查得多。
+AGENT_ROSTER = (
+    "explorer",
+    "planner",
+    "executor",
+    "inspector",
+    "visualizer",
+    "reporter",
+    "critic",
+)
 
 
 def build_agents(
@@ -37,6 +51,7 @@ def build_agents(
     registry: Any,
     config: dict[str, Any],
     budget: Any,
+    skills: Any = None,
 ) -> dict[str, Any]:
     agents_cfg = config.get("agents", {})
     return {
@@ -45,6 +60,7 @@ def build_agents(
             config=config,
             budget=budget,
             registry=registry,
+            skills=skills,
         )
         for name, cls in (
             ("explorer", ExplorerAgent),
@@ -119,11 +135,15 @@ def run_analysis(
     session_id: str | None = None,
     on_event: Any | None = None,
     pack: str | None = None,
+    skills_dir: str | Path | None = None,
+    mcp_config: str | Path | None = None,
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
 
     sources：Bundle 或文件路径（单个或列表）——异构输入在 `as_bundle` 里归一化。
     pack：场景包名称（如 login_audit），装载 packs/<name>/ 并切换为领域规则包模式。
+    skills_dir：方法（skill）目录，默认仓库 `skills/`；关哪几只走 config `skills.disabled`。
+    mcp_config：外部工具 server 配置，默认 `config/mcp.yaml`（文件不存在 = 一个都不接）。
     """
     config = load_config(config_path)
     registry = build_default_registry(config)
@@ -160,13 +180,24 @@ def run_analysis(
 
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
     llm.budget = budget  # v1.2：预算计数点下沉到 LLM 层（每次真实 API 调用计 1）
-    agents = build_agents(llm, registry, config, budget)
+    # skill 装载必须在 build_agents 之前：注入发生在各角色 __init__ 里。
+    # 权限预检用的就是运行时那一份白名单函数，两套口径必然打架（见 core/skill.py）。
+    skills = load_skill_set(
+        skills_dir=skills_dir,
+        registry=registry,
+        disabled=(config.get("skills") or {}).get("disabled") or [],
+        known_agents=list(AGENT_ROSTER),
+    )
+    mcp = attach_mcp_tools(registry, config, mcp_config)
+    agents = build_agents(llm, registry, config, budget, skills=skills)
     orchestrator = Orchestrator(
         config=config,
         registry=registry,
         agents=agents,
         budget=budget,
         on_event=on_event,
+        skills=skills,
+        mcp=mcp,
     )
     bundle = as_bundle(sources, outputs_root)
     result = orchestrator.run(
@@ -242,13 +273,18 @@ def _summarize(
         "请合并输出新的会话摘要 JSON。"
     )
     try:
-        result = llm.complete_structured(
-            system=SUMMARIZER_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            schema=SessionSummary,
-            temperature=0.2,
-            max_tokens=800,
-        )
+        previous = getattr(llm.agent_local, "agent", None)
+        llm.agent_local.agent = "summarizer"  # 不走 BaseAgent，所以自己打标并负责还原
+        try:
+            result = llm.complete_structured(
+                system=SUMMARIZER_SYSTEM,
+                messages=[{"role": "user", "content": prompt}],
+                schema=SessionSummary,
+                temperature=0.2,
+                max_tokens=800,
+            )
+        finally:
+            llm.agent_local.agent = previous
         return result.model_dump(mode="json")
     except Exception:  # noqa: BLE001 - 摘要失败退化为确定性合并
         return merge_summary_mock(old_summary, turn)

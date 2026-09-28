@@ -15,7 +15,7 @@ execution:
 
 agents:
   explorer:
-    tools: [profile_bundle]
+    tools: [profile_bundle, "mcp:soc_intel:query"]   # 外部只读证据：白名单是第二道，server 侧 allowed_agents 是第一道
     temperature: 0.2
     max_tokens: 800
   planner:
@@ -43,3 +43,8 @@ agents:
     tools: [check_report]
     temperature: 0.3
     max_tokens: 800
+
+# 方法（skill）开关。关掉一只 = 系统失去那套方法，行为变化必须被门禁量到（见 core/skill.py）。
+# 名单里写的是 skill 的 name 字段，不是目录名；关掉的名单与原因会进 transcript + evaluation.json。
+skills:
+  disabled: []

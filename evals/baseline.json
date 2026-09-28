@@ -1,21 +1,21 @@
 {
   "suite_version": 1,
   "mode": "mock",
-  "generated_at": "2026-09-28 20:04:38",
+  "generated_at": "2026-09-28 21:21:01",
   "aggregate": {
-    "cases": 25,
-    "pass": 25,
+    "cases": 27,
+    "pass": 27,
     "fail": 0,
     "xpass": 0,
     "error": 0,
-    "gate_checks": 109,
+    "gate_checks": 125,
     "gate_failed": 0,
     "gap_checks": 12,
     "gap_passed": 0,
-    "numbers_traceable_mean": 0.92,
-    "avg_llm_calls": 4.96,
-    "avg_duration": 2.3062,
-    "verifier_checked": 15,
+    "numbers_traceable_mean": 0.9259,
+    "avg_llm_calls": 4.9259,
+    "avg_duration": 1.9305,
+    "verifier_checked": 17,
     "fingerprints": {
       "prompt:critic": "d8435a6e38bb",
       "prompt:executor": "0148a451cb91",
@@ -24,10 +24,16 @@
       "prompt:planner": "ca032ec2ad28",
       "prompt:reporter": "e44a344aa675",
       "prompt:visualizer": "c55800626f76",
-      "config": "39ae54c1bd32",
-      "harness:suite.yaml": "2c62f504a53e",
-      "harness:grading.py": "ea93dd0d1fb3",
-      "harness:run_eval.py": "643f52aa7973"
+      "prompt:data_defense": "93bd3aaf495a",
+      "prompt:summarizer": "e4d8a26a1dfc",
+      "prompt_version:data_defense": "1.0.0",
+      "prompt_version:summarizer": "1.0.0",
+      "skill:chart_selection": "541fcfd46ecb",
+      "skill:cross_table_triage": "1cb341d774ea",
+      "config": "64ce83725f3a",
+      "harness:suite.yaml": "1b8564826dff",
+      "harness:grading.py": "bc08b08a99e2",
+      "harness:run_eval.py": "54695da584f1"
     }
   },
   "results": [
@@ -35,11 +41,11 @@
       "case_id": "E01",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.64,
+      "seconds": 1.83,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.61,
+        "duration_seconds": 1.797,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -89,7 +95,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200331_88bb4f44",
+          "run_id": "run_20260928_212001_c9cf29f8",
           "status": "success"
         }
       ]
@@ -98,11 +104,11 @@
       "case_id": "E02",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.38,
+      "seconds": 1.88,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.344,
+        "duration_seconds": 1.843,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -140,7 +146,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200333_04a4f953",
+          "run_id": "run_20260928_212003_89b3f960",
           "status": "success"
         }
       ]
@@ -149,11 +155,11 @@
       "case_id": "E03",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.25,
+      "seconds": 2.84,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.235,
+        "duration_seconds": 2.813,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -203,7 +209,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200336_1e17b5bb",
+          "run_id": "run_20260928_212005_f8239d85",
           "status": "success"
         }
       ]
@@ -212,11 +218,11 @@
       "case_id": "E04",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.3,
+      "seconds": 2.89,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.266,
+        "duration_seconds": 2.843,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -254,7 +260,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200339_7d3f8337",
+          "run_id": "run_20260928_212008_4c00c5f8",
           "status": "success"
         }
       ]
@@ -263,11 +269,11 @@
       "case_id": "E05",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.38,
+      "seconds": 2.81,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.359,
+        "duration_seconds": 2.781,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -305,7 +311,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200342_ab5918b9",
+          "run_id": "run_20260928_212011_b4a60870",
           "status": "success"
         }
       ]
@@ -314,11 +320,11 @@
       "case_id": "E06",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.3,
+      "seconds": 2.86,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.25,
+        "duration_seconds": 2.828,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -344,7 +350,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200346_5d314abe",
+          "run_id": "run_20260928_212013_0eb2ecae",
           "status": "success"
         }
       ]
@@ -353,11 +359,11 @@
       "case_id": "E07",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 2.42,
+      "seconds": 1.91,
       "metrics": {
         "numbers_traceable_ratio": 0.0,
         "llm_calls": 2.0,
-        "duration_seconds": 2.375,
+        "duration_seconds": 1.875,
         "tasks": 2.0,
         "unexplained_numbers": 2.0
       },
@@ -383,7 +389,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200349_42d2bc0e",
+          "run_id": "run_20260928_212016_8ff9ba78",
           "status": "degraded"
         }
       ]
@@ -392,11 +398,11 @@
       "case_id": "E08",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.36,
+      "seconds": 2.72,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.328,
+        "duration_seconds": 2.687,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -428,7 +434,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200351_baeb4762",
+          "run_id": "run_20260928_212018_f614556d",
           "status": "success"
         }
       ]
@@ -437,11 +443,11 @@
       "case_id": "E09",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.88,
+      "seconds": 0.72,
       "metrics": {
         "numbers_traceable_ratio": 0.0,
         "llm_calls": 2.0,
-        "duration_seconds": 0.828,
+        "duration_seconds": 0.703,
         "tasks": 2.0,
         "unexplained_numbers": 2.0
       },
@@ -485,7 +491,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200355_79123aa1",
+          "run_id": "run_20260928_212021_262c0175",
           "status": "degraded"
         }
       ]
@@ -494,11 +500,11 @@
       "case_id": "E10",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.12,
+      "seconds": 1.84,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.094,
+        "duration_seconds": 1.797,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -524,7 +530,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200356_77f1cd02",
+          "run_id": "run_20260928_212022_c5e88dee",
           "status": "success"
         }
       ]
@@ -533,11 +539,11 @@
       "case_id": "E11",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.59,
+      "seconds": 3.73,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.375,
+        "duration_seconds": 1.812,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -557,11 +563,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200358_8d1b567a",
+          "run_id": "run_20260928_212024_0c0bfe4f",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_200400_fc071b99",
+          "run_id": "run_20260928_212025_e4f0ecd2",
           "status": "success"
         }
       ]
@@ -570,11 +576,11 @@
       "case_id": "E12",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.22,
+      "seconds": 4.7,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.218,
+        "duration_seconds": 1.828,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -594,11 +600,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200402_34f1fd90",
+          "run_id": "run_20260928_212027_ee070fb8",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_200406_ecfcb339",
+          "run_id": "run_20260928_212030_a5e812e7",
           "status": "success"
         }
       ]
@@ -607,11 +613,11 @@
       "case_id": "E13",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.26,
+      "seconds": 1.86,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.219,
+        "duration_seconds": 1.828,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -631,7 +637,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200409_330fc242",
+          "run_id": "run_20260928_212032_934066f1",
           "status": "success"
         }
       ]
@@ -640,11 +646,11 @@
       "case_id": "E14",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.7,
+      "seconds": 1.58,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.672,
+        "duration_seconds": 1.547,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -688,7 +694,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200411_6a3007a9",
+          "run_id": "run_20260928_212034_923fe0df",
           "status": "success"
         }
       ]
@@ -697,11 +703,11 @@
       "case_id": "E15",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.31,
+      "seconds": 2.95,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.265,
+        "duration_seconds": 2.921,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -739,7 +745,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200413_0394369b",
+          "run_id": "run_20260928_212036_d17a0e7e",
           "status": "success"
         }
       ]
@@ -748,11 +754,11 @@
       "case_id": "E16",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.88,
+      "seconds": 1.61,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.843,
+        "duration_seconds": 1.578,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -790,7 +796,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200416_5e1d4d1e",
+          "run_id": "run_20260928_212039_c24b9851",
           "status": "success"
         }
       ]
@@ -799,11 +805,11 @@
       "case_id": "E17",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.61,
+      "seconds": 3.7,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.156,
+        "duration_seconds": 1.844,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -829,11 +835,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200418_2e818022",
+          "run_id": "run_20260928_212040_f506b075",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_200420_3c949e22",
+          "run_id": "run_20260928_212042_9cce0e83",
           "status": "success"
         }
       ]
@@ -842,11 +848,11 @@
       "case_id": "E18",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.36,
+      "seconds": 3.69,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 10.0,
-        "duration_seconds": 4.328,
+        "duration_seconds": 3.625,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -896,7 +902,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200422_6c668998",
+          "run_id": "run_20260928_212044_a1de4bb8",
           "status": "success"
         }
       ]
@@ -905,11 +911,11 @@
       "case_id": "E19",
       "verdict": "pass",
       "status": "partial",
-      "seconds": 2.14,
+      "seconds": 1.84,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.125,
+        "duration_seconds": 1.813,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -935,7 +941,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200427_6c0e9402",
+          "run_id": "run_20260928_212048_97635f29",
           "status": "partial"
         }
       ]
@@ -944,11 +950,11 @@
       "case_id": "E20",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.09,
+      "seconds": 3.45,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 4.062,
+        "duration_seconds": 3.422,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -986,7 +992,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200429_11bb0edb",
+          "run_id": "run_20260928_212049_a6094e69",
           "status": "success"
         }
       ]
@@ -995,11 +1001,11 @@
       "case_id": "E21",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.22,
+      "seconds": 1.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.172,
+        "duration_seconds": 1.016,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1061,7 +1067,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200433_29e00165",
+          "run_id": "run_20260928_212053_bc37518c",
           "status": "success"
         }
       ]
@@ -1070,11 +1076,11 @@
       "case_id": "E22",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.26,
+      "seconds": 1.05,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.218,
+        "duration_seconds": 1.0,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1124,7 +1130,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200434_7b96c61e",
+          "run_id": "run_20260928_212054_4e41b082",
           "status": "success"
         }
       ]
@@ -1133,11 +1139,11 @@
       "case_id": "E23",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.25,
+      "seconds": 1.05,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.188,
+        "duration_seconds": 1.015,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1193,7 +1199,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200436_09f1a8f8",
+          "run_id": "run_20260928_212055_f70c3c98",
           "status": "success"
         }
       ]
@@ -1202,11 +1208,11 @@
       "case_id": "E24",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.16,
+      "seconds": 1.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.093,
+        "duration_seconds": 1.031,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1250,7 +1256,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200437_3bc2ac13",
+          "run_id": "run_20260928_212056_e5ccd843",
           "status": "success"
         }
       ]
@@ -1259,11 +1265,11 @@
       "case_id": "E25",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.06,
+      "seconds": 0.16,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 0.0,
-        "duration_seconds": 0.031,
+        "duration_seconds": 0.11,
         "tasks": 0.0,
         "unexplained_numbers": 0.0
       },
@@ -1289,8 +1295,146 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_200438_33b018a2",
+          "run_id": "run_20260928_212057_6819cf3b",
           "status": "degraded"
+        }
+      ]
+    },
+    {
+      "case_id": "E26",
+      "verdict": "pass",
+      "status": "success",
+      "seconds": 2.83,
+      "metrics": {
+        "numbers_traceable_ratio": 1.0,
+        "llm_calls": 8.0,
+        "duration_seconds": 2.766,
+        "tasks": 2.0,
+        "unexplained_numbers": 0.0
+      },
+      "checks": [
+        {
+          "kind": "status",
+          "tier": "gate",
+          "passed": true,
+          "detail": "status=success 期望∈['success']"
+        },
+        {
+          "kind": "skills_active",
+          "tier": "gate",
+          "passed": true,
+          "detail": "installed=['chart_selection', 'cross_table_triage'] 注入={'explorer': [], 'planner': ['cross_table_triage'], 'executor': ['cross_table_triage'], 'inspector': [], 'visualizer': ['chart_selection'], 'reporter': [], 'critic': []}"
+        },
+        {
+          "kind": "chart_type",
+          "tier": "gate",
+          "passed": true,
+          "detail": "task2.chart_type=line 期望=line"
+        },
+        {
+          "kind": "transcript_has",
+          "tier": "gate",
+          "passed": true,
+          "detail": "2 项在场"
+        },
+        {
+          "kind": "verifier",
+          "tier": "gate",
+          "passed": true,
+          "detail": "校验一致 1/1"
+        },
+        {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        }
+      ],
+      "runs": [
+        {
+          "run_id": "run_20260928_212058_e1e71c99",
+          "status": "success"
+        }
+      ]
+    },
+    {
+      "case_id": "E27",
+      "verdict": "pass",
+      "status": "success",
+      "seconds": 1.06,
+      "metrics": {
+        "numbers_traceable_ratio": 1.0,
+        "llm_calls": 1.0,
+        "duration_seconds": 1.0,
+        "tasks": 3.0,
+        "unexplained_numbers": 0.0
+      },
+      "checks": [
+        {
+          "kind": "status",
+          "tier": "gate",
+          "passed": true,
+          "detail": "status=success 期望∈['success']"
+        },
+        {
+          "kind": "external_evidence",
+          "tier": "gate",
+          "passed": true,
+          "detail": "soc_intel:query 5 行 ['host', 'score']（只作证据）"
+        },
+        {
+          "kind": "subjects",
+          "tier": "gate",
+          "passed": true,
+          "detail": "3 条规则的主体集合一致"
+        },
+        {
+          "kind": "findings",
+          "tier": "gate",
+          "passed": true,
+          "detail": "命中数核对 全部一致"
+        },
+        {
+          "kind": "verifier",
+          "tier": "gate",
+          "passed": true,
+          "detail": "校验一致 3/3"
+        },
+        {
+          "kind": "critic",
+          "tier": "gate",
+          "passed": true,
+          "detail": "critic_pass=True 期望=pass"
+        },
+        {
+          "kind": "report_layers",
+          "tier": "gate",
+          "passed": true,
+          "detail": "三档结构一致（6 条发现均落在事实层与建议层）"
+        },
+        {
+          "kind": "report_excludes",
+          "tier": "gate",
+          "passed": true,
+          "detail": "无禁用词"
+        },
+        {
+          "kind": "transcript_has",
+          "tier": "gate",
+          "passed": true,
+          "detail": "2 项在场"
+        },
+        {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        }
+      ],
+      "runs": [
+        {
+          "run_id": "run_20260928_212100_876968fa",
+          "status": "success"
         }
       ]
     }

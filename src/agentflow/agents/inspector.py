@@ -10,11 +10,12 @@ from agentflow.core import dataset_scope
 from agentflow.core.llm import MockLLM
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.verdict import CheckResult, Verdict
+from agentflow.core.prompts import load_prompt
 
 
 class InspectorAgent(BaseAgent):
     name = "inspector"
-    system_prompt = "你是数据质量审核员：审核执行结果是否为空、列是否齐全、数值是否合理、能否回答原始问题。"
+    system_prompt = load_prompt("inspector")
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
         data = json.loads(message.content)

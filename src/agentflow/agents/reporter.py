@@ -14,9 +14,9 @@ from agentflow.core.llm import LLMError, MockLLM
 from agentflow.core.messages import AgentMessage
 from agentflow.core.pack import SEVERITY_ORDER
 from agentflow.schemas.report import FailureInfo, ReportResult
+from agentflow.core.prompts import load_prompt
 
 
-REPORTER_SYSTEM = """你是商业智能汇报专家。只能引用输入中提供的真实数字与结论，禁止计算或猜测。"""
 
 REPORT_TEMPLATE = """# 📊 数据分析报告
 
@@ -60,7 +60,7 @@ DEGRADED_TEMPLATE = """# 数据分析报告（未完成）
 
 class ReporterAgent(BaseAgent):
     name = "reporter"
-    system_prompt = REPORTER_SYSTEM
+    system_prompt = load_prompt("reporter")
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
         data = json.loads(message.content)

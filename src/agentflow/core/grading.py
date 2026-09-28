@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from agentflow.core.prompts import prompt_hashes, prompt_version
+
 # 报告里允许出现的"非结论数字"：时间戳、日期、行号等运行元数据
 _META_NUMBER_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}:\d{2}:\d{2}\b")
 # 点分四段（IPv4 等）不是"数字"：不先挖掉会把 198.51.100.23 拆成三个假未追溯数
@@ -456,6 +458,85 @@ def _p_tasks_min(evidence, params, mode):
     return actual >= int(params), f"任务数={actual} 下界={params}"
 
 
+def _p_chart_type(evidence, params, mode):
+    """逐任务断言"画成了什么"。
+
+    `chart` 那个谓词只看"有没有图"，量不出**选图方法**在不在。M4 的验收判据是
+    "关掉某 skill 后门禁能量出指标差"，差要落在这一粒度上才说得清是哪只任务、差在哪。
+    params = {task: 2, expect: "line"} / {expect_any: "none"}
+    """
+    charts = (evidence.get("evaluation") or {}).get("chart_types") or {}
+    if isinstance(params, dict) and params.get("task") is not None:
+        task_id = str(params["task"])
+        actual = charts.get(task_id)
+        return actual == params["expect"], f"task{task_id}.chart_type={actual} 期望={params['expect']}"
+    expected = params.get("expect_any") if isinstance(params, dict) else params
+    matched = [t for t, chart in charts.items() if chart == expected]
+    return bool(matched), f"chart_types={charts} 期望存在 {expected}"
+
+
+def _p_skills_active(evidence, params, mode):
+    """方法（skill）装载与注入断言（M4-B 那道闸门进 harness）。
+
+    三个方向都要能判：
+    - `installed`：这只方法本次确实装上了（不是"文件在仓库里"就算数）；
+    - `injected`：{角色: [方法名]}——正文真的进了那个角色的 prompt。只查"装载"是假的：
+      装上却没注入 = 方法没生效，而门禁会照样绿；
+    - `refused`：越权的方法必须**没**装上且原因留痕。这条防的是"扩权被静默接受"。
+    """
+    skills = (evidence.get("evaluation") or {}).get("skills") or {}
+    installed = {item.get("name") for item in skills.get("installed") or []}
+    refused = {item.get("skill") for item in skills.get("refused") or []}
+    injected: dict[str, set[str]] = {}
+    for entry in skills.get("injected") or []:
+        injected[str(entry.get("agent"))] = {
+            item.get("name") for item in entry.get("bodies") or []
+        }
+    problems: list[str] = []
+    spec = params if isinstance(params, dict) else {"installed": params}
+    for name in spec.get("installed") or []:
+        if name not in installed:
+            problems.append(f"未装载 {name}")
+    for name in spec.get("refused") or []:
+        if name in installed:
+            problems.append(f"{name} 本该被拒装却装上了（扩权被接受）")
+        if name not in refused:
+            problems.append(f"{name} 装不上却没留拒装原因")
+    for agent, names in (spec.get("injected") or {}).items():
+        got = injected.get(agent, set())
+        missing = [name for name in names if name not in got]
+        if missing:
+            problems.append(f"{agent} 未注入 {'、'.join(missing)}")
+    return not problems, ("；".join(problems) if problems else f"installed={sorted(installed)} 注入={ {k: sorted(v) for k, v in injected.items()} }")
+
+
+def _p_external_evidence(evidence, params, mode):
+    """外部（MCP）证据断言：取到了、几行、哪些列——以及最要紧的"它只作证据"。
+
+    这里的判定不读 server 自述，读的是本地审计累计（evaluation.json 的 external_evidence），
+    因为外部说"我返回了 5 行"不构成证据。
+    """
+    items = (evidence.get("evaluation") or {}).get("external_evidence") or []
+    want = params if isinstance(params, dict) else {}
+    matched = [
+        item
+        for item in items
+        if item.get("server") == want.get("server") and item.get("tool") == want.get("tool")
+    ]
+    if not matched:
+        return False, f"没有 {want.get('server')}:{want.get('tool')} 的外部证据记录，实到={[ (i.get('server'), i.get('tool'), i.get('status')) for i in items ]}"
+    item = matched[0]
+    if item.get("status") != "ok":
+        return False, f"外部证据拉取失败：{str(item.get('reason'))[:120]}"
+    if want.get("rows") is not None and int(item.get("rows") or -1) != int(want["rows"]):
+        return False, f"外部证据 {item.get('rows')} 行，期望 {want['rows']} 行"
+    if want.get("columns") is not None and sorted(item.get("columns") or []) != sorted(want["columns"]):
+        return False, f"外部证据列={item.get('columns')} 期望={want['columns']}"
+    if want.get("evidence_only") and not item.get("untrusted"):
+        return False, "外部证据未标记为不可信数据"
+    return True, f"{item.get('server')}:{item.get('tool')} {item.get('rows')} 行 {item.get('columns')}（只作证据）"
+
+
 PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "status": _p_status,
     "degraded_reason": _p_degraded_reason,
@@ -472,6 +553,9 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "llm_calls_max": _p_llm_calls_max,
     "duration_max": _p_duration_max,
     "chart": _p_chart,
+    "chart_type": _p_chart_type,
+    "skills_active": _p_skills_active,
+    "external_evidence": _p_external_evidence,
     "critic": _p_critic,
     "replan": _p_replan,
     "clarify": _p_clarify,
@@ -597,15 +681,29 @@ def fingerprint(
     pack: Any = None,
     pack_name: str | None = None,
     extra_files: list[Path] | None = None,
+    skills: Any = None,
 ) -> dict[str, str]:
-    """run 的可归因指纹：prompt / config / pack / harness 四者的 hash 一起记。
+    """run 的可归因指纹：prompt / skill / pack / harness 四者的 hash 一起记。
 
     分数变化只有配对到这里的某个 diff，才算"可归因"（评估方案 §8 归因规则）。
+
+    `prompt:*` 在 M4-A 之后取的是 `prompts/<name>.md` 的正文 hash。装载器不加工正文，
+    所以迁移前后 hash 逐位相同——这既是"外置没改动内容"的证明，也意味着**改了文件
+    就等于改了 prompt**，没有第二份真相。摘要器与数据内容防线过去藏在 .py 里、
+    不进任何 hash，现在一并记入（它们确实会进模型的 system prompt）。
     """
     out: dict[str, str] = {}
     for name, agent in sorted((agents or {}).items()):
         prompt = getattr(agent, "system_prompt", "") or ""
         out[f"prompt:{name}"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+    for name, digest in sorted(prompt_hashes().items()):
+        out.setdefault(name, digest)
+    for name, version in sorted(
+        ((name, prompt_version(name)) for name in ("summarizer", "data_defense"))
+    ):
+        out[f"prompt_version:{name}"] = version
+    for skill in getattr(skills, "installed", []) or []:
+        out[f"skill:{skill.name}"] = skill.sha256
     if config is not None:
         blob = json.dumps(config, ensure_ascii=False, sort_keys=True, default=str)
         out["config"] = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]

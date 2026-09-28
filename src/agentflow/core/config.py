@@ -22,6 +22,10 @@ DEFAULT_CONFIG = {
         "allow_partial_results": True,
     },
     "agents": {},
+    # skill：能力面开关。关掉一只 skill 是可执行的动作，且必须留下原因（见 core/skill.py）
+    "skills": {"disabled": []},
+    # mcp：外部 server 白名单与能力分级（见 core/mcp.py）。默认一个都不接。
+    "mcp": {"servers": [], "max_calls": 5},
 }
 
 # core/config.py → agentflow → src → 项目根
@@ -44,7 +48,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         return config
     with config_path.open(encoding="utf-8") as fh:
         loaded = yaml.safe_load(fh) or {}
-    for key in ("llm", "execution", "agents"):
+    for key in ("llm", "execution", "agents", "skills", "mcp"):
         section = loaded.get(key)
         if not isinstance(section, dict):
             continue

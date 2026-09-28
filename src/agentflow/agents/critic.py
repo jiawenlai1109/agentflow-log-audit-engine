@@ -8,15 +8,14 @@ from typing import Any
 from agentflow.agents.base import BaseAgent
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.review import Review, ReviewIssue
+from agentflow.core.prompts import load_prompt
 
 
-CRITIC_SYSTEM = """你是报告质量评审员。检查报告是否完整、数字是否与数据一致、是否有洞察。
-输出 JSON：{"verdict": "PASS" 或 "FAIL", "rounds": 1, "issues": [{"severity": "high|medium|low", "section": "...", "message": "..."}]}"""
 
 
 class CriticAgent(BaseAgent):
     name = "critic"
-    system_prompt = CRITIC_SYSTEM
+    system_prompt = load_prompt("critic")
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
         data = json.loads(message.content)

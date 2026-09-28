@@ -11,21 +11,17 @@ from agentflow.core import dataset_scope
 from agentflow.core.llm import LLMError
 from agentflow.core.messages import AgentMessage
 from agentflow.schemas.figure import FigureResult
+from agentflow.core.prompts import load_prompt
 
 
-VISUALIZER_SYSTEM = """你是数据可视化专家。根据任务与数据生成 matplotlib 代码。
-要求：
-- 只输出纯 Python 代码，禁止 Markdown 围栏；
-- 必须包含中文字体配置：plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']，且 axes.unicode_minus = False；
-- 可读取 os.environ['DATA_PATH'] 或 os.environ['RESULT_PATH']；
-- 图表保存到 os.environ['CHART_PATH']；
-- 注意：本环境 pandas 为 3.x，月末频率请用 'ME'（'M' 已废弃），月初 'MS' 不变；
-- 禁止访问网络。"""
 
 
 class VisualizerAgent(BaseAgent):
     name = "visualizer"
-    system_prompt = VISUALIZER_SYSTEM
+    system_prompt = load_prompt("visualizer")
+
+    # 降级必留因：不画的时候要说清为什么不画，否则下游只能看到一个空字段
+    no_chart_reason: str = ""
 
     def run(self, ctx: Any, message: AgentMessage) -> AgentMessage:
         data = json.loads(message.content)
@@ -33,9 +29,12 @@ class VisualizerAgent(BaseAgent):
         result = data["result"]
         task_id = int(task["task_id"])
 
+        self.no_chart_reason = ""
         chart_type = self._decide_chart_type(task, result, ctx)
         if chart_type == "none":
-            figure = FigureResult(task_id=task_id, chart_type="none")
+            figure = FigureResult(
+                task_id=task_id, chart_type="none", note=self.no_chart_reason
+            )
             return self.reply(ctx, "orchestrator", "figure_result", figure.model_dump_json())
 
         chart_path = ctx.artifacts_dir / f"chart_task_{task_id}.png"
@@ -107,29 +106,78 @@ class VisualizerAgent(BaseAgent):
         return self.reply(ctx, "orchestrator", "figure_result", figure.model_dump_json())
 
     # ------------------------------------------------------------ helpers
+    # `when` 只准用这几个键：规则表是外部文件，给它一个可执行的表达式语法
+    # 就等于把代码执行权交给一份 yaml。这里是一组封闭谓词，不是小语言。
+    RULE_KEYS = ("constraint_contains", "task_chart_type_present", "required_has_date_column")
+
     def _decide_chart_type(self, task: dict[str, Any], result: dict[str, Any], ctx: Any) -> str:
-        # 约束一等公民（v1.2）：UserConstraints 的 display 图表偏好覆盖默认选图规则
-        constraints = getattr(ctx, "constraints", None) or {}
-        for pref in constraints.get("display") or []:
-            text = str(pref)
-            if any(k in text for k in ("柱状", "柱形", "bar")):
-                return "bar"
-            if any(k in text for k in ("折线", "line", "走势图")):
-                return "line"
-            if any(k in text for k in ("饼图", "pie")):
-                return "pie"
-        suggested = task.get("chart_type") or ""
-        if suggested and suggested != "none":
-            return suggested
-        if suggested == "none":
-            # 显式 none：Planner 明确不需要图表，不做推断
+        """按 skill `chart_selection` 的规则表选图；没有规则表就不画。
+
+        规则原先硬编码在这个函数里（M4-B 之前）。搬出去不是为了好看：
+        搬出来之后"关掉方法"是一个可执行的动作，门禁也就能量出它没了之后差在哪。
+        """
+        rules = self._chart_rules(ctx)
+        if not rules:
+            self.no_chart_reason = (
+                "未装载选图方法（skill chart_selection），系统没有选图依据，故不生成图表"
+            )
             return "none"
-        required = task.get("required_columns", [])
+        constraints = getattr(ctx, "constraints", None) or {}
         schema = ctx.schema_profile or {}
         date_col = schema.get("suggested_date_column")
-        if date_col and date_col in required:
-            return "line"
-        return "bar"
+        for rule in rules:
+            when = rule.get("when") or {}
+            unknown = set(when) - set(self.RULE_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"选图规则 {rule.get('id')} 含未知条件 {sorted(unknown)}；"
+                    "静默跳过一条规则 = 少一条在守门的规则，宁可报错"
+                )
+            if not self._matches(when, task, constraints, date_col):
+                continue
+            then = rule.get("then") or {}
+            chosen = then.get("chart_type")
+            if chosen == "from_task":
+                return str(task.get("chart_type"))
+            if isinstance(chosen, str) and chosen:
+                return chosen
+            raise ValueError(f"选图规则 {rule.get('id')} 没有给出 chart_type")
+        # 规则表走完仍无命中 = 表里缺兜底条目
+        self.no_chart_reason = "选图规则表无兜底条目，未选择图表类型"
+        return "none"
+
+    def _matches(
+        self,
+        when: dict[str, Any],
+        task: dict[str, Any],
+        constraints: dict[str, Any],
+        date_col: str | None,
+    ) -> bool:
+        if "constraint_contains" in when:
+            texts = [str(item) for item in (constraints.get("display") or [])]
+            if not any(any(k in text for k in when["constraint_contains"]) for text in texts):
+                return False
+        if "task_chart_type_present" in when:
+            present = bool(task.get("chart_type"))
+            if present is not bool(when["task_chart_type_present"]):
+                return False
+        if "required_has_date_column" in when:
+            has = bool(date_col) and date_col in (task.get("required_columns") or [])
+            if has is not bool(when["required_has_date_column"]):
+                return False
+        return True
+
+    def _chart_rules(self, ctx: Any) -> list[dict[str, Any]]:
+        """L3 明细按需读取：每次选图都从规则表现取，读到什么在 transcript 留痕。"""
+        skills = getattr(self, "skills", None)
+        skill = skills.get("chart_selection") if skills is not None else None
+        if skill is None:
+            return []
+        data = skill.reference(skill.reference_path("rules"), ctx)
+        rules = (data or {}).get("rules")
+        if not isinstance(rules, list):
+            raise ValueError("skill chart_selection 的 rules.yaml 缺 rules 列表")
+        return rules
 
     def _timeout(self, ctx: Any) -> int:
         return int(ctx.config.get("execution", {}).get("task_timeout_seconds", 30))

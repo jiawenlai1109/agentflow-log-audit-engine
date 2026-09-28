@@ -40,7 +40,7 @@ from agentflow.core.grading import (  # noqa: E402
     lint_suite,
     load_evidence,
 )
-from agentflow.pipeline import run_analysis  # noqa: E402
+from agentflow.pipeline import AGENT_ROSTER, run_analysis  # noqa: E402
 
 SUITE_PATH = PROJECT_ROOT / "evals" / "suite.yaml"
 BASELINE_PATH = PROJECT_ROOT / "evals" / "baseline.json"
@@ -158,6 +158,39 @@ def _triage_goldens(data_dir: Path) -> dict[str, Any]:
         "sigma_clean_total": clean["total"],
         # 零命中不是"数据本来就安静"：最大失败次数恰好等于阈值减一，是被构造出来的贴边
         "sigma_clean_max_host_failures": clean["max_host_failures"],
+        **_intel_goldens(data_dir),
+    }
+
+
+def _intel_goldens(data_dir: Path) -> dict[str, Any]:
+    """MCP 外部情报库的 golden：用 stdlib sqlite3 直接数，不经过系统的任何一段代码。
+
+    E27 断言的是"外部数据只作证据、不进数字来源"，那么"外部库里到底有几行、
+    那个独特数字是多少"就必须有一份独立出处——否则"报告里没有 4242"这句话
+    可能只是因为 4242 压根不存在，而不是因为闸门起了作用。
+    """
+    import sqlite3
+
+    database = data_dir / "soc_intel.sqlite"
+    if not database.exists():
+        return {}
+    conn = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+    try:
+        pulled = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT host, score FROM intel WHERE source = 'osint-demo' ORDER BY host)"
+        ).fetchone()[0]
+        marker = conn.execute(
+            "SELECT score FROM intel WHERE host = '10.0.0.15' AND source = 'osint-demo'"
+        ).fetchone()
+        other = conn.execute(
+            "SELECT COUNT(*) FROM intel WHERE source <> 'osint-demo'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return {
+        "intel_pulled_rows": int(pulled),
+        "intel_marker_score": int(marker[0]) if marker else None,
+        "intel_other_source_rows": int(other),
     }
 
 
@@ -300,11 +333,23 @@ def agent_prompt_map() -> dict[str, Any]:
 
 
 def _write_provenance(outputs_dir: str, case: dict[str, Any], mode: str, result, runs) -> None:
-    """§8 归因：把 prompt/config/pack/harness 指纹落到 run 目录，分数变化才有对账对象。"""
+    """§8 归因：把 prompt/skill/config/pack/harness 指纹落到 run 目录，分数变化才有对账对象。"""
     from agentflow.core.config import load_config
     from agentflow.core.pack import load_pack
+    from agentflow.core.skill import load_skill_set
+    from agentflow.core.tools import build_default_registry
 
     pack_obj = load_pack(case["pack"]) if case.get("pack") else None
+    config = load_config(None)
+    registry = build_default_registry(config)
+    # skill 指纹必须与真实运行时装的是同一份：这里重走一遍装载器（无副作用、不调模型），
+    # 而不是另读目录列表——否则"文件在"和"方法生效"会被混为一谈。
+    skills = load_skill_set(
+        registry=registry,
+        skills_dir=PROJECT_ROOT / "skills",
+        disabled=(config.get("skills") or {}).get("disabled") or [],
+        known_agents=list(AGENT_ROSTER),
+    )
     payload = {
         "case_id": case["id"],
         "suite_version": case.get("suite_version"),
@@ -313,10 +358,11 @@ def _write_provenance(outputs_dir: str, case: dict[str, Any], mode: str, result,
         "verdict": result.verdict,
         "fingerprints": fingerprint(
             agents=agent_prompt_map(),
-            config=load_config(None),
+            config=config,
             pack=pack_obj,
             pack_name=case.get("pack"),
             extra_files=HARNESS_FILES,
+            skills=skills,
         ),
         "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -539,8 +585,19 @@ def main() -> int:
         print("提示：还没有基线（evals/baseline.json），本次只出结果不设门禁")
 
     if args.update_baseline:
+        from agentflow.core.skill import load_skill_set
+        from agentflow.core.tools import build_default_registry
+
+        config = load_config(None)
         payload["aggregate"]["fingerprints"] = fingerprint(
-            agents=agent_prompt_map(), config=load_config(None), extra_files=HARNESS_FILES
+            agents=agent_prompt_map(),
+            config=config,
+            extra_files=HARNESS_FILES,
+            skills=load_skill_set(
+                registry=build_default_registry(config),
+                disabled=(config.get("skills") or {}).get("disabled") or [],
+                known_agents=list(AGENT_ROSTER),
+            ),
         )
         BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
         BASELINE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

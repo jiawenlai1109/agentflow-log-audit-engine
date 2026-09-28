@@ -28,12 +28,16 @@ class Orchestrator:
         agents: dict[str, Any],
         budget: Any = None,
         on_event: Any = None,
+        skills: Any = None,
+        mcp: Any = None,
     ) -> None:
         self.config = config
         self.registry = registry
         self.agents = agents
         self.budget = budget
         self.on_event = on_event
+        self.skills = skills
+        self.mcp = mcp
         self._commit_lock = threading.Lock()
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -70,7 +74,11 @@ class Orchestrator:
             transcript=transcript,
             budget=budget,
             pack=pack,
+            skills=self.skills,
+            mcp=self.mcp,
+            mcp_approvals=dict(getattr(self.mcp, "config", None).approvals) if self.mcp is not None else {},
         )
+        self._record_capabilities(ctx, pack)
         started = time.monotonic()
         self._started = started  # 墙钟守卫基准（total_budget_seconds 的执行点）
         status = "failed"
@@ -121,6 +129,11 @@ class Orchestrator:
         finally:
             duration = round(time.monotonic() - started, 3)
             self._write_evaluation(ctx, status, duration)
+            if ctx.mcp is not None:
+                # 外部 server 是子进程：不关就是每跑一次漏一个进程，
+                # 而"跑批跑着跑着机器没了内存"这种缺陷最难归因。
+                ctx.mcp.transcript = None
+                ctx.mcp.close()
             transcript.close()
         return {
             "run_id": run_id,
@@ -131,6 +144,40 @@ class Orchestrator:
             # 回传实际读到的输入快照：CLI/Web 要能回答"这次跑的是哪几份文件、它们的 sha256"
             "bundle": ctx.bundle,
         }
+
+    def _record_capabilities(self, ctx: RunContext, pack: Any) -> None:
+        """把"这次运行到底装了什么能力"写进 transcript：装了什么、拒了什么、注入了什么。
+
+        降级必留因同样适用于能力面：关掉一只 skill 与拒装一只 skill 都必须在事实层可见，
+        否则一次质量下降会被解释成"模型今天状态不好"。
+        """
+        if ctx.mcp is not None:
+            # hub 是 run 级对象、transcript 也是 run 级才建出来的，所以接线只能发生在这里：
+            # 早一步（pipeline 里）transcript 还不存在，晚一步则第一次外部调用不留痕——
+            # "出站数据标记"这条安全线就会变成"写在文档里、没落在事实层"。
+            ctx.mcp.transcript = ctx.transcript
+        if ctx.transcript is None:
+            return
+        if ctx.skills is not None:
+            summary = ctx.skills.summary()
+            ctx.transcript.write({"event": "skills_loaded", **summary})
+            for injection in summary["injected"]:
+                ctx.transcript.write({"event": "skill_injected", **injection})
+            # 关停与拒装也要进事实层：装载发生在 run 目录建出来之前，
+            # 那时还没有 transcript 可写，所以由这里补上（装载器自带 transcript 时不会走到这）。
+            for entry in summary["disabled"]:
+                ctx.transcript.write({"event": "skill_disabled", **entry})
+            for entry in summary["refused"]:
+                ctx.transcript.write({"event": "skill_refused_no_escalation", **entry})
+        if ctx.mcp is not None:
+            ctx.transcript.write(
+                {
+                    "event": "mcp_attached",
+                    "servers": ctx.mcp.summary()["servers"],
+                    "max_calls": ctx.mcp.config.max_calls,
+                    "approvals": dict(ctx.mcp_approvals),
+                }
+            )
 
     # ------------------------------------------------------------ 阶段
     def _explore(self, ctx: RunContext) -> None:
@@ -663,6 +710,15 @@ class Orchestrator:
                 {"source_file": table.get("source_file"), "row_count": table.get("row_count")}
                 for table in ((ctx.schema_profile or {}).get("tables") or [])
             ],
+            # 逐任务选图结果：M4 的"关掉 skill 后指标要能动"就量这个字段。
+            # 只记结论数字不够，得记到"每个任务画了什么"这一粒度，否则差在哪没人说得清。
+            "chart_types": {str(k): v.get("chart_type") for k, v in ctx.figures.items()},
+            "chart_notes": {
+                str(k): (v.get("note") or "") for k, v in ctx.figures.items() if v.get("chart_type") == "none"
+            },
+            "skills": (ctx.skills.summary() if ctx.skills is not None else None),
+            "mcp": (ctx.mcp.summary() if ctx.mcp is not None else None),
+            "external_evidence": ctx.external_evidence,
             "results": {str(k): v for k, v in ctx.results.items()},
         }
         (ctx.outputs_dir / "evaluation.json").write_text(

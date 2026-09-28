@@ -228,6 +228,16 @@ class MockLLM(BaseLLM):
     }
 
     def _agent_name(self, system: str) -> str:
+        """角色判定：优先用调用方打上的权威标签，其次才回落到 prompt 关键词嗅探。
+
+        关键词嗅探在 M4 装载 skill 之后变成隐患：注入的方法文本里只要出现别的角色的
+        关键词（"画像""审核"……），`ROLE_KEYWORDS` 的字典顺序就会把这次调用判给错误的
+        角色，于是 mock 跑出一条没人看得懂的结果。BaseAgent 每次调用前已经写过
+        `agent_local.agent`（原本只给 token 归因用），这里复用它当权威口径。
+        """
+        tagged = getattr(self.agent_local, "agent", None)
+        if tagged:
+            return tagged
         lowered = system.lower()
         for name, keywords in self.ROLE_KEYWORDS.items():
             if any(k in system or k in lowered for k in keywords):

@@ -87,6 +87,10 @@ class RunContext:
     task_list: dict[str, Any] | None = None
     constraints: dict[str, Any] | None = None  # v1.2：用户约束（一等公民，注入下游全部 Agent）
     pack: Any = None  # 场景包（ScenarioPack）：登录审计等领域规则包（工作规划 §6.2）
+    skills: Any = None  # 已装载的方法（SkillSet）：谁被注入、谁被拒装
+    mcp: Any = None  # 外部工具门面（McpHub）：None = 本次一个外部 server 都没接
+    mcp_approvals: dict[str, bool] = field(default_factory=dict)  # 人在环批准结果（write/network 必需）
+    external_evidence: list[dict[str, Any]] = field(default_factory=list)  # 外部证据（只作证据，不进数字来源）
     clarify: dict[str, Any] | None = None  # v1.2：非阻塞澄清请求
     join_preflight: dict[str, Any] = field(default_factory=dict)  # M2-3：派发前 join 预检留痕
     replan_used: int = 0  # v1.2：重规划预算（每 run ≤ max_replan_rounds）

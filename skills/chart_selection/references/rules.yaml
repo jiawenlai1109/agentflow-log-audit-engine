@@ -1,0 +1,28 @@
+# 选图规则表（L3 明细）：由 `agents/visualizer.py` 的选择器**确定性消费**，不是给模型看的说明文。
+#
+# 三条硬约束：
+# 1. 顺序即优先级，命中第一条即决定，后面的不再看；
+# 2. `when` 里只准用选择器认识的那几个键——写了不认识的键会直接抛错，
+#    因为"静默跳过的规则"等于一条没在守门的规则；
+# 3. 末尾必须留一条 `when: {}` 的兜底规则。没有兜底就允许"什么都不选"，
+#    而"什么都不选"和"没有这份规则表"是两件事，前者是判断，后者是缺配置。
+version: 1.0.0
+rules:
+  - id: user_prefers_bar
+    when: {constraint_contains: [柱状, 柱形, bar]}
+    then: {chart_type: bar}
+  - id: user_prefers_line
+    when: {constraint_contains: [折线, line, 走势图]}
+    then: {chart_type: line}
+  - id: user_prefers_pie
+    when: {constraint_contains: [饼图, pie]}
+    then: {chart_type: pie}
+  - id: planner_stated_intent
+    when: {task_chart_type_present: true}
+    then: {chart_type: from_task}
+  - id: time_series_is_line
+    when: {required_has_date_column: true}
+    then: {chart_type: line}
+  - id: single_metric_default
+    when: {}
+    then: {chart_type: bar}

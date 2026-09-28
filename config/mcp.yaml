@@ -1,0 +1,46 @@
+# MCP server 白名单与能力分级（M4-C 骨架）
+#
+# 这个文件不存在 = 一个外部 server 都不接（`core/mcp.py` 返回 None）。
+# 三件事在这里定，不在代码里定：接哪些 server、每个工具有多危险、谁可以调。
+#
+# 为什么 SQL 写在配置里而不是让模型现编：外部数据源一旦由模型给查询语句，
+# "白名单只管工具名、不管工具里干了什么"这条裂缝就打开了——本项目要的是判定权不下放。
+
+servers:
+  - name: soc_intel
+    # {python} 由客户端替换成当前解释器路径（跨机可用；写死绝对路径等于把配置绑在这台机器上）
+    command: ["{python}", "-m", "agentflow.mcp_servers.sqlite_server", "--db", "demo/data/soc_intel.sqlite"]
+    timeout_seconds: 20
+    allowed_agents: [explorer]        # 只有探查角色能调它（服务端第二道，与 agents.yaml 白名单互为交叉）
+    tools:
+      - name: query
+        tier: read
+        evidence_only: true           # I1：外部结果只作证据，不进数字来源池
+        description: 只读查询威胁情报库（单条 SELECT/WITH，外层强制 LIMIT）
+      - name: list_tables
+        tier: read
+        evidence_only: true
+        description: 列出库表与行数
+      - name: write_note
+        tier: write
+        evidence_only: false
+        description: 写入一条备注（骨架里用来验人在环闸门：无批准即拒，且**不会发出**）
+
+# 确定性消费点：跑 sigma_triage 时，由 explorer 按这条固定查询取一批外部证据进 artifacts/。
+# 报告不引用它——引用了就会被数字追溯率判红，这条正是本题要守的东西。
+evidence_pulls:
+  - server: soc_intel
+    agent: explorer
+    tool: query
+    label: 外部威胁情报（osint-demo 路）
+    when_pack: sigma_triage
+    arguments:
+      sql: "SELECT host, score FROM intel WHERE source = 'osint-demo' ORDER BY host"
+      limit: 50
+
+limits:
+  max_calls: 5        # 外部调用预算，与 LLM 预算分列：两条都得有上界
+
+# 人在环批准的落点。骨架阶段它是运维在本文件里签的字（或 Web 请求带进来的 approvals），
+# 关键是：**模型改不了它**。write/network 没有这里的 true 就调不动。
+approvals: {}
