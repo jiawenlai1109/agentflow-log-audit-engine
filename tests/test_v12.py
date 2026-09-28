@@ -298,3 +298,64 @@ def test_parse_window_days():
     assert parse_window_days("最近7天每日销售额走势") == 7
     assert parse_window_days("近30天") == 30
     assert parse_window_days("总销售额是多少") is None
+
+
+# ---------------------------------------------------------------- 路径形态归一（偶发降级的根因）
+
+EXTENDED = "\\\\?\\"   # Windows 扩展长度路径前缀：\\?\
+
+
+def test_key_normalizes_forms_but_resolve_keeps_the_capable_one():
+    r"""比较走 `_key`（归一形态），放行/读写走 `_resolve`（保留真值）。
+
+    超过 260 字符的路径确实要靠 `\\?\` 前缀才能打开，所以归一只能发生在比较侧。
+    """
+    from agentflow.core.tools import _key, _resolve
+
+    prefixed = EXTENDED + "D:\\a\\work\\2"
+    plain = "D:\\a\\work\\2"
+    assert _key(prefixed) == _key(plain)
+    assert str(_resolve(prefixed)).startswith(EXTENDED), "真值形态不能被弄坏"
+
+
+def test_same_and_within_are_form_insensitive(tmp_path):
+    from agentflow.core.tools import _same, _within
+
+    own = tmp_path / "work" / "2"
+    own.mkdir(parents=True)
+    assert _same(own, tmp_path / "work" / "2")
+    assert _within(tmp_path / "work", own)
+    # 兄弟任务目录仍然不算在内
+    assert not _within(own, tmp_path / "work" / "1")
+
+
+def test_own_work_dir_passes_even_if_only_one_side_has_prefix(tmp_path, monkeypatch):
+    r"""把"只有一侧带扩展前缀"这个真实形状固化成用例：守卫不得因此判越界。
+
+    现场证据：outputs/eval_20260928_134306_mock/E04 的 transcript 里
+    自有=`\\?\D:\...work\2` 而 实际=`D:\...work\2`，同一个目录两种形态。
+    """
+    from agentflow.core import tools
+
+    run_root = tmp_path / "run_x"
+    (run_root / "work" / "2").mkdir(parents=True)
+    ctx = SimpleNamespace(
+        outputs_dir=run_root,
+        bundle=None,
+        data_path=str(tmp_path / "d.csv"),
+        readable_paths=set(),
+    )
+    real_resolve = tools._resolve
+
+    def one_sided(path):
+        resolved = real_resolve(path)
+        text = str(resolved)
+        # 模拟 Windows 的偶发：只有"已存在的那一条路"返回扩展长度形态（且不重复加前缀）
+        if resolved.exists() and not text.startswith(EXTENDED):
+            return Path(EXTENDED + text)
+        return resolved
+
+    monkeypatch.setattr(tools, "_resolve", one_sided)
+    assert tools.ensure_authorized(ctx, run_root / "work" / "2", task_id=2, grants=[])
+    with pytest.raises(tools.PathViolationError):
+        tools.ensure_authorized(ctx, run_root / "work" / "1", task_id=2, grants=[])

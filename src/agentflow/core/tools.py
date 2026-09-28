@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,12 +27,47 @@ class TableViolationError(PathViolationError):
     """
 
 
+_WIN_EXTENDED = re.compile(r"^\\\\[\?\\]\\")
+
+
+def _resolve(path: str | Path) -> Path:
+    """解析路径（真值，用于放行/读写）。**不做形态归一**——
+    超过 260 字符的路径确实需要 `\\?\` 前缀才能打开，剥掉会把真能力弄坏。
+    比较一律走 `_key()`。
+    """
+    return Path(path).resolve()
+
+
+def _key(path: str | Path) -> str:
+    """比较用的规范形态：解析 + 去掉 Windows 扩展长度前缀 + 大小写归一。
+
+    Windows 上 `Path.resolve()` 会偶发返回 `\\?\D:\...`（走 `GetFinalPathNameByHandle`），
+    而另一条兜底路径返回 `D:\...`。同一个目录于是有两种字符串形态，直接比 `==`
+    就会把"自己的 work 目录"判成"别人的"——这正是 2026-09-28 两次偶发降级的根因
+    （证据：`outputs/eval_20260928_134306_mock/E04` 的 transcript 里
+    自有=`\\?\D:\...work\2` 而 实际=`D:\...work\2`）。命中与否取决于线程交错与目录
+    是否已存在，所以它只在并发下偶发。
+    """
+    return _WIN_EXTENDED.sub("", str(_resolve(path)), count=1).casefold()
+
+
+def _same(left: Path | str, right: Path | str) -> bool:
+    return _key(left) == _key(right)
+
+
+def _within(root: Path, target: Path) -> bool:
+    """target 是否等于或位于 root 之内（两侧同形态、同大小写口径后再比）。"""
+    base = _key(root).rstrip("\\/")
+    child = _key(target)
+    return child == base or child.startswith((base + "\\", base + "/"))
+
+
 def ensure_within(root: Path, path: str | Path) -> Path:
     """校验 path 位于 root 之内（解析后），拒绝 .. 与越界绝对路径。"""
-    root = Path(root).resolve()
+    root = _resolve(root)
     raw = Path(path)
-    target = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
-    if target != root and root not in target.parents:
+    target = _resolve(raw) if raw.is_absolute() else _resolve(root / raw)
+    if not _within(root, target):
         raise PathViolationError(f"路径越界：{path} 不在 {root} 内")
     return target
 
@@ -42,16 +78,16 @@ def ensure_allowed(ctx: Any, path: str | Path) -> Path:
     Bundle 缺失时退回单 data_path 语义——那是非 RunContext 调用方（如上传校验）
     仍在用的窄接口，不是向后兼容补丁。
     """
-    root = Path(ctx.outputs_dir).resolve()
+    root = _resolve(ctx.outputs_dir)
     raw = Path(path)
-    target = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
-    if target == root or root in target.parents:
+    target = _resolve(raw) if raw.is_absolute() else _resolve(root / raw)
+    if _within(root, target):
         return target
     allowed = getattr(ctx, "readable_paths", None)
     if allowed:
-        if target in set(allowed):
+        if any(_same(target, candidate) for candidate in allowed):
             return target
-    elif ctx.data_path and target == Path(ctx.data_path).resolve():
+    elif ctx.data_path and _same(target, Path(ctx.data_path)):
         return target
     raise PathViolationError(f"路径越界：{path} 不在授权范围内")
 
@@ -75,30 +111,35 @@ def ensure_authorized(
     target = ensure_allowed(ctx, path)
     if dataset_refs:
         _ensure_table_granted(ctx, target, dataset_refs, path)
-    run_root = Path(ctx.outputs_dir).resolve()
+    run_root = _resolve(ctx.outputs_dir)
     work_root = run_root / "work"
     art_root = run_root / "artifacts"
 
-    if target == work_root or work_root in target.parents:
+    if _within(work_root, target):
         if task_id is None:
             return target
-        own = (work_root / str(task_id)).resolve()
-        if target != own and own not in target.parents:
+        own = _resolve(work_root / str(task_id))
+        if not _same(target, own) and not _within(own, target):
             raise PathViolationError(
                 f"路径越界：{path} 位于其他任务的 work 目录（work 目录任务私有）"
                 f"[task_id={task_id!r} 自有={own} 实际={target} 线程={threading.current_thread().name}]"
             )
         return target
 
-    if target == art_root or art_root in target.parents:
+    if _within(art_root, target):
         if task_id is None:
             return target
         owner = _artifact_owner(target)
-        if owner is not None and owner != int(task_id) and str(target) not in (grants or []):
+        if owner is not None and owner != int(task_id) and not _granted(target, grants):
             raise PathViolationError(
                 f"路径越界：{path} 属于任务 {owner} 的产物，未在授权清单（grants）内——依赖边即授权边"
             )
     return target
+
+
+def _granted(target: Path, grants: list[str] | None) -> bool:
+    """grants 里存的是别的任务写下的产物路径：同样要先归一形态再比。"""
+    return any(_same(target, Path(entry)) for entry in grants or [] if entry)
 
 
 def _ensure_table_granted(
@@ -113,14 +154,14 @@ def _ensure_table_granted(
     tables = list(getattr(bundle, "tables", []) or [])
     if not tables:
         return
-    denied: set[Path] = set()
+    denied: set[str] = set()
     for table in tables:
         if str(table.id) in {str(ref) for ref in dataset_refs}:
             continue
-        denied.add(Path(table.path).resolve())
+        denied.add(_key(table.path))
         if table.source_path:
-            denied.add(Path(table.source_path).resolve())
-    if target in denied:
+            denied.add(_key(table.source_path))
+    if _key(target) in denied:
         raise TableViolationError(
             f"表级越权：任务声明的 dataset_refs={list(dataset_refs)} 不包含该表，"
             f"却试图读 {raw}（未声明的表既不进 prompt 也不进 env，路径本身也不放行）"
