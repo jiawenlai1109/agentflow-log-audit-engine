@@ -1,4 +1,4 @@
-"""分析任务：提交、状态查询、SSE 进度流。"""
+"""分析任务：提交、状态查询、SSE 进度流（全部按用户归属收口）。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import OUTPUTS_ROOT
 from app.db import execute, query_one
+from app.deps import get_current_user
 from app.jobs import JobManager
 from app.schemas import AnalyzeRequest, JobOut
 from agentflow.pipeline import run_analysis
@@ -21,13 +22,30 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 manager = JobManager(max_workers=2)
 
 PHASE_PROGRESS = {"explore": 10, "plan": 20, "execute": 60, "report": 85, "review": 95}
+_JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question"
 
 
-def submit_analysis(question: str, dataset_path: str, mode: str, session_id: str | None) -> str:
+def _owned_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
+    """归属过滤写进 SQL 本身，不靠调用方先查再比——将来谁删了比对，这条语句仍然拦得住。
+
+    不区分"不存在"与"别人的"，一律 404，避免 job_id 枚举。
+    """
+    job = query_one(
+        f"SELECT {_JOB_FIELDS} FROM jobs WHERE job_id = ? AND user_id = ?",
+        (job_id, user["id"]),
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return job
+
+
+def submit_analysis(
+    question: str, dataset_path: str, mode: str, session_id: str | None, user_id: int
+) -> str:
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     execute(
-        "INSERT INTO jobs (job_id, question, mode, session_id, status) VALUES (?, ?, ?, ?, 'pending')",
-        (job_id, question, mode, session_id),
+        "INSERT INTO jobs (job_id, user_id, question, mode, session_id, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+        (job_id, user_id, question, mode, session_id),
     )
 
     def worker() -> None:
@@ -36,19 +54,26 @@ def submit_analysis(question: str, dataset_path: str, mode: str, session_id: str
             if event.get("type") == "phase":
                 progress = PHASE_PROGRESS.get(event.get("phase"), 50)
                 execute(
-                    "UPDATE jobs SET status='running', progress=? WHERE job_id=?",
-                    (progress, job_id),
+                    "UPDATE jobs SET status='running', progress=? WHERE job_id=? AND user_id=?",
+                    (progress, job_id, user_id),
                 )
             if event.get("type") == "done":
                 execute(
-                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 WHERE job_id=?",
-                    (event.get("status"), event.get("run_id"), datetime.now().isoformat(), job_id),
+                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 "
+                    "WHERE job_id=? AND user_id=?",
+                    (
+                        event.get("status"),
+                        event.get("run_id"),
+                        datetime.now().isoformat(),
+                        job_id,
+                        user_id,
+                    ),
                 )
 
         try:
             result = run_analysis(
                 question=question,
-                data_path=dataset_path,
+                sources=dataset_path,
                 mode=mode,
                 outputs_root=OUTPUTS_ROOT,
                 session_id=session_id,
@@ -56,13 +81,21 @@ def submit_analysis(question: str, dataset_path: str, mode: str, session_id: str
             )
             if result.get("status") != "success":
                 execute(
-                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 WHERE job_id=?",
-                    (result.get("status"), result.get("run_id"), datetime.now().isoformat(), job_id),
+                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 "
+                    "WHERE job_id=? AND user_id=?",
+                    (
+                        result.get("status"),
+                        result.get("run_id"),
+                        datetime.now().isoformat(),
+                        job_id,
+                        user_id,
+                    ),
                 )
         except Exception as exc:  # noqa: BLE001
             execute(
-                "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE job_id=?",
-                (str(exc)[:500], datetime.now().isoformat(), job_id),
+                "UPDATE jobs SET status='failed', error=?, finished_at=? "
+                "WHERE job_id=? AND user_id=?",
+                (str(exc)[:500], datetime.now().isoformat(), job_id, user_id),
             )
             manager.publish(job_id, {"type": "error", "error": str(exc)[:500]})
 
@@ -71,28 +104,32 @@ def submit_analysis(question: str, dataset_path: str, mode: str, session_id: str
 
 
 @router.post("/analyze", response_model=JobOut)
-def analyze(payload: AnalyzeRequest) -> dict:
-    dataset = query_one("SELECT * FROM datasets WHERE id = ?", (payload.dataset_id,))
+def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> dict:
+    dataset = query_one(
+        "SELECT * FROM datasets WHERE id = ? AND user_id = ?", (payload.dataset_id, user["id"])
+    )
     if not dataset:
         raise HTTPException(status_code=404, detail="数据集不存在")
-    if payload.session_id:
-        session = query_one("SELECT * FROM sessions WHERE session_id = ?", (payload.session_id,))
-        if not session:
-            raise HTTPException(status_code=404, detail="会话不存在")
-    job_id = submit_analysis(payload.question, dataset["path"], payload.mode, payload.session_id)
-    return query_one("SELECT job_id, status, progress, run_id, error, question FROM jobs WHERE job_id = ?", (job_id,))
+    if payload.session_id and not query_one(
+        "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+        (payload.session_id, user["id"]),
+    ):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    job_id = submit_analysis(
+        payload.question, dataset["path"], payload.mode, payload.session_id, user["id"]
+    )
+    return _owned_job(job_id, user)
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
-def get_job(job_id: str) -> dict:
-    job = query_one("SELECT job_id, status, progress, run_id, error, question FROM jobs WHERE job_id = ?", (job_id,))
-    if not job:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return job
+def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
+    return _owned_job(job_id, user)
 
 
 @router.get("/jobs/{job_id}/events")
-async def job_events(job_id: str) -> StreamingResponse:
+async def job_events(job_id: str, user: dict = Depends(get_current_user)) -> StreamingResponse:
+    _owned_job(job_id, user)
+
     async def event_stream():
         index = 0
         while True:

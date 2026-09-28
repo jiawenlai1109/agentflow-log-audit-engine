@@ -24,6 +24,18 @@ class SessionCreateRequest(BaseModel):
     dataset_id: int | None = None
 
 
+class MessageCreateRequest(BaseModel):
+    """会话续轮请求。
+
+    mode 必须与 AnalyzeRequest 一样收紧成白名单：pipeline 用
+    `MockLLM() if mode == "mock" else OpenAILLM(...)` 选客户端，
+    任何未校验的字符串都会落到真实（计费）分支上。
+    """
+
+    question: str = Field(min_length=1)
+    mode: str = Field(default="mock", pattern="^(mock|real)$")
+
+
 class JobOut(BaseModel):
     job_id: str
     status: str
@@ -42,10 +54,11 @@ class DatasetOut(BaseModel):
 
 
 class SessionOut(BaseModel):
+    """会话对客户端只暴露标识与标题；dataset_path 是服务器绝对路径，不外泄。"""
+
     session_id: str
     title: str | None
     turn_count: int
-    dataset_path: str | None
 
 
 class MessageOut(BaseModel):

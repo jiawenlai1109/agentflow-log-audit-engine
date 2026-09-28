@@ -38,13 +38,43 @@ def test_whitelist_denies_unauthorized_tool(tmp_path):
 
 
 def test_whitelist_allows_authorized_tool(tmp_path):
+    from agentflow.core.ingest import build_bundle
+
     data = tmp_path / "d.csv"
     data.write_text("a,销售额\n1,2\n2,3\n", encoding="utf-8")
-    ctx = _Ctx(tmp_path)
-    ctx.data_path = str(data)
+    bundle = build_bundle([data], tmp_path / "bd")
+    outputs_dir = tmp_path / "run"  # Bundle 在 outputs_dir 之外：只能靠 readable_paths 放行
+    ctx = SimpleNamespace(
+        outputs_dir=outputs_dir,
+        data_path=bundle.primary.path,
+        bundle=bundle,
+        readable_paths=bundle.readable_paths(),
+        transcript=None,
+    )
     registry = build_default_registry()
-    profile = registry.call("explorer", "profile_csv", ctx, data_path=str(data))
+    profile = registry.call("explorer", "profile_bundle", ctx)
     assert profile["row_count"] == 2
+    assert profile["tables"][0]["id"] == "t1"
+
+
+def test_bundle_outside_run_dir_is_allowed_but_strangers_are_not(tmp_path):
+    from agentflow.core.ingest import build_bundle
+
+    data = tmp_path / "d.csv"
+    data.write_text("a\n1\n", encoding="utf-8")
+    bundle = build_bundle([data], tmp_path / "bd")
+    stranger = tmp_path / "other.csv"
+    stranger.write_text("a\n1\n", encoding="utf-8")
+    ctx = SimpleNamespace(
+        outputs_dir=tmp_path / "run",
+        data_path=bundle.primary.path,
+        bundle=bundle,
+        readable_paths=bundle.readable_paths(),
+        transcript=None,
+    )
+    ensure_authorized(ctx, bundle.primary.path)
+    with pytest.raises(PathViolationError):
+        ensure_authorized(ctx, str(stranger))
 
 
 # ---------------------------------------------------------------- grants（依赖边=授权边）

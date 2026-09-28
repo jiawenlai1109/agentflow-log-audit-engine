@@ -1,4 +1,4 @@
-"""会话与轮次管理（复用 SessionStore）。"""
+"""会话与轮次管理（复用 SessionStore，按用户归属收口）。"""
 
 from __future__ import annotations
 
@@ -6,40 +6,63 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.config import OUTPUTS_ROOT, SESSIONS_ROOT
+from app.config import SESSIONS_ROOT
 from app.db import execute, query, query_one
+from app.deps import get_current_user
 from app.routers.jobs import submit_analysis
-from app.schemas import JobOut, MessageOut, SessionCreateRequest, SessionOut
+from app.schemas import (
+    JobOut,
+    MessageCreateRequest,
+    MessageOut,
+    SessionCreateRequest,
+    SessionOut,
+)
 from agentflow.core.context import SessionContext
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
+def _owned_session(session_id: str, user: dict) -> dict:
+    """不区分"不存在"与"别人的"，一律 404。"""
+    row = query_one(
+        "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
+        (session_id, user["id"]),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return row
+
+
 @router.post("", response_model=SessionOut)
-def create_session(payload: SessionCreateRequest) -> dict:
+def create_session(payload: SessionCreateRequest, user: dict = Depends(get_current_user)) -> dict:
     session_id = f"session_{uuid.uuid4().hex[:10]}"
     dataset_path = None
     if payload.dataset_id:
-        dataset = query_one("SELECT * FROM datasets WHERE id = ?", (payload.dataset_id,))
-        if dataset:
-            dataset_path = dataset["path"]
+        dataset = query_one(
+            "SELECT * FROM datasets WHERE id = ? AND user_id = ?",
+            (payload.dataset_id, user["id"]),
+        )
+        if not dataset:
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        dataset_path = dataset["path"]
     execute(
-        "INSERT INTO sessions (session_id, title, dataset_path) VALUES (?, ?, ?)",
-        (session_id, payload.title, dataset_path),
+        "INSERT INTO sessions (session_id, user_id, title, dataset_path) VALUES (?, ?, ?, ?)",
+        (session_id, user["id"], payload.title, dataset_path),
     )
     return {
         "session_id": session_id,
         "title": payload.title,
         "turn_count": 0,
-        "dataset_path": dataset_path,
     }
 
 
 @router.get("", response_model=list[SessionOut])
-def list_sessions() -> list[dict]:
-    rows = query("SELECT * FROM sessions ORDER BY id DESC")
+def list_sessions(user: dict = Depends(get_current_user)) -> list[dict]:
+    rows = query(
+        "SELECT * FROM sessions WHERE user_id = ? ORDER BY id DESC", (user["id"],)
+    )
     result = []
     for row in rows:
         session = SessionContext(row["session_id"], SESSIONS_ROOT / row["session_id"])
@@ -48,16 +71,16 @@ def list_sessions() -> list[dict]:
                 "session_id": row["session_id"],
                 "title": row["title"],
                 "turn_count": len(session.read_turns()),
-                "dataset_path": row["dataset_path"],
             }
         )
     return result
 
 
 @router.get("/{session_id}/messages", response_model=list[MessageOut])
-def session_messages(session_id: str) -> list[dict]:
-    if not query_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,)):
-        raise HTTPException(status_code=404, detail="会话不存在")
+def session_messages(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> list[dict]:
+    _owned_session(session_id, user)
     session = SessionContext(session_id, SESSIONS_ROOT / session_id)
     return [
         {
@@ -72,27 +95,33 @@ def session_messages(session_id: str) -> list[dict]:
 
 
 @router.post("/{session_id}/messages", response_model=JobOut)
-def post_message(session_id: str, payload: dict) -> dict:
-    session = query_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
-    if not session:
-        raise HTTPException(status_code=404, detail="会话不存在")
-    question = str(payload.get("question", "")).strip()
-    mode = str(payload.get("mode", "mock"))
+def post_message(
+    session_id: str, payload: MessageCreateRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    session = _owned_session(session_id, user)
+    question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
     dataset_path = session["dataset_path"]
     if not dataset_path or not Path(dataset_path).exists():
         raise HTTPException(status_code=400, detail="会话未绑定数据集或数据集已删除")
-    job_id = submit_analysis(question, dataset_path, mode, session_id)
-    execute("UPDATE sessions SET updated_at = datetime('now','localtime') WHERE session_id = ?", (session_id,))
-    return query_one("SELECT job_id, status, progress, run_id, error, question FROM jobs WHERE job_id = ?", (job_id,))
+    job_id = submit_analysis(question, dataset_path, payload.mode, session_id, user["id"])
+    execute(
+        "UPDATE sessions SET updated_at = datetime('now','localtime') "
+        "WHERE session_id = ? AND user_id = ?",
+        (session_id, user["id"]),
+    )
+    return query_one(
+        "SELECT job_id, status, progress, run_id, error, question FROM jobs "
+        "WHERE job_id = ? AND user_id = ?",
+        (job_id, user["id"]),
+    )
 
 
 @router.delete("/{session_id}")
-def delete_session(session_id: str) -> dict:
-    if not query_one("SELECT * FROM sessions WHERE session_id = ?", (session_id,)):
-        raise HTTPException(status_code=404, detail="会话不存在")
-    execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+def delete_session(session_id: str, user: dict = Depends(get_current_user)) -> dict:
+    _owned_session(session_id, user)
+    execute("DELETE FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user["id"]))
     session_dir = SESSIONS_ROOT / session_id
     if session_dir.exists():
         shutil.rmtree(session_dir)

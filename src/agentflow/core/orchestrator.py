@@ -47,7 +47,7 @@ class Orchestrator:
     def run(
         self,
         question: str,
-        data_path: str,
+        bundle: Any,
         outputs_root: str | Path,
         session: Any = None,
         max_review_rounds: int | None = None,
@@ -63,7 +63,7 @@ class Orchestrator:
         ctx = RunContext(
             run_id=run_id,
             question=question,
-            data_path=str(Path(data_path).resolve()),
+            bundle=bundle,
             outputs_dir=outputs_dir,
             config=self.config,
             session=session,
@@ -128,6 +128,8 @@ class Orchestrator:
             "status": status,
             "report": ctx.report,
             "task_states": ctx.task_states,
+            # 回传实际读到的输入快照：CLI/Web 要能回答"这次跑的是哪几份文件、它们的 sha256"
+            "bundle": ctx.bundle,
         }
 
     # ------------------------------------------------------------ 阶段
@@ -576,6 +578,8 @@ class Orchestrator:
             "degraded_reason": ctx.degraded_reason,
             "chart_success": chart_success if chart_attempted else None,
             "critic_pass": ctx.critic_passed,
+            # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
+            "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
             "results": {str(k): v for k, v in ctx.results.items()},
         }
         (ctx.outputs_dir / "evaluation.json").write_text(

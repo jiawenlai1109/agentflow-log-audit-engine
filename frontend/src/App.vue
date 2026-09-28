@@ -23,12 +23,26 @@
 </template>
 
 <script setup lang="ts">
+import { onBeforeUnmount, onMounted } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import { ElMessage } from "element-plus";
+import { UNAUTHORIZED_EVENT } from "./api/client";
 import { useAuthStore } from "./stores/auth";
 
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
+
+// 服务端判 401（token 过期/被吊销）时统一收口：本地清干净再跳登录页
+function onUnauthorized() {
+  if (!auth.token) return;
+  auth.logout();
+  ElMessage.warning("登录已过期，请重新登录");
+  if (route.path !== "/login") router.push("/login");
+}
+
+onMounted(() => window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized));
+onBeforeUnmount(() => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized));
 </script>
 
 <style>

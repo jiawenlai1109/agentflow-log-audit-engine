@@ -1,18 +1,25 @@
-"""后端配置：路径、鉴权开关、限制。"""
+"""后端配置：路径与限制。鉴权参数见 app/security.py。"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from agentflow.core.config import load_dotenv
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# 必须在 security.py 读环境变量之前完成：直接 `python -m uvicorn app.main:app` 启动时
+# 没人加载 .env，APP_SECRET 会静默退化成每次启动随机（重启即踢掉所有已登录会话）。
+load_dotenv(PROJECT_ROOT / ".env")
+
 OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 APP_DATA_DIR = PROJECT_ROOT / ".appdata"
 DB_PATH = APP_DATA_DIR / "app.db"
 DATASETS_DIR = APP_DATA_DIR / "datasets"
 SESSIONS_ROOT = OUTPUTS_ROOT / "sessions"
 
-# 本地单机默认关闭强制鉴权（接口仍发 Token，便于多用户时开启）
-AUTH_ENABLED = False
-SECRET = "dev-secret-change-me"
 MAX_UPLOAD_MB = 50
 ALLOWED_EXTENSIONS = {".csv"}
+
+# 产物目录只回图片：报告与 evaluation.json 一律走带归属校验的 API
+MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}

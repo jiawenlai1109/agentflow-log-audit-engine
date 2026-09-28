@@ -111,6 +111,22 @@ def test_verify_findings_empty_pass():
 # ------------------------------------------------------------ 端到端（mock）
 
 
+def _why(result) -> str:
+    """失败时把降级原因与逐任务错误一起打出来——只 assert status 的测试会让人去猜。"""
+    evaluation = Path(result["outputs_dir"], "evaluation.json")
+    if not evaluation.exists():
+        return f"status={result['status']}；无 evaluation.json"
+    data = json.loads(evaluation.read_text(encoding="utf-8"))
+    tasks = {
+        tid: (row.get("error_class"), (row.get("error") or "")[:160])
+        for tid, row in (data.get("results") or {}).items()
+    }
+    return (
+        f"status={data.get('status')} reason={data.get('degraded_reason')} "
+        f"duration={data.get('duration_seconds')}s llm={data.get('llm_calls')} tasks={tasks}"
+    )
+
+
 def test_e2e_attack_audit(tmp_path):
     result = run_analysis(
         "对2026-09-05的登录日志做安全审计",
@@ -118,7 +134,7 @@ def test_e2e_attack_audit(tmp_path):
         outputs_root=tmp_path,
         pack="login_audit",
     )
-    assert result["status"] == "success"
+    assert result["status"] == "success", _why(result)
     report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
     for section in ("发现清单", "处置建议", "研判摘要", "审计说明"):
         assert section in report

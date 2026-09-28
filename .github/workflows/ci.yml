@@ -1,0 +1,62 @@
+name: CI
+
+# 门禁两件事：单元/集成/API/鉴权回归 + 冻结评测集（mock）。
+# 只跑 mock：确定性、离线、不花 token，所以每次 push 都全量跑。
+# real 模式留给夜间批（见 evals/suite.yaml 的 real 块与 run_eval --mode real）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: golden 自检（评测集与数据是否漂移）
+        run: python scripts/run_eval.py --check-golden
+
+      - name: 测试回归（单元 / 机制 / 端到端 / API / 鉴权与隔离）
+        run: python -m pytest -q
+
+      - name: 冻结评测集门禁（mock 全量，破了阻塞合并）
+        run: python scripts/run_eval.py --json eval_results.json
+
+      - name: 保留评测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            eval_results.json
+            outputs/eval_*_mock/*/run_config.json
+          if-no-files-found: warn
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 构建（语法与打包门禁）
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build

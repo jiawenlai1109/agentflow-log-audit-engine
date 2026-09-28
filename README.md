@@ -31,10 +31,14 @@ python -m venv .venv
 # 3c. 真实 LLM 模式（先配置 .env：OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）
 .\.venv\Scripts\python.exe scripts\run_analysis.py --data demo\data\login_auth.csv --question "对今天的登录日志做安全审计" --mode real --pack login_audit
 
-# 4. 运行测试（66 个用例）与批量评估
+# 4. 运行测试（161 个用例）与批量评估
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe scripts\run_batch.py --suite pack --mode mock   # 场景包批次
 .\.venv\Scripts\python.exe scripts\evaluate.py                             # 聚合入评估记录.md
+
+# 5. 冻结评测集门禁（17 题 mock 全量，破了 exit 1）
+.\.venv\Scripts\python.exe scripts\run_eval.py                             # 与 evals\baseline.json 比对
+.\.venv\Scripts\python.exe scripts\run_eval.py --check-golden              # 只核对 golden 是否漂移
 ```
 
 产物在 `outputs/run_<id>/`：`report.md`（报告）、`transcript.jsonl`（全量过程审计）、`evaluation.json`（状态/校验/成本指标）、`plan.json`（任务规划）。
@@ -62,6 +66,25 @@ packs/login_audit/
 
 新增一个场景 = 写一个新包（规则 + 模板 + 约定），不新增 Agent、不改编排器。
 
+## 评估 harness
+
+自动化评估是这套运行时的一部分，不是事后补的报表：
+
+```text
+evals/suite.yaml        # 冻结评测集 17 题（评估方案 §7 的 15 题 + 空语义 + 一致性）
+evals/baseline.json     # 基线：逐题结论 + 聚合指标 + 指纹
+scripts/run_eval.py     # runner → 断言 → 基线比对 → exit code（CI 门禁）
+src/agentflow/core/grading.py  # 20 个确定性谓词 + 数字可追溯率 + 归因指纹
+tests/test_grading.py   # 给尺子本身写的 58 个用例
+.github/workflows/ci.yml # push/PR：golden 自检 → pytest → mock 评测集门禁
+```
+
+三条立场：① **grader 也守 producer ≠ verifier**——只读 `evaluation.json` / `report.md` / `transcript.jsonl` / `plan.json`，不读 LLM 自述；② **golden 独立重算**——suite 里的字面量与数据文件对不上时报"漂移"而非"系统失败"，两类红分开；③ **能力边界是记账不是宽容**——每题分 `gate`（破了就红）与 `gap`（已知做不到，红不阻塞，**变绿报 XPASS 逼重新分类**）。
+
+核心指标是**数字可追溯率**：报告里的每个数字都要能在证据里找到出处（当前 mock 全量均值 65.69%，缺口来自 Reporter 明细表把样例行原样打进报告，已记为 gap）。
+
+门禁有效性用**变异测试**验证（四条位点：空语义反转、谓词名拼错、拆掉评分器 IP 掩码均被抓住；改 `max_llm_calls` 漏过——顺藤挖出 `config/agents.yaml` 从未被加载的接线缺陷，详见工作日志 2026-09-28）。
+
 ## 验收用例
 
 | 用例 | 输入 | 预期 |
@@ -72,6 +95,9 @@ packs/login_audit/
 | 场景包 E2E | 登录日志（含植入攻击）+ `--pack login_audit` | success，4 规则命中且独立校验一致 |
 | 场景包空语义 | 登录日志（无攻击）+ `--pack login_audit` | success，"无发现" PASS |
 | 注入防线 | 日志 message 字段含提示词注入文本 | 检测结论不变，注入文本作为证据行留档 |
+| 鉴权 401 | 匿名请求 15 个受保护端点 | 全部 401（`/api/health`、`/api/auth/login` 除外） |
+| 归属隔离 | 用户 B 访问用户 A 的数据集 / 会话 / 任务 / 报告 | 全部 404，不泄露资源是否存在 |
+| 产物收口 | 同一图表 URL 去掉 `?t=`、或用 API token 冒充媒体 token 请求 | 均 401；`report.md` 经产物路由直读 404 |
 
 ## Web 前后端
 
@@ -81,6 +107,15 @@ cd frontend && npm install && npm run dev   # http://localhost:5173（默认账�
 ```
 
 登录 → 数据管理（上传 CSV）→ 分析工作台（提问 + SSE 实时 Agent 进度）→ 会话管理（多轮记忆）→ 历史与报告。设计详见[前后端设计方案.md](前后端设计方案.md)。
+
+**Web 层鉴权（2026-09-27 起强制）**：
+
+- 除 `/api/health` 与 `/api/auth/login` 外，全部接口要求 `Authorization: Bearer <token>`；token 为加签自包含串，含 `exp` 与 `scope`，默认 12 小时过期（`APP_TOKEN_TTL_SECONDS` 可调）。
+- 数据按 `user_id` 隔离：数据集 / 会话 / 任务 / 报告 / 历史列表都只看得见自己提交的资源；跨用户访问统一返回 404（不区分"不存在"与"别人的"，避免资源枚举）。
+- 口令存储为加盐 PBKDF2-HMAC-SHA256；种子账号口令可用 `ADMIN_PASSWORD` 覆盖（默认 `admin`，启动时会告警）。
+- 产物目录不再公开挂载：`/outputs/<run>/<file>` 只放行图片，且需报告接口签发的**只读媒体 token**（`?t=`，900 秒、绑定单个 run、scope 与 API token 互斥）；`report.md`、`evaluation.json` 只能经带归属校验的 API 读取。
+- 环境变量：`APP_SECRET`（签名密钥，未设置则每次启动随机、重启即令全部 token 失效）、`ADMIN_PASSWORD`、`APP_TOKEN_TTL_SECONDS`。
+- 已知代价：CLI 直跑产生的 run 与鉴权上线前的历史产物不出现在 Web 历史列表中（无 `jobs` 归属记录 = 默认拒绝）。
 
 ## 目录结构
 
@@ -92,20 +127,23 @@ src/agentflow/
 ├── schemas/    # pydantic 模型（对应《输出格式设计.md》）
 └── pipeline.py # 端到端组装 run_analysis（支持 pack 参数）
 packs/          # 场景包（领域规则包 + 报告模板 + 数据约定）
-scripts/        # CLI 入口、demo 数据生成（零售/登录日志）、批量跑测(run_batch)、评估聚合(evaluate)
+evals/          # 冻结评测集 suite.yaml（17 题）+ 基线 baseline.json
+scripts/        # CLI 入口、demo 数据生成（零售/登录日志）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
+.github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
 demo/data/      # 固定验收数据集
-tests/          # 66 个自动化测试（单元/机制/端到端/API 全流程）
+tests/          # 161 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/配置接线）
 outputs/        # 运行产物（不入 git）
 ```
 
 ## 文档地图
 
-[项目总览.md](项目总览.md) 是设计文档总入口（需求/交互/输出格式/恢复回滚/上下文记忆/子 Agent/安全隔离/评估/技术实现）。批次级数字与缺陷记录见[评估记录.md](评估记录.md)。
+[项目总览.md](项目总览.md) 是设计文档总入口（需求/交互/输出格式/恢复回滚/上下文记忆/子 Agent/安全隔离/评估/技术实现）。批次级数字与缺陷记录见[评估记录.md](评估记录.md)。**六项优化的总纲、里程碑依赖与逐任务进度见[优化总纲与进度清单.md](优化总纲与进度清单.md)。**
 
 ## 测试与质量
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q     # 66 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 161 passed
+.\.venv\Scripts\python.exe scripts\run_eval.py   # 17/17 pass，gate 断言 56 全绿
 ```
 
-测试基线演进：18 → 31 → 39 → 48 → 54 → 66；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md。
+测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。

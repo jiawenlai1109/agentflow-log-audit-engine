@@ -69,11 +69,15 @@ class SessionContext:
 
 @dataclass
 class RunContext:
-    """一次运行共享的黑板上下文（L2），对 Agent 只读；写入仅 Orchestrator。"""
+    """一次运行共享的黑板上下文（L2），对 Agent 只读；写入仅 Orchestrator。
+
+    输入的唯一真源是 `bundle`。`data_path` 是主表派生视图（= bundle.primary.path），
+    不再单独存一份——单文件本就只有一个成员的 Bundle，两份数据迟早会走样。
+    """
 
     run_id: str
     question: str
-    data_path: str
+    bundle: Any  # agentflow.core.bundle.Bundle
     outputs_dir: Path
     config: dict[str, Any]
     session: SessionContext | None = None
@@ -95,6 +99,16 @@ class RunContext:
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+
+    @property
+    def data_path(self) -> str:
+        """主表路径：兼容"单表运行"的全部既有语义（执行 env、独立校验、报告行数基准）。"""
+        return str(self.bundle.primary.path)
+
+    @property
+    def readable_paths(self) -> set[Path]:
+        """本次运行允许读取的文件集合（表 + 原件副本 + 文档）。"""
+        return self.bundle.readable_paths()
 
     @property
     def run_root(self) -> Path:

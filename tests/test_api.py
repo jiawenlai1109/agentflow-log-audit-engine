@@ -33,12 +33,20 @@ def _wait_job(client: TestClient, job_id: str, timeout: float = 60.0) -> dict:
     raise TimeoutError(f"job {job_id} 超时未完成")
 
 
+def _login(client: TestClient, username: str = "admin", password: str = "admin") -> str:
+    """登录并把 token 装进 client 默认头，返回 token（供媒体 URL 拼接用）。"""
+    login = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert login.status_code == 200, login.text
+    token = login.json()["token"]
+    client.headers["Authorization"] = f"Bearer {token}"
+    return token
+
+
 def test_full_flow(tmp_path):
     with TestClient(app) as client:
         # 登录
-        login = client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
-        assert login.status_code == 200
-        assert login.json()["token"]
+        token = _login(client)
+        assert token
 
         # 上传数据集
         with DATA.open("rb") as fh:
@@ -89,6 +97,7 @@ def test_full_flow(tmp_path):
 def test_mock_profit_top3_report_and_image_link():
     """利润Top3 问题：mock 报告含利润指标，图片链接转为 /outputs/ URL。"""
     with TestClient(app) as client:
+        _login(client)
         with DATA_PROFIT.open("rb") as fh:
             upload = client.post(
                 "/api/datasets", files={"file": ("retail_sales_with_profit.csv", fh, "text/csv")}

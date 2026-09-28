@@ -87,9 +87,10 @@ def main() -> int:
         try:
             result = run_analysis(
                 question=case["question"],
-                data_path=str(case["data"]),
+                sources=case["data"],
                 mode=args.mode,
                 outputs_root=outputs_root,
+                session_id=case.get("session"),
                 pack=case.get("pack"),
             )
             status = result["status"]

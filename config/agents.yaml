@@ -15,7 +15,7 @@ execution:
 
 agents:
   explorer:
-    tools: [profile_csv]
+    tools: [profile_bundle]
     temperature: 0.2
     max_tokens: 800
   planner:

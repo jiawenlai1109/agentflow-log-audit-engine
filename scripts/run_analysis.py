@@ -2,7 +2,8 @@
 
 用法示例：
   python scripts/run_analysis.py --data demo/data/retail_sales.csv --question "总销售额是多少？" --mode mock
-  python scripts/run_analysis.py --data demo/data/retail_sales.csv --question "最近7天销售额走势如何？" --mode real --session demo1
+  python scripts/run_analysis.py --data a.csv b.tsv alerts.json --question "生产域主机的异常登录有哪些？"
+  python scripts/run_analysis.py --bundle outputs/bundles/bd_xxxx --question "总销售额是多少？"
 """
 
 from __future__ import annotations
@@ -23,7 +24,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="基于多智能体协作的自动化数据分析引擎",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data", required=True, help="本地 CSV 数据文件路径")
+    parser.add_argument(
+        "--data",
+        nargs="+",
+        help="输入文件（可多个，异构）：csv/tsv/json/jsonl 归一化成表，txt/log/md 作证据文档",
+    )
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="已建好的 Bundle 目录（含 manifest.json）；与 --data 二选一",
+    )
     parser.add_argument("--question", required=True, help="中文业务问题，如：总销售额是多少？")
     parser.add_argument(
         "--mode",
@@ -34,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         default=None,
-        help="config/agents.yaml 路径（默认使用内置默认配置）",
+        help="配置文件路径（留空则用项目默认 config/agents.yaml）",
     )
     parser.add_argument(
         "--output",
@@ -59,18 +69,33 @@ def main() -> int:
     load_dotenv(project_root / ".env")
     args = build_parser().parse_args()
 
+    if bool(args.data) == bool(args.bundle):
+        print("--data 与 --bundle 必须二选一（给一组文件，或给一个已建好的 Bundle 目录）")
+        return 2
+
+    sources: object = args.data or args.bundle
+    if args.bundle:
+        from agentflow.core.bundle import Bundle
+
+        sources = Bundle.load(args.bundle)
+
     result = run_analysis(
         question=args.question,
-        data_path=args.data,
+        sources=sources,
         config_path=args.config,
         mode=args.mode,
         outputs_root=args.output,
         session_id=args.session,
         pack=args.pack,
     )
+    bundle = result.get("bundle")
     report = result.get("report") or {}
     print("=" * 48)
     print(f"run_id   : {result.get('run_id')}")
+    if bundle is not None:
+        print(f"输入     : {bundle.summary()}")
+        if bundle.skipped:
+            print(f"未入包   : {len(bundle.skipped)} 个文件（{bundle.skipped[0]['file']}：{bundle.skipped[0]['reason']}）")
     print(f"状态     : {result.get('status')}")
     print(f"输出目录 : {result.get('outputs_dir')}")
     if report.get("report_path"):

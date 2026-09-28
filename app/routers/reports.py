@@ -1,27 +1,84 @@
-"""运行历史、报告文本、评估聚合。"""
+"""运行历史、报告文本、评估聚合（按用户归属读，run_id 走格式白名单）。"""
 
 from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
+from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import OUTPUTS_ROOT
+from app.db import query
+from app.deps import ensure_run_access, get_current_user, guard_within
 from app.schemas import EvaluationSummary
+from app.security import MEDIA_TOKEN_TTL_SECONDS, SCOPE_MEDIA, make_token
 
 router = APIRouter(prefix="/api", tags=["reports"])
 
+RUN_ID_PATTERN = re.compile(r"^run_\d{8}_\d{6}_[0-9a-f]{8}$")
 
-def _normalize_report_links(run_id: str, content: str) -> str:
+
+def _valid_run_id(run_id: str) -> str:
+    """run_id 来自 URL，进文件路径前先按生成规则收紧，杜绝 `..` 与任意段。"""
+    if not RUN_ID_PATTERN.match(run_id):
+        raise HTTPException(status_code=404, detail="报告不存在")
+    return run_id
+
+
+def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
+    """归属来自 jobs 表（run 由谁提交），指标来自 evaluation.json（谁跑出了什么）。
+
+    鉴权上线前由 CLI 直跑产生的 run 没有 jobs 记录，因此不出现在列表里——默认拒绝。
+    """
+    rows = query(
+        "SELECT run_id, question, status, created_at FROM jobs "
+        "WHERE user_id = ? AND run_id IS NOT NULL ORDER BY id DESC",
+        (user["id"],),
+    )
+    runs: list[dict[str, Any]] = []
+    for row in rows:
+        run_id = str(row["run_id"])
+        if not RUN_ID_PATTERN.match(run_id):
+            continue
+        evaluation_file = OUTPUTS_ROOT / run_id / "evaluation.json"
+        try:
+            evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        runs.append(
+            {
+                "run_id": evaluation.get("run_id", run_id),
+                "status": evaluation.get("status"),
+                "question": evaluation.get("question") or row["question"],
+                "duration_seconds": evaluation.get("duration_seconds"),
+                "llm_calls": evaluation.get("llm_calls"),
+                "chart_success": evaluation.get("chart_success"),
+                "critic_pass": evaluation.get("critic_pass"),
+                "degraded_reason": evaluation.get("degraded_reason"),
+                "created_at": row.get("created_at"),
+                "report_path": str(evaluation_file.parent / "report.md"),
+            }
+        )
+    return runs
+
+
+def _normalize_report_links(
+    run_id: str, content: str, media_token: str = ""
+) -> str:
     """把报告内图片引用统一转为可访问的 /outputs/<run_id>/... URL。
 
     兼容两种写法：相对路径（./artifacts/...，新报告）与绝对本地路径（D:\\...\\outputs\\...，旧报告）。
+    media_token 非空时附到 URL 上——产物目录已不再公开，图片需要带只读媒体 token 才取到。
     """
+
+    def _signed(url: str) -> str:
+        # 两轮正则可能命中同一张图（先相对、再绝对路径），已签过的不再追加
+        return url if not media_token or "?t=" in url else f"{url}?t={media_token}"
+
     content = re.sub(
         r"!\[([^\]]*)\]\(\s*\.?/?((?:artifacts|work|sessions)/[^)]*)\)",
-        lambda m: f"![{m.group(1)}](/outputs/{run_id}/{m.group(2)})",
+        lambda m: f"![{m.group(1)}]({_signed(f'/outputs/{run_id}/{m.group(2)}')})",
         content,
     )
 
@@ -30,7 +87,7 @@ def _normalize_report_links(run_id: str, content: str) -> str:
         marker = "/outputs/"
         idx = raw.find(marker)
         if idx >= 0:
-            return f"![{match.group(1)}]({raw[idx:]})"
+            return f"![{match.group(1)}]({_signed(raw[idx:])})"
         return match.group(0)
 
     content = re.sub(
@@ -42,41 +99,29 @@ def _normalize_report_links(run_id: str, content: str) -> str:
 
 
 @router.get("/runs")
-def list_runs() -> list[dict]:
-    runs = []
-    for evaluation_file in sorted(OUTPUTS_ROOT.glob("run_*/evaluation.json")):
-        try:
-            evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        runs.append(
-            {
-                "run_id": evaluation.get("run_id"),
-                "status": evaluation.get("status"),
-                "question": evaluation.get("question"),
-                "duration_seconds": evaluation.get("duration_seconds"),
-                "llm_calls": evaluation.get("llm_calls"),
-                "chart_success": evaluation.get("chart_success"),
-                "critic_pass": evaluation.get("critic_pass"),
-                "degraded_reason": evaluation.get("degraded_reason"),
-                "report_path": str(evaluation_file.parent / "report.md"),
-            }
-        )
-    return list(reversed(runs))
+def list_runs(user: dict = Depends(get_current_user)) -> list[dict]:
+    return list(reversed(_user_runs(user)))
 
 
 @router.get("/reports/{run_id}")
-def get_report(run_id: str) -> dict:
-    report_path = OUTPUTS_ROOT / run_id / "report.md"
+def get_report(run_id: str, user: dict = Depends(get_current_user)) -> dict:
+    run_id = _valid_run_id(run_id)
+    ensure_run_access(run_id, user)
+    report_path = guard_within(OUTPUTS_ROOT / run_id, "report.md")
     if not report_path.exists():
         raise HTTPException(status_code=404, detail="报告不存在")
     content = report_path.read_text(encoding="utf-8")
-    return {"run_id": run_id, "content": _normalize_report_links(run_id, content)}
+    token = make_token(user["username"], scope=SCOPE_MEDIA, run_scope=run_id)
+    return {
+        "run_id": run_id,
+        "content": _normalize_report_links(run_id, content, token),
+        "media_expires_in": MEDIA_TOKEN_TTL_SECONDS,
+    }
 
 
 @router.get("/evaluations/summary", response_model=EvaluationSummary)
-def evaluation_summary() -> dict:
-    runs = list_runs()
+def evaluation_summary(user: dict = Depends(get_current_user)) -> dict:
+    runs = _user_runs(user)
     total = len(runs)
 
     def count(status: str) -> int:

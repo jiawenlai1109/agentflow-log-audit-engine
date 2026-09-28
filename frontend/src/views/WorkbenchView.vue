@@ -64,10 +64,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { ElMessage } from "element-plus";
 import { api } from "../api";
+import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
 
@@ -82,6 +83,9 @@ const running = ref(false);
 const events = ref<any[]>([]);
 const messages = ref<any[]>([]);
 
+// 切换视图或重复提交时取消上一条进度流，避免旧流回调写进新结果
+let streamController: AbortController | null = null;
+
 async function loadSessions() {
   const { data } = await api.listSessions();
   sessions.value = data;
@@ -91,13 +95,23 @@ async function loadHistory() {
   if (!session_id.value) return;
   const { data } = await api.sessionMessages(session_id.value);
   messages.value = data.map((m: any) => ({ question: m.question, run_id: m.run_id, answer_summary: m.answer_summary, report: "" }));
-  const jobIds: string[] = [];
   for (const m of data) {
     if (m.run_id) {
       const { data: report } = await api.getReport(m.run_id);
       messages.value.find((x: any) => x.run_id === m.run_id)!.report = report.content;
     }
   }
+}
+
+async function showResult(entry: any, jobId: string) {
+  const { data: job } = await api.getJob(jobId);
+  if (job.run_id) {
+    const { data: report } = await api.getReport(job.run_id);
+    messages.value.push({ ...entry, run_id: job.run_id, answer_summary: "", report: report.content });
+    return job.status;
+  }
+  messages.value.push({ ...entry, error: job.error || "分析失败（无详细信息）" });
+  return job.status;
 }
 
 async function submit() {
@@ -109,47 +123,45 @@ async function submit() {
     ElMessage.warning("请输入问题");
     return;
   }
-  if (!session_id.value) {
-    const { data } = await api.createSession({ title: question.value.slice(0, 20), dataset_id: dataset_id.value });
-    session_id.value = data.session_id;
-    loadSessions();
-  }
-  const { data } = await api.analyze({
-    question: question.value,
-    dataset_id: dataset_id.value,
-    mode: mode.value,
-    session_id: session_id.value,
-  });
-  const jobId = data.job_id;
+  const asked = question.value;
+  const usedMode = mode.value;
+  streamController?.abort();
+  streamController = new AbortController();
   running.value = true;
   events.value = [];
-  const source = new EventSource(`/api/jobs/${jobId}/events?token=${localStorage.getItem("token") || ""}`);
-  source.onmessage = async (ev) => {
-    const event = JSON.parse(ev.data);
-    events.value.push(event);
-    if (event.type === "done" || event.type === "error") {
-      source.close();
-      running.value = false;
-      const job = await api.getJob(jobId);
-      if (job.data.run_id) {
-        const { data: report } = await api.getReport(job.data.run_id);
-        messages.value.push({ question: question.value, run_id: job.data.run_id, answer_summary: "", report: report.content, mode: mode.value });
-      } else {
-        messages.value.push({
-          question: question.value,
-          error: job.data.error || event.error || "分析失败（无详细信息）",
-          mode: mode.value,
-        });
-      }
-      question.value = "";
-      loadHistory();
-      if (event.type === "done") {
-        ElMessage.success(`分析完成（${event.status}）`);
-      } else {
-        ElMessage.error("分析出错");
-      }
+  try {
+    if (!session_id.value) {
+      const { data } = await api.createSession({ title: asked.slice(0, 20), dataset_id: dataset_id.value });
+      session_id.value = data.session_id;
+      loadSessions();
     }
-  };
+    const { data } = await api.analyze({
+      question: asked,
+      dataset_id: dataset_id.value,
+      mode: usedMode,
+      session_id: session_id.value,
+    });
+    const jobId = data.job_id;
+    await streamJobEvents(jobId, (event) => events.value.push(event), streamController?.signal);
+    const status = await showResult({ question: asked, mode: usedMode }, jobId);
+    question.value = "";
+    await loadHistory();
+    if (status === "pending" || status === "running") {
+      ElMessage.warning("进度流已中断，任务仍在后台执行，请到历史与报告页查看结果");
+    } else if (status === "success") {
+      ElMessage.success(`分析完成（${status}）`);
+    } else {
+      ElMessage.error(`分析结束（${status}）`);
+    }
+  } catch (err: any) {
+    if (err?.name !== "CanceledError" && err?.name !== "AbortError") {
+      messages.value.push({ question: asked, mode: usedMode, error: err?.message || "提交失败" });
+      ElMessage.error(err?.message || "提交失败");
+    }
+  } finally {
+    running.value = false;
+    streamController = null;
+  }
 }
 
 onMounted(async () => {
@@ -159,6 +171,8 @@ onMounted(async () => {
   await loadSessions();
   await loadHistory();
 });
+
+onBeforeUnmount(() => streamController?.abort());
 </script>
 
 <style scoped>

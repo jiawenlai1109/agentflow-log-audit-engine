@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from agentflow.core.bundle import detect_encoding
 
 
 class ToolError(RuntimeError):
@@ -26,13 +29,21 @@ def ensure_within(root: Path, path: str | Path) -> Path:
 
 
 def ensure_allowed(ctx: Any, path: str | Path) -> Path:
-    """运行级授权：outputs_dir 之内，或等于源数据路径（data_path）。"""
+    """运行级授权：outputs_dir 之内，或本次 Bundle 里的任一文件（表与证据原件）。
+
+    Bundle 缺失时退回单 data_path 语义——那是非 RunContext 调用方（如上传校验）
+    仍在用的窄接口，不是向后兼容补丁。
+    """
     root = Path(ctx.outputs_dir).resolve()
     raw = Path(path)
     target = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
     if target == root or root in target.parents:
         return target
-    if ctx.data_path and target == Path(ctx.data_path).resolve():
+    allowed = getattr(ctx, "readable_paths", None)
+    if allowed:
+        if target in set(allowed):
+            return target
+    elif ctx.data_path and target == Path(ctx.data_path).resolve():
         return target
     raise PathViolationError(f"路径越界：{path} 不在授权范围内")
 
@@ -62,6 +73,7 @@ def ensure_authorized(
         if target != own and own not in target.parents:
             raise PathViolationError(
                 f"路径越界：{path} 位于其他任务的 work 目录（work 目录任务私有）"
+                f"[task_id={task_id!r} 自有={own} 实际={target} 线程={threading.current_thread().name}]"
             )
         return target
 
@@ -132,7 +144,7 @@ def _has_filter_hint(text: str) -> bool:
 
 # 默认白名单（与 config/agents.yaml 对应；未绑定 config 时作为运行时强制依据）
 DEFAULT_TOOL_WHITELIST = {
-    "explorer": ["profile_csv"],
+    "explorer": ["profile_bundle"],
     "planner": [],
     "executor": ["execute_python", "read_artifact"],
     "inspector": ["validate_rules", "verify_aggregate", "verify_findings"],
@@ -215,16 +227,6 @@ class ToolRegistry:
 # ---------------------------------------------------------------- handlers
 
 
-def _detect_encoding(path: Path) -> str:
-    for encoding in ("utf-8-sig", "gbk", "gb18030", "utf-8"):
-        try:
-            path.read_text(encoding=encoding)
-            return encoding
-        except (UnicodeDecodeError, OSError):
-            continue
-    return "utf-8"
-
-
 def _try_date(series: Any) -> tuple[bool, str | None, str | None]:
     import pandas as pd
     import warnings
@@ -243,15 +245,19 @@ def _try_date(series: Any) -> tuple[bool, str | None, str | None]:
     return True, str(parsed.min().date()), str(parsed.max().date())
 
 
-def _profile_csv(ctx: Any, data_path: str | Path) -> dict[str, Any]:
-    """确定性数据画像：编码检测 → 读取 → SchemaProfile。"""
+def profile_table(path: str | Path) -> dict[str, Any]:
+    """确定性表画像（无授权语义：调用方负责路径已被放行）。
+
+    抽成公共函数是因为上传校验、Bundle 归一化、Explorer 需要的是同一份口径——
+    三处各写一遍 pandas 读取迟早会算出三个"缺失率"。
+    """
     import pandas as pd
 
     from agentflow.schemas.profile import ColumnProfile, SchemaProfile
 
-    path = ensure_allowed(ctx, data_path)
-    encoding = _detect_encoding(path)
-    df = pd.read_csv(path, encoding=encoding)
+    target = Path(path)
+    encoding = detect_encoding(target)
+    df = pd.read_csv(target, encoding=encoding)
     columns: list[ColumnProfile] = []
     for col in df.columns:
         series = df[col]
@@ -278,7 +284,7 @@ def _profile_csv(ctx: Any, data_path: str | Path) -> dict[str, Any]:
         if c.missing_rate > 0.5
     ]
     profile = SchemaProfile(
-        file_path=str(path),
+        file_path=str(target),
         encoding=encoding,
         row_count=len(df),
         column_count=len(df.columns),
@@ -287,6 +293,52 @@ def _profile_csv(ctx: Any, data_path: str | Path) -> dict[str, Any]:
         issues=issues,
     )
     return profile.model_dump(mode="json")
+
+
+def _profile_bundle(ctx: Any) -> dict[str, Any]:
+    """Bundle 级画像：每张表一份真实画像 + 文档清单 + 确定性 join 候选。
+
+    返回值同时是"主表画像"（保留 file_path/row_count/columns 等既有字段），
+    所以下游（校验器、报告基准行数、Planner 的列名依据）不用改口径；
+    多表信息以 tables / documents / join_candidates 三个新键附带。
+    """
+    bundle = getattr(ctx, "bundle", None)
+    if bundle is None:
+        return profile_table(ensure_allowed(ctx, ctx.data_path))
+    tables: list[dict[str, Any]] = []
+    for table in bundle.tables:
+        allowed = ensure_allowed(ctx, table.path)
+        profile = profile_table(allowed)
+        tables.append(
+            {
+                "id": table.id,
+                "source_file": table.source_file,
+                "sha256": table.sha256,
+                "row_count": profile["row_count"],
+                "columns": [c["name"] for c in profile["columns"]],
+                "profile": profile,
+            }
+        )
+    if not tables:
+        raise ToolError("Bundle 中没有可分析的表")
+    primary = tables[0]["profile"]
+    documents = [
+        {
+            "id": document.id,
+            "source_file": document.source_file,
+            "sha256": document.sha256,
+            "size": document.size,
+            "preview": document.preview[:500],
+        }
+        for document in bundle.documents
+    ]
+    return {
+        **primary,
+        "tables": tables,
+        "documents": documents,
+        "join_candidates": bundle.join_candidates(),
+        "multi_table": len(tables) > 1,
+    }
 
 
 def _execute_python(
@@ -522,10 +574,10 @@ def build_default_registry(config: dict[str, Any] | None = None) -> ToolRegistry
     registry = ToolRegistry(config)
     registry.register(
         Tool(
-            name="profile_csv",
-            description="读取 CSV 并生成真实 schema 画像（列名/类型/缺失率/日期）",
-            handler=_profile_csv,
-            parameters={"type": "object", "properties": {"data_path": {"type": "string"}}},
+            name="profile_bundle",
+            description="对整批输入生成真实画像：每张表的结构与质量指标、文档清单、确定性 join 候选",
+            handler=_profile_bundle,
+            parameters={"type": "object", "properties": {}},
         )
     )
     registry.register(

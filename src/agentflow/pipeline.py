@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -72,9 +73,45 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
     return llm
 
 
+def _bundle_fingerprint(sources: list[Path]) -> str:
+    """源文件路径 + mtime 的指纹：同一批文件复用同一个 Bundle，改动自动换 id。"""
+    digest = hashlib.sha256()
+    for path in sources:
+        digest.update(f"{path.resolve()}|{path.stat().st_mtime_ns}\n".encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def as_bundle(sources: Any, outputs_root: Path) -> Any:
+    """把"Bundle / 单个路径 / 路径列表"归一成一个 Bundle。
+
+    不是多写一套兼容分支：单文件本就是只有一个成员的 Bundle，这里只是把它构造出来。
+    构造结果落在 `<outputs_root>/bundles/bd_<指纹>/`，同批源文件复用同一份，
+    这样重复跑同一数据不会反复归一化，而报告里的数字仍能指回一份固定快照。
+    """
+    from agentflow.core.bundle import Bundle
+    from agentflow.core.ingest import build_bundle
+
+    if isinstance(sources, Bundle):
+        return sources
+    if isinstance(sources, (str, Path)):
+        sources = [sources]
+    paths = [Path(item).resolve() for item in sources]
+    if not paths:
+        raise ValueError("没有输入文件")
+    root = outputs_root / "bundles" / f"bd_{_bundle_fingerprint(paths)}"
+    if (root / "manifest.json").exists():
+        try:
+            cached = Bundle.load(root)
+        except Exception:  # noqa: BLE001 - 缓存坏了就重建，别让一次坏 manifest 卡住所有跑批
+            cached = None
+        if cached is not None and len(cached.tables) + len(cached.documents) == len(paths):
+            return cached
+    return build_bundle(paths, root, strict=True)
+
+
 def run_analysis(
     question: str,
-    data_path: str,
+    sources: Any,
     config_path: str | Path | None = None,
     mode: str = "mock",
     llm: BaseLLM | None = None,
@@ -85,6 +122,7 @@ def run_analysis(
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
 
+    sources：Bundle 或文件路径（单个或列表）——异构输入在 `as_bundle` 里归一化。
     pack：场景包名称（如 login_audit），装载 packs/<name>/ 并切换为领域规则包模式。
     """
     config = load_config(config_path)
@@ -130,9 +168,10 @@ def run_analysis(
         budget=budget,
         on_event=on_event,
     )
+    bundle = as_bundle(sources, outputs_root)
     result = orchestrator.run(
         question=question,
-        data_path=str(Path(data_path).resolve()),
+        bundle=bundle,
         outputs_root=outputs_root,
         session=session,
         pack=pack_obj,
