@@ -21,6 +21,17 @@ data:
   plain: demo/data/retail_sales.csv
   login_attack: demo/data/login_auth.csv
   login_normal: demo/data/login_auth_normal.csv
+  # 多源题（#21 追加）：值是**列表**时按 Bundle 入包，单文件仍是只有一个成员的 Bundle
+  multi_clean:
+    - demo/data/multi/orders.csv
+    - demo/data/multi/hosts.csv
+  multi_exploding:
+    - demo/data/multi/calls_a.csv
+    - demo/data/multi/calls_b.csv
+  multi_with_doc:
+    - demo/data/multi/orders.csv
+    - demo/data/multi/hosts.csv
+    - demo/data/multi/runbook.md
 
 # golden 由外部推导，非系统输出。表达式即"怎么算出来的"。
 golden:
@@ -49,6 +60,13 @@ golden:
   peak_day: "2024-03-18"                # groupby(日期).销售额.sum().idxmax()
   peak_day_sales: 19067.12
   peak_day_profit: 3889.16
+  # 多源题 golden（同样独立推导：pandas 直接 merge / value_counts 相乘，不借系统任何一段代码）
+  multi_join_rows: 46                   # orders.merge(hosts, on=主机).shape[0]（维表键唯一 ⇒ 等于订单行数）
+  multi_join_total: 10010.0             # merged['事件数'].sum()
+  multi_join_top_domain: 生产            # groupby(域).事件数.sum().idxmax()
+  multi_join_top_domain_value: 4327.0
+  multi_exploding_expected_rows: 144    # Σ 左键计数 × 右键计数 = 12 × 12
+  multi_exploding_baseline: 12          # max(len(a), len(b)) ⇒ 膨胀比 12.0 > 上界 4.0
 
 cases:
   # ---------------------------------------------------------------- 汇总
@@ -64,10 +82,10 @@ cases:
         verifier: pass_all
         chart: none
         llm_calls_max: 10
-      gap:
-        # 未达 0.9 的根因是 Reporter 把样例行 dict 原样打进「说明」列（工作规划 §6.1 待办），
-        # 不是数字编造。修好后这里会 XPASS，逼着把本条升回 gate。
+        # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
+        # 量具修好后 mock 实测 100%。仍存的缺陷是「样例行原文进报告」的展示问题，另案跟。
         numbers_traceable_min: 0.9
+      gap: {}
     real:
       gate:
         status: success
@@ -86,8 +104,10 @@ cases:
         rows: { task: 1, expect: 2000 }
         report_contains: ["2000"]
         verifier: pass_all
-      gap:
-        numbers_traceable_min: 0.9   # 同 E01：样例行泄漏
+        # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
+        # 量具修好后 mock 实测 100%。仍存的缺陷是「样例行原文进报告」的展示问题，另案跟。
+        numbers_traceable_min: 0.9
+      gap: {}
     real:
       gate:
         status: success
@@ -109,10 +129,12 @@ cases:
         llm_calls_max: 12
         # 实测：mock 确实按 7 天窗口出了 7 行（原记为"做不到"，由 XPASS 纠正）
         rows: { task: 2, expect: 7 }
+        # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
+        # 量具修好后 mock 实测 100%。仍存的缺陷是「样例行原文进报告」的展示问题，另案跟。
+        numbers_traceable_min: 0.9
       gap:
         # 缺的是"最高/最低点"这两个结论数字，不是窗口本身
         report_contains: ["18574.9", "4148.11"]
-        numbers_traceable_min: 0.9
     real:
       gate:
         status: success
@@ -134,8 +156,10 @@ cases:
         verifier: pass_all
         # 实测：Top 类别与其销售额 mock 能给（原记为"做不到"，由 XPASS 纠正）
         report_contains: ["家居", "407500.44"]
-      gap:
+        # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
+        # 量具修好后 mock 实测 100%。仍存的缺陷是「样例行原文进报告」的展示问题，另案跟。
         numbers_traceable_min: 0.9
+      gap: {}
     real:
       gate:
         status: success
@@ -152,9 +176,11 @@ cases:
         status: success
         verifier: pass_all
         report_contains: ["华南"]          # 排名首位类别名 mock 能给
+        # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
+        # 量具修好后 mock 实测 100%。仍存的缺陷是「样例行原文进报告」的展示问题，另案跟。
+        numbers_traceable_min: 0.9
       gap:
         report_contains: ["82755.31"]      # 但利润数值本身没进报告
-        numbers_traceable_min: 0.9
     real:
       gate:
         status: success
@@ -390,3 +416,62 @@ cases:
     real:
       gate:
         status: success
+
+  # ---------------------------------------------------------------- 多源（#21 追加）
+  # 这三题考的不是"能不能读多个文件"，而是 M2-3/M2-4 那两道闸门在真实 Bundle 上是否有效：
+  # 合法 join 要真跑起来且三处同数，坏 join 要在派发前被算出并拦下，证据文件不得变成数字来源。
+  - id: E18
+    type: 多源-合法join
+    question: 按域汇总事件数，哪个域最多？
+    data: multi_clean
+    mock:
+      gate:
+        status: success
+        # 预检必须放行这个跨表任务（维表键唯一 ⇒ 期望 46 行 = 订单行数）
+        join_preflight: { ok_min: 1, rejected: [] }
+        aggregate: { task: 3, expect: { join_行数: 46, 合计_事件数: 10010.0 } }
+        verifier: pass_all          # 含 join 重放：预检=执行=校验器 三处同数
+        report_contains: ["生产"]
+        numbers_traceable_min: 0.9
+        llm_calls_max: 12
+      gap: {}
+    real:
+      gate:
+        status: success
+        join_preflight: { ok_min: 1, rejected: [] }
+
+  - id: E19
+    type: 多源-笛卡尔积被拦
+    question: 按会话关联两张表统计
+    data: multi_exploding
+    mock:
+      gate:
+        # 两侧同键各 12 行 ⇒ 期望 144 行 = baseline 12 的 12 倍 → 必须在派发前被拒
+        status: partial
+        join_preflight:
+          rejected: [{ reason: expansion, expected_rows: 144 }]
+        tasks_min: 1               # 拦下坏 join 不该把整条 run 打死
+      gap: {}
+    real:
+      gate:
+        status: partial
+        join_preflight:
+          rejected: [{ reason: expansion, expected_rows: 144 }]
+
+  - id: E20
+    type: 多源-文档只作证据
+    question: 总事件数是多少？
+    data: multi_with_doc
+    mock:
+      gate:
+        status: success
+        aggregate: { task: 1, expect: { 合计_事件数: 10010.0 } }
+        # runbook.md 里的示例数字：出现在报告里就意味着"文档进了数字来源"（违反 I1）
+        report_excludes: ["987654.31", "4242"]
+        transcript_has: ["runbook.md"]
+        numbers_traceable_min: 0.9
+      gap: {}
+    real:
+      gate:
+        status: success
+        report_excludes: ["987654.31", "4242"]

@@ -145,6 +145,15 @@ def _flatten_numbers(payload: Any) -> set[float]:
         pass
     elif isinstance(payload, (int, float)):
         numbers.add(float(payload))
+    elif isinstance(payload, str):
+        # 整格是数字的字符串也算出处：CSV 样例行经 `astype(str)` 后全是字符串，
+        # 报告把它们原样排进表格时，这些数字确实来自证据。日期/时间/IP 都不会被 float() 接受，
+        # 所以这条不会把"看起来像数字的文本"混进池子。
+        text = payload.strip()
+        try:
+            numbers.add(float(text))
+        except ValueError:
+            pass
     return numbers
 
 
@@ -319,6 +328,41 @@ def _p_transcript_has(evidence, params, mode):
     return not missing, ("transcript 缺 " + "；".join(missing)) if missing else f"{len(wanted)} 项在场"
 
 
+def _p_join_preflight(evidence, params, mode):
+    """派发前 join 预检的判定断言（M2-3 那道闸门进 harness）。
+
+    params = {ok_min: 1, rejected: [{reason: expansion, expected_rows: 144}]}
+    只断言"有任务被拒"是不够的：**拦错原因**（把膨胀说成零重叠）与**拦错数量**
+    （期望行数和独立推导对不上）都该红——否则这道闸门红着也不知道它在防什么。
+    """
+    checks = (evidence.get("evaluation") or {}).get("join_preflight") or {}
+    passed = [item for item in checks.values() if item.get("ok")]
+    rejected = [item for item in checks.values() if not item.get("ok")]
+    problems: list[str] = []
+
+    want_ok = int(params.get("ok_min", 0))
+    if len(passed) < want_ok:
+        problems.append(f"预检放行的跨表任务数 {len(passed)} < 期望 {want_ok}")
+
+    expectations = params.get("rejected") or []
+    if len(rejected) != len(expectations):
+        problems.append(
+            f"被拒任务数 {len(rejected)} 期望 {len(expectations)}"
+            f"（实测理由={[item.get('reason') for item in rejected]}）"
+        )
+    else:
+        for want, got in zip(expectations, rejected):
+            if "reason" in want and got.get("reason") != want["reason"]:
+                problems.append(f"理由码 {got.get('reason')!r} 期望 {want['reason']!r}")
+            if "expected_rows" in want:
+                if int(got.get("expected_rows") or -1) != int(want["expected_rows"]):
+                    problems.append(
+                        f"预检期望行数 {got.get('expected_rows')} 与独立推导 "
+                        f"{want['expected_rows']} 不符"
+                    )
+    return not problems, "；".join(problems) or f"预检判定一致（放行 {len(passed)} / 拒绝 {len(rejected)}）"
+
+
 def _p_depends_on(evidence, params, mode):
     """数据流结构断言（依赖边即授权边的可验证形式）。params = {task: 2, expect: [1]}"""
     tasks = {int(t.get("task_id", -1)): t for t in (evidence.get("plan") or {}).get("tasks", [])}
@@ -365,6 +409,7 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "critic": _p_critic,
     "replan": _p_replan,
     "clarify": _p_clarify,
+    "join_preflight": _p_join_preflight,
     "transcript_has": _p_transcript_has,
     "artifacts_clean": _p_artifacts_clean,
     "numbers_traceable_min": _p_numbers_traceable_min,

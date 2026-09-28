@@ -1,33 +1,33 @@
 {
   "suite_version": 1,
   "mode": "mock",
-  "generated_at": "2026-09-28 00:07:01",
+  "generated_at": "2026-09-28 15:59:12",
   "aggregate": {
-    "cases": 17,
-    "pass": 17,
+    "cases": 20,
+    "pass": 20,
     "fail": 0,
     "xpass": 0,
     "error": 0,
-    "gate_checks": 56,
+    "gate_checks": 76,
     "gate_failed": 0,
-    "gap_checks": 17,
+    "gap_checks": 12,
     "gap_passed": 0,
-    "numbers_traceable_mean": 0.6569,
-    "avg_llm_calls": 5.6471,
-    "avg_duration": 2.5192,
-    "verifier_checked": 10,
+    "numbers_traceable_mean": 0.9,
+    "avg_llm_calls": 6.0,
+    "avg_duration": 2.2375,
+    "verifier_checked": 11,
     "fingerprints": {
       "prompt:critic": "d8435a6e38bb",
       "prompt:executor": "0148a451cb91",
-      "prompt:explorer": "955b779321f8",
+      "prompt:explorer": "3cec92f4e57d",
       "prompt:inspector": "a982bfa4c290",
-      "prompt:planner": "21e7afaba4de",
+      "prompt:planner": "ca032ec2ad28",
       "prompt:reporter": "e44a344aa675",
       "prompt:visualizer": "c55800626f76",
-      "config": "24f2d589d0ad",
-      "harness:suite.yaml": "32a31f878684",
-      "harness:grading.py": "1baeb62caf13",
-      "harness:run_eval.py": "4af659dad35d"
+      "config": "39ae54c1bd32",
+      "harness:suite.yaml": "5ee68a408362",
+      "harness:grading.py": "5364fcd7db4d",
+      "harness:run_eval.py": "43826f6691e2"
     }
   },
   "results": [
@@ -35,13 +35,13 @@
       "case_id": "E01",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.36,
+      "seconds": 1.91,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.344,
+        "duration_seconds": 1.875,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -82,14 +82,14 @@
         },
         {
           "kind": "numbers_traceable_min",
-          "tier": "known_gap",
-          "passed": false,
-          "detail": "可追溯率=66.67% 下界=90% 未追到=['1753.36']"
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000610_860e3111",
+          "run_id": "run_20260928_155820_f8e84163",
           "status": "success"
         }
       ]
@@ -98,13 +98,13 @@
       "case_id": "E02",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.38,
+      "seconds": 1.97,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.375,
+        "duration_seconds": 1.922,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -133,14 +133,14 @@
         },
         {
           "kind": "numbers_traceable_min",
-          "tier": "known_gap",
-          "passed": false,
-          "detail": "可追溯率=66.67% 下界=90% 未追到=['1753.36']"
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000612_0340ef72",
+          "run_id": "run_20260928_155822_28628460",
           "status": "success"
         }
       ]
@@ -149,13 +149,13 @@
       "case_id": "E03",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.28,
+      "seconds": 2.88,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.265,
+        "duration_seconds": 2.828,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -189,21 +189,21 @@
           "detail": "rows={'1': 2000, '2': 7} 期望={'task': 2, 'expect': 7}"
         },
         {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        },
+        {
           "kind": "report_contains",
           "tier": "known_gap",
           "passed": false,
           "detail": "缺少 18574.9；4148.11"
-        },
-        {
-          "kind": "numbers_traceable_min",
-          "tier": "known_gap",
-          "passed": false,
-          "detail": "可追溯率=75.00% 下界=90% 未追到=['1753.36']"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000615_4f081659",
+          "run_id": "run_20260928_155824_3d1847c8",
           "status": "success"
         }
       ]
@@ -212,13 +212,13 @@
       "case_id": "E04",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.3,
+      "seconds": 2.77,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.281,
+        "duration_seconds": 2.734,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -247,14 +247,14 @@
         },
         {
           "kind": "numbers_traceable_min",
-          "tier": "known_gap",
-          "passed": false,
-          "detail": "可追溯率=75.00% 下界=90% 未追到=['1753.36']"
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000618_7f84e103",
+          "run_id": "run_20260928_155827_318e2cfc",
           "status": "success"
         }
       ]
@@ -263,13 +263,13 @@
       "case_id": "E05",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.25,
+      "seconds": 2.88,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.218,
+        "duration_seconds": 2.828,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -291,21 +291,21 @@
           "detail": "1 处命中"
         },
         {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        },
+        {
           "kind": "report_contains",
           "tier": "known_gap",
           "passed": false,
           "detail": "缺少 82755.31"
-        },
-        {
-          "kind": "numbers_traceable_min",
-          "tier": "known_gap",
-          "passed": false,
-          "detail": "可追溯率=75.00% 下界=90% 未追到=['1753.36']"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000621_529e16d4",
+          "run_id": "run_20260928_155830_d1e79190",
           "status": "success"
         }
       ]
@@ -314,13 +314,13 @@
       "case_id": "E06",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.41,
+      "seconds": 2.84,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.391,
+        "duration_seconds": 2.797,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -344,7 +344,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000624_4e70afe9",
+          "run_id": "run_20260928_155833_117a45b9",
           "status": "success"
         }
       ]
@@ -353,13 +353,13 @@
       "case_id": "E07",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 2.33,
+      "seconds": 1.98,
       "metrics": {
         "numbers_traceable_ratio": 0.0,
         "llm_calls": 2.0,
-        "duration_seconds": 2.297,
+        "duration_seconds": 1.953,
         "tasks": 2.0,
-        "unexplained_numbers": 7.0
+        "unexplained_numbers": 6.0
       },
       "checks": [
         {
@@ -383,7 +383,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000628_e68b132a",
+          "run_id": "run_20260928_155835_6a2b01f2",
           "status": "degraded"
         }
       ]
@@ -392,13 +392,13 @@
       "case_id": "E08",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.27,
+      "seconds": 2.67,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.266,
+        "duration_seconds": 2.641,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -428,7 +428,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000630_850df59e",
+          "run_id": "run_20260928_155837_1f99875a",
           "status": "success"
         }
       ]
@@ -437,11 +437,11 @@
       "case_id": "E09",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.8,
+      "seconds": 0.75,
       "metrics": {
         "numbers_traceable_ratio": 0.0,
         "llm_calls": 2.0,
-        "duration_seconds": 0.796,
+        "duration_seconds": 0.719,
         "tasks": 2.0,
         "unexplained_numbers": 7.0
       },
@@ -485,7 +485,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000633_f81d7455",
+          "run_id": "run_20260928_155840_8516241a",
           "status": "degraded"
         }
       ]
@@ -494,13 +494,13 @@
       "case_id": "E10",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.33,
+      "seconds": 1.98,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.313,
+        "duration_seconds": 1.953,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -524,7 +524,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000634_f60b36db",
+          "run_id": "run_20260928_155841_e15cd299",
           "status": "success"
         }
       ]
@@ -533,13 +533,13 @@
       "case_id": "E11",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.74,
+      "seconds": 3.84,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.344,
+        "duration_seconds": 1.89,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -557,11 +557,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000637_e794d660",
+          "run_id": "run_20260928_155843_bf90f7b6",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_000639_ccc0fb29",
+          "run_id": "run_20260928_155845_c5848b21",
           "status": "success"
         }
       ]
@@ -570,13 +570,13 @@
       "case_id": "E12",
       "verdict": "pass",
       "status": "success",
-      "seconds": 5.62,
+      "seconds": 4.86,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.375,
+        "duration_seconds": 1.984,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -594,11 +594,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000641_2a7e73ca",
+          "run_id": "run_20260928_155847_0a7dbb25",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_000645_d6cb12c3",
+          "run_id": "run_20260928_155849_a167eb60",
           "status": "success"
         }
       ]
@@ -607,13 +607,13 @@
       "case_id": "E13",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.36,
+      "seconds": 2.02,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.359,
+        "duration_seconds": 1.985,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -631,7 +631,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000647_cdf08467",
+          "run_id": "run_20260928_155851_72b99d12",
           "status": "success"
         }
       ]
@@ -640,11 +640,11 @@
       "case_id": "E14",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.88,
+      "seconds": 1.61,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.859,
+        "duration_seconds": 1.563,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -688,7 +688,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000649_de61b247",
+          "run_id": "run_20260928_155853_7ab64630",
           "status": "success"
         }
       ]
@@ -697,13 +697,13 @@
       "case_id": "E15",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.25,
+      "seconds": 2.81,
       "metrics": {
-        "numbers_traceable_ratio": 0.75,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.25,
+        "duration_seconds": 2.781,
         "tasks": 2.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -739,7 +739,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000651_15a412ff",
+          "run_id": "run_20260928_155855_61c8d106",
           "status": "success"
         }
       ]
@@ -748,11 +748,11 @@
       "case_id": "E16",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.83,
+      "seconds": 1.56,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.812,
+        "duration_seconds": 1.531,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -790,7 +790,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000654_8a8a59c3",
+          "run_id": "run_20260928_155858_cdb17e58",
           "status": "success"
         }
       ]
@@ -799,13 +799,13 @@
       "case_id": "E17",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.7,
+      "seconds": 3.81,
       "metrics": {
-        "numbers_traceable_ratio": 0.6667,
+        "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 2.281,
+        "duration_seconds": 1.891,
         "tasks": 1.0,
-        "unexplained_numbers": 1.0
+        "unexplained_numbers": 0.0
       },
       "checks": [
         {
@@ -829,11 +829,164 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260928_000656_a457627a",
+          "run_id": "run_20260928_155900_28402125",
           "status": "success"
         },
         {
-          "run_id": "run_20260928_000659_bb4c70b3",
+          "run_id": "run_20260928_155901_54ab858b",
+          "status": "success"
+        }
+      ]
+    },
+    {
+      "case_id": "E18",
+      "verdict": "pass",
+      "status": "success",
+      "seconds": 3.62,
+      "metrics": {
+        "numbers_traceable_ratio": 1.0,
+        "llm_calls": 10.0,
+        "duration_seconds": 3.594,
+        "tasks": 3.0,
+        "unexplained_numbers": 0.0
+      },
+      "checks": [
+        {
+          "kind": "status",
+          "tier": "gate",
+          "passed": true,
+          "detail": "status=success 期望∈['success']"
+        },
+        {
+          "kind": "join_preflight",
+          "tier": "gate",
+          "passed": true,
+          "detail": "预检判定一致（放行 1 / 拒绝 0）"
+        },
+        {
+          "kind": "aggregate",
+          "tier": "gate",
+          "passed": true,
+          "detail": "aggregate 命中 ['join_行数', '合计_事件数']"
+        },
+        {
+          "kind": "verifier",
+          "tier": "gate",
+          "passed": true,
+          "detail": "校验一致 2/2"
+        },
+        {
+          "kind": "report_contains",
+          "tier": "gate",
+          "passed": true,
+          "detail": "1 处命中"
+        },
+        {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        },
+        {
+          "kind": "llm_calls_max",
+          "tier": "gate",
+          "passed": true,
+          "detail": "llm_calls=10 上界=12"
+        }
+      ],
+      "runs": [
+        {
+          "run_id": "run_20260928_155903_4bfe4f47",
+          "status": "success"
+        }
+      ]
+    },
+    {
+      "case_id": "E19",
+      "verdict": "pass",
+      "status": "partial",
+      "seconds": 1.91,
+      "metrics": {
+        "numbers_traceable_ratio": 1.0,
+        "llm_calls": 6.0,
+        "duration_seconds": 1.875,
+        "tasks": 2.0,
+        "unexplained_numbers": 0.0
+      },
+      "checks": [
+        {
+          "kind": "status",
+          "tier": "gate",
+          "passed": true,
+          "detail": "status=partial 期望∈['partial']"
+        },
+        {
+          "kind": "join_preflight",
+          "tier": "gate",
+          "passed": true,
+          "detail": "预检判定一致（放行 0 / 拒绝 1）"
+        },
+        {
+          "kind": "tasks_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "任务数=2 下界=1"
+        }
+      ],
+      "runs": [
+        {
+          "run_id": "run_20260928_155907_ec1c97f7",
+          "status": "partial"
+        }
+      ]
+    },
+    {
+      "case_id": "E20",
+      "verdict": "pass",
+      "status": "success",
+      "seconds": 3.44,
+      "metrics": {
+        "numbers_traceable_ratio": 1.0,
+        "llm_calls": 8.0,
+        "duration_seconds": 3.406,
+        "tasks": 2.0,
+        "unexplained_numbers": 0.0
+      },
+      "checks": [
+        {
+          "kind": "status",
+          "tier": "gate",
+          "passed": true,
+          "detail": "status=success 期望∈['success']"
+        },
+        {
+          "kind": "aggregate",
+          "tier": "gate",
+          "passed": true,
+          "detail": "aggregate 命中 ['合计_事件数']"
+        },
+        {
+          "kind": "report_excludes",
+          "tier": "gate",
+          "passed": true,
+          "detail": "无禁用词"
+        },
+        {
+          "kind": "transcript_has",
+          "tier": "gate",
+          "passed": true,
+          "detail": "1 项在场"
+        },
+        {
+          "kind": "numbers_traceable_min",
+          "tier": "gate",
+          "passed": true,
+          "detail": "可追溯率=100.00% 下界=90% 未追到=[]"
+        }
+      ],
+      "runs": [
+        {
+          "run_id": "run_20260928_155909_720b0161",
           "status": "success"
         }
       ]

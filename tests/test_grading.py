@@ -311,3 +311,83 @@ def yaml_safe_load(path: Path):
     import yaml
 
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------- M2 追加：join 预检谓词与数字池
+
+def test_join_preflight_predicate_passes_on_matching_verdicts():
+    from agentflow.core.grading import _p_join_preflight
+
+    evidence = {
+        "evaluation": {
+            "join_preflight": {
+                "3": {"ok": True, "reason": "ok", "expected_rows": 46},
+                "4": {
+                    "ok": False,
+                    "reason": "expansion",
+                    "expected_rows": 144,
+                },
+            }
+        }
+    }
+    ok, detail = _p_join_preflight(
+        evidence,
+        {"ok_min": 1, "rejected": [{"reason": "expansion", "expected_rows": 144}]},
+        "mock",
+    )
+    assert ok, detail
+
+
+def test_join_preflight_predicate_catches_wrong_reason():
+    """拦对数量拦错原因也要红：把膨胀说成零重叠，等于闸门在防什么都没防。"""
+    from agentflow.core.grading import _p_join_preflight
+
+    evidence = {
+        "evaluation": {
+            "join_preflight": {"2": {"ok": False, "reason": "no_overlap", "expected_rows": 144}}
+        }
+    }
+    ok, detail = _p_join_preflight(
+        evidence, {"rejected": [{"reason": "expansion", "expected_rows": 144}]}, "mock"
+    )
+    assert not ok and "理由码" in detail
+
+
+def test_join_preflight_predicate_catches_wrong_cardinality():
+    """预检算出的期望行数与独立推导不符 → 红（基数是这道闸门的全部依据）。"""
+    from agentflow.core.grading import _p_join_preflight
+
+    evidence = {
+        "evaluation": {
+            "join_preflight": {"2": {"ok": False, "reason": "expansion", "expected_rows": 12}}
+        }
+    }
+    ok, detail = _p_join_preflight(
+        evidence, {"rejected": [{"reason": "expansion", "expected_rows": 144}]}, "mock"
+    )
+    assert not ok and "期望行数" in detail
+
+
+def test_head_row_numbers_count_as_traced_provenance():
+    """CSV 样例行经 astype(str) 后是字符串：整格数字仍是合法出处，不该算未追到。"""
+    from agentflow.core.grading import numbers_traceable
+
+    evidence = {
+        "report": "| 1 | success | 46 | {'主机': 'h01', '事件数': '342', '年份': '2026'} |",
+        "evaluation": {
+            "dataset_rows": 46,
+            "results": {"1": {"summary": {"head": [{"主机": "h01", "事件数": "342", "年份": "2026"}]}}},
+        },
+        "plan": {},
+        "transcript": [],
+    }
+    ratio, unexplained = numbers_traceable(evidence)
+    assert ratio == 1.0, unexplained
+
+
+def test_text_cells_do_not_inflate_the_pool():
+    """反向一条：日期/IP 这类文本不能被 float() 混进数字池。"""
+    from agentflow.core.grading import _flatten_numbers
+
+    numbers = _flatten_numbers({"a": "2026-09-28 13:34:12", "b": "10.0.0.24", "c": "h01"})
+    assert numbers == set()

@@ -106,6 +106,34 @@ def derive_goldens(data_dir: Path) -> dict[str, Any]:
         "peak_day": str(peak.date()),
         "peak_day_sales": round(float(by_day.loc[peak, "销售额"]), 2),
         "peak_day_profit": round(float(by_day.loc[peak, "利润"]), 2),
+        **_multi_goldens(data_dir / "multi"),
+    }
+
+
+def _multi_goldens(multi_dir: Path) -> dict[str, Any]:
+    """多源题的 golden：同样只用 pandas 直接算，不借系统的预检/执行/校验任何一段代码。"""
+    import pandas as pd
+
+    orders = pd.read_csv(multi_dir / "orders.csv")
+    hosts = pd.read_csv(multi_dir / "hosts.csv")
+    merged = orders.merge(hosts, on="主机", how="inner")
+    by_domain = merged.groupby("域")["事件数"].sum().sort_values(ascending=False)
+
+    calls_a = pd.read_csv(multi_dir / "calls_a.csv")
+    calls_b = pd.read_csv(multi_dir / "calls_b.csv")
+    left = calls_a["会话"].value_counts()
+    right = calls_b["会话"].value_counts()
+    common = left.index.intersection(right.index)
+    exploding_rows = int((left.loc[common] * right.loc[common]).sum()) if len(common) else 0
+
+    return {
+        "multi_join_rows": int(len(merged)),
+        "multi_join_total": round(float(merged["事件数"].sum()), 2),
+        "multi_join_top_domain": str(by_domain.index[0]),
+        "multi_join_top_domain_value": round(float(by_domain.iloc[0]), 2),
+        # 爆炸对的期望行数：预检算出来的数必须与这个相等，否则"拦对了"只是巧合
+        "multi_exploding_expected_rows": exploding_rows,
+        "multi_exploding_baseline": int(max(len(calls_a), len(calls_b))),
     }
 
 
@@ -128,8 +156,16 @@ def check_golden(suite: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------- 跑题
 
 
-def _data_path(suite: dict[str, Any], ref: str) -> str:
-    return str(PROJECT_ROOT / suite["data"][ref])
+def _data_path(suite: dict[str, Any], ref: str) -> Any:
+    """数据引用：单个路径，或一组路径（多源题）。
+
+    列表直接交给 `run_analysis` 的 `sources`——单文件本就是只有一个成员的 Bundle，
+    这里不再为"多文件"另开一条执行分支。
+    """
+    entry = suite["data"][ref]
+    if isinstance(entry, list):
+        return [str(PROJECT_ROOT / item) for item in entry]
+    return str(PROJECT_ROOT / entry)
 
 
 def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path) -> dict[str, Any]:
