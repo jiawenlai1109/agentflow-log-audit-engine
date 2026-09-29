@@ -33,19 +33,36 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "agents.y
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
-    """加载配置：未显式给路径时用项目默认 config/agents.yaml，文件不存在才退默认。
+    """加载配置。
+
+    两类路径不是一件事，别再混成一条：
+
+    - **不传 path**：读项目默认 `config/agents.yaml`。这份文件不在（比如精简过的部署包）
+      就退内置 `DEFAULT_CONFIG`——默认配置是可选的。
+    - **显式传 path**：这是声明式意图，"我就是要用这份配置"。文件读不到必须报错，
+      绝不能退默认：静默退默认会把"配置根本没生效"伪装成"配置生效了但行为没变"，
+      归因链当场断掉。（2026-09-28 实测踩过：拿一个解释器看不见的 `/tmp` 路径跑
+      "关停某 skill"的实验，`skills.disabled` 一个字都没读进去，而程序毫无异常。）
 
     合并按 section 逐键覆盖（不是整段替换）：YAML 少写一个 execution 键时，
     该键仍取 DEFAULT_CONFIG 的值，而不是静默消失——否则"改了配置没生效"会
     变成"改了配置把别的配置弄丢了"。
     """
-    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     config: dict[str, Any] = {
         key: (dict(value) if isinstance(value, dict) else value)
         for key, value in DEFAULT_CONFIG.items()
     }
-    if not config_path.exists():
-        return config
+    if path is not None:
+        config_path = Path(path)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"配置文件不存在：{config_path}。显式给出的路径必须真的读到东西；"
+                "要使用内置默认就别传 path（或不传 config_path）"
+            )
+    else:
+        config_path = DEFAULT_CONFIG_PATH
+        if not config_path.exists():
+            return config
     with config_path.open(encoding="utf-8") as fh:
         loaded = yaml.safe_load(fh) or {}
     for key in ("llm", "execution", "agents", "skills", "mcp"):

@@ -73,6 +73,11 @@ def main() -> int:
         print("--data 与 --bundle 必须二选一（给一组文件，或给一个已建好的 Bundle 目录）")
         return 2
 
+    if args.config and not Path(args.config).exists():
+        # 边界上就把话说完：`load_config` 现在会对读不到的显式路径报错，CLI 不该让人看 traceback
+        print(f"配置文件读不到：{args.config}（要用项目默认 config/agents.yaml 就别带 --config）")
+        return 2
+
     sources: object = args.data or args.bundle
     if args.bundle:
         from agentflow.core.bundle import Bundle
