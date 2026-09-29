@@ -41,6 +41,7 @@ from agentflow.core.grading import (  # noqa: E402
     load_evidence,
     review_state,
 )
+from agentflow.core.streams import harden_streams  # noqa: E402
 from agentflow.pipeline import AGENT_ROSTER, run_analysis  # noqa: E402
 
 SUITE_PATH = PROJECT_ROOT / "evals" / "suite.yaml"
@@ -529,17 +530,6 @@ def preflight_credentials(mode: str) -> str:
     except Exception as exc:  # noqa: BLE001 - 预检失败即中止，不烧一整批
         return f"凭据预检失败，未跑批：{type(exc).__name__}: {str(exc)[:200]}"
     return ""
-
-
-def harden_streams() -> None:
-    """把输出钉在 UTF-8 上：一次已经跑完的运行不该被输出编码判成失败。
-
-    Windows 下 stdout 被重定向或管道接走时按本地码页编码（本机实测 cp936），而报告里有 ✔ ✘ ⚠
-    这类码页外字符——2026-09-29 实测：27 题全部跑完，炸在 print_report 第一行，非零退出，
-    汇总数字一行都打不出来。交互终端与 CI（ubuntu）都不会现，只有"把数字落进日志"这个动作会。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def main() -> int:

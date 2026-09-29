@@ -37,6 +37,7 @@ config.OUTPUTS_ROOT = SCRATCH / "outputs"
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
+from agentflow.core.streams import harden_streams  # noqa: E402
 from app.main import app  # noqa: E402
 from app.db import init_db  # noqa: E402
 
@@ -69,6 +70,8 @@ def wait_job(client: httpx.Client, job_id: str, timeout: float = 90.0) -> dict:
 
 
 def main() -> int:
+    # 探针自己不许把"一次全过的验收"报成崩溃：✓ ✗ 在 Windows 重定向下按 cp936 编码会抛
+    harden_streams()
     init_db()
     serve()
     checks: list[tuple[str, bool, str]] = []
