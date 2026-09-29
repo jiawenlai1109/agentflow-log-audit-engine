@@ -137,6 +137,8 @@ def run_analysis(
     pack: str | None = None,
     skills_dir: str | Path | None = None,
     mcp_config: str | Path | None = None,
+    mcp_approvals: dict[str, bool] | None = None,
+    run_origin: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
 
@@ -144,6 +146,10 @@ def run_analysis(
     pack：场景包名称（如 login_audit），装载 packs/<name>/ 并切换为领域规则包模式。
     skills_dir：方法（skill）目录，默认仓库 `skills/`；关哪几只走 config `skills.disabled`。
     mcp_config：外部工具 server 配置，默认 `config/mcp.yaml`（文件不存在 = 一个都不接）。
+    mcp_approvals：调用方带来的外部工具批准（`mcp:<server>:<tool>` → bool）。
+        **这里不做裁决**：原样交给 hub，由闸门按 config 的 grantable_approvals 过滤——
+        判定权只在一处，任何调用方都过同一道。
+    run_origin：这次运行的来源与经手人（如 {source: web, actor_user_id: 1}），只用于留痕。
     """
     config = load_config(config_path)
     registry = build_default_registry(config)
@@ -198,6 +204,8 @@ def run_analysis(
         on_event=on_event,
         skills=skills,
         mcp=mcp,
+        mcp_approvals=mcp_approvals,
+        run_origin=run_origin,
     )
     bundle = as_bundle(sources, outputs_root)
     result = orchestrator.run(

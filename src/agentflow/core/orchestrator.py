@@ -30,6 +30,8 @@ class Orchestrator:
         on_event: Any = None,
         skills: Any = None,
         mcp: Any = None,
+        mcp_approvals: dict[str, Any] | None = None,
+        run_origin: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -38,6 +40,11 @@ class Orchestrator:
         self.on_event = on_event
         self.skills = skills
         self.mcp = mcp
+        # 请求侧带来的批准**原样**交给 hub，由闸门按 grantable 名单过滤。
+        # 不在这里先合一遍 config.approvals：合并点必须只有一处，否则"谁覆盖了谁"
+        # 就有两个解释，而这类分歧最后都是靠读代码猜的。
+        self.mcp_approvals = dict(mcp_approvals or {})
+        self.run_origin = dict(run_origin or {})
         self._commit_lock = threading.Lock()
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -76,7 +83,8 @@ class Orchestrator:
             pack=pack,
             skills=self.skills,
             mcp=self.mcp,
-            mcp_approvals=dict(getattr(self.mcp, "config", None).approvals) if self.mcp is not None else {},
+            mcp_approvals=dict(self.mcp_approvals),
+            run_origin=dict(self.run_origin),
         )
         self._record_capabilities(ctx, pack)
         started = time.monotonic()
@@ -170,14 +178,25 @@ class Orchestrator:
             for entry in summary["refused"]:
                 ctx.transcript.write({"event": "skill_refused_no_escalation", **entry})
         if ctx.mcp is not None:
+            # 走 hub 的同一个方法，不是在这儿再算一遍：判定与留痕必须是同一次解析的结果
+            accepted, rejected = ctx.mcp.resolve_approvals(ctx.mcp_approvals)
             ctx.transcript.write(
                 {
                     "event": "mcp_attached",
                     "servers": ctx.mcp.summary()["servers"],
                     "max_calls": ctx.mcp.config.max_calls,
-                    "approvals": dict(ctx.mcp_approvals),
+                    # 谁签的分开记：运维的、请求想要的、请求签字里算数的、被丢掉的。
+                    # 合成一个 approvals 字段就回答不了"这次写能力是谁批的"。
+                    "approvals_from_config": dict(ctx.mcp.config.approvals),
+                    "approvals_requested": dict(ctx.mcp_approvals),
+                    "approvals_accepted": accepted,
+                    "approvals_rejected": rejected,
+                    "grantable": sorted(ctx.mcp.config.grantable),
                 }
             )
+        if ctx.run_origin:
+            # 运行来源单独一条：不是谁请求的、批准了什么，这些要能在事实层查回来
+            ctx.transcript.write({"event": "run_origin", **ctx.run_origin})
 
     # ------------------------------------------------------------ 阶段
     def _explore(self, ctx: RunContext) -> None:
@@ -716,6 +735,18 @@ class Orchestrator:
             "chart_notes": {
                 str(k): (v.get("note") or "") for k, v in ctx.figures.items() if v.get("chart_type") == "none"
             },
+            # 事实层要能回答"这次跑的是哪个场景包、哪几规则"：只有 run_config 里的 pack
+            # 文件 hash 是不够的，而 hash 又只有跑批才写（CLI/Web 不写 run_config.json）。
+            "pack": (
+                {
+                    "name": ctx.pack.name,
+                    "version": ctx.pack.version,
+                    "rule_ids": [rule.id for rule in ctx.pack.rules],
+                    "required_columns": list(ctx.pack.required_columns),
+                }
+                if ctx.pack is not None
+                else None
+            ),
             "skills": (ctx.skills.summary() if ctx.skills is not None else None),
             "mcp": (ctx.mcp.summary() if ctx.mcp is not None else None),
             "external_evidence": ctx.external_evidence,

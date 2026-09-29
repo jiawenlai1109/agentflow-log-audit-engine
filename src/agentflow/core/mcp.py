@@ -144,9 +144,17 @@ class McpConfig:
     pulls: list[EvidencePull] = field(default_factory=list)
     max_calls: int = 5
     approvals: dict[str, bool] = field(default_factory=dict)
+    # 允许由**请求侧**追加/收回批准的工具全名。默认空集 = 批准只能来自本文件的
+    # `approvals`（运维签字）。这条名单是"第二入口不变成后门"的唯一护栏：
+    # 没有它，任何能发 HTTP 的人都能给 write/network 能力签字。
+    grantable: frozenset[str] = frozenset()
 
     def server(self, name: str) -> McpServerSpec | None:
         return next((item for item in self.servers if item.name == name), None)
+
+    def qualified_names(self) -> set[str]:
+        """所有已登记的 `mcp:<server>:<tool>` 全名。"""
+        return {spec.qualified(tool.name) for spec in self.servers for tool in spec.tools}
 
     def pulls_for(self, pack_name: str | None, agent_name: str) -> list[EvidencePull]:
         return [
@@ -156,13 +164,48 @@ class McpConfig:
         ]
 
 
+def partition_approvals(
+    config: McpConfig, requested: dict[str, Any] | None
+) -> tuple[dict[str, bool], list[str]]:
+    """把请求带来的批准分成"算数的"和"被丢掉的"。
+
+    只有 `config.grantable` 里点过名的工具才接受请求侧签字（含签成 false 收回）；名单外的一律
+    丢弃并回报——**判定权留在引擎**：API 层可以提前告诉调用方"这个批不了"，但绕过 API 直接
+    构造 hub 的调用方同样过这道过滤，否则就出现"装得上、跑不动"之外的第二种裂缝
+    （批得动、而没人拦）。
+    """
+    accepted: dict[str, bool] = {}
+    rejected: list[str] = []
+    for key, value in (requested or {}).items():
+        name = str(key)
+        if name in config.grantable:
+            accepted[name] = bool(value)
+        elif value:
+            rejected.append(name)
+    return accepted, rejected
+
+
 def load_mcp_config(path: str | Path | None = None) -> McpConfig | None:
-    """读 `config/mcp.yaml`。文件不存在 = 一个外部 server 都不接（返回 None，不报错）。"""
+    """读 MCP 配置。
+
+    与 `core/config.py: load_config` 同一条规矩（这里是我今天新写的代码，同一个缺陷形状
+    不能留两份）：**默认路径**不存在 = 一个外部 server 都不接（返回 None，正常状态）；
+    **显式给出的路径**读不到必须报错——否则"以为接了情报库、其实什么都没接"，
+    而所有下游断言只会显示"没有外部证据"这种无法区分两者的结果。
+    """
     import yaml
 
-    config_path = Path(path) if path is not None else DEFAULT_MCP_CONFIG_PATH
-    if not config_path.exists():
-        return None
+    if path is not None:
+        config_path = Path(path)
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"MCP 配置不存在：{config_path}。显式点名了外部 server 配置就必须读到东西；"
+                "要「不接任何外部 server」就别传 path"
+            )
+    else:
+        config_path = DEFAULT_MCP_CONFIG_PATH
+        if not config_path.exists():
+            return None
     data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     servers: list[McpServerSpec] = []
     for entry in data.get("servers") or []:
@@ -207,12 +250,23 @@ def load_mcp_config(path: str | Path | None = None) -> McpConfig | None:
         for item in (data.get("evidence_pulls") or [])
     ]
     limits = data.get("limits") or {}
-    return McpConfig(
+    grantable_raw = data.get("grantable_approvals") or []
+    config = McpConfig(
         servers=servers,
         pulls=pulls,
         max_calls=int(limits.get("max_calls", 5)),
         approvals={str(k): bool(v) for k, v in (data.get("approvals") or {}).items()},
+        grantable=frozenset(str(name) for name in grantable_raw),
     )
+    # 名单里点了不存在的工具 ⇒ 直接报错，而不是"安静地批不了"。
+    # 写错一个名字的表现会是"我明明批了、调用仍被拒"，那种红最难归因。
+    unknown = sorted(config.grantable - config.qualified_names())
+    if unknown:
+        raise ValueError(
+            f"config/mcp.yaml 的 grantable_approvals 点名的工具并不存在：{unknown}"
+            "（可登记的工具有：" + "、".join(sorted(config.qualified_names())) + "）"
+        )
+    return config
 
 
 class StdioMcpClient:
@@ -415,6 +469,7 @@ class McpHub:
         self.clients: dict[str, StdioMcpClient] = {}
         self.calls: list[dict[str, Any]] = []
         self.denials: list[dict[str, Any]] = []
+        self.ignored_approvals: list[dict[str, Any]] = []
         self.external_evidence: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._used = 0
@@ -510,8 +565,13 @@ class McpHub:
             )
 
         tier = tool.effective_tier()
+        # 请求侧的批准先过 `grantable` 名单再合并：合并点只在这一处，
+        # 所以无论从 API 进来、从 CLI 进来，还是测试直接调 hub，走的都是同一条判定。
+        accepted, rejected = self.resolve_approvals(approvals)
+        if rejected:
+            self._note_rejected(rejected, asked_for=qualified, agent=agent_name)
         approved = dict(self.config.approvals)
-        approved.update(approvals or {})
+        approved.update(accepted)
         if tier in APPROVAL_TIERS and not approved.get(qualified, False):
             raise self._deny(
                 "mcp_denied_capability",
@@ -519,7 +579,10 @@ class McpHub:
                 agent=agent_name,
                 tool=qualified,
                 tier=tier,
-                reason=f"{tier} 能力需要人在环批准（approvals 里给出 {qualified}=true）后才可调",
+                reason=(
+                    f"{tier} 能力需要人在环批准（config/mcp.yaml 的 approvals，"
+                    f"或请求批准 {qualified} 且该工具在 grantable_approvals 名单里）后才可调"
+                ),
             )
 
         blocked = sorted(
@@ -600,6 +663,40 @@ class McpHub:
                 self.external_evidence.append(dict(record))
         return {"untrusted": True, "evidence_only": tool.evidence_only, "source": qualified, "result": payload}
 
+    def resolve_approvals(
+        self, requested: dict[str, Any] | None
+    ) -> tuple[dict[str, bool], list[str]]:
+        """本 hub 唯一的批准解析点：闸门与审计都走这里。
+
+        分开写会出什么事是实测过的：把闸门的过滤改坏而审计仍自己算一遍，
+        transcript 依旧老老实实写"这份签字不作数"——审计与行为就此分叉，
+        而分叉的两侧看起来都对。合并成一个方法之后，改判定必然同时改到留痕。
+        """
+        return partition_approvals(self.config, requested)
+
+    def _note_rejected(self, rejected: list[str], asked_for: str, agent: str = "unknown") -> None:
+        """请求想批、但不在可授予名单里 ⇒ 丢掉的痕迹要留，且每个名字只留一次。
+
+        留痕的理由：调用方以为批了而系统其实没批，是事后最难还原的一类分歧——它长得像
+        "闸门坏了"，实际是名单没放行。只留一次的理由：闸门每次调用都重跑这条过滤，
+        全记会把事实层刷成噪声，反而看不见别的事件。
+        """
+        for name in rejected:
+            key = name + "->" + asked_for
+            if any(entry.get("key") == key for entry in self.ignored_approvals):
+                continue
+            entry = {
+                "key": key,
+                "event": "mcp_approval_ignored",
+                "tool": name,
+                "asked_for": asked_for,
+                "agent": agent,
+                "reason": "不在 config/mcp.yaml 的 grantable_approvals 名单里，请求签字不作数",
+            }
+            with self._lock:
+                self.ignored_approvals.append(entry)
+            self._audit({k: v for k, v in entry.items() if k != "key"})
+
     def _deny(
         self, event: str, error_cls: type[McpDeniedError] = McpDeniedError, **item: Any
     ) -> McpDeniedError:
@@ -638,6 +735,13 @@ class McpHub:
             "external_evidence": self.external_evidence,
             "used": self._used,
             "max_calls": self.config.max_calls,
+            # 三条分开记：运维签了什么、哪些允许请求签、请求想批但被丢了。
+            # 合成一条就回答不了"这次写能力到底是谁批的"。
+            "approvals_from_config": dict(self.config.approvals),
+            "grantable": sorted(self.config.grantable),
+            "ignored_approvals": [
+                {k: v for k, v in entry.items() if k != "key"} for entry in self.ignored_approvals
+            ],
         }
 
 

@@ -41,6 +41,16 @@ evidence_pulls:
 limits:
   max_calls: 5        # 外部调用预算，与 LLM 预算分列：两条都得有上界
 
-# 人在环批准的落点。骨架阶段它是运维在本文件里签的字（或 Web 请求带进来的 approvals），
-# 关键是：**模型改不了它**。write/network 没有这里的 true 就调不动。
+# 人在环批准的落点。骨架阶段它是运维在本文件里签的字，第二个入口是 Web 请求带进来的
+# `mcp_approvals`——但**只有下面这份名单里的工具**能被请求签字：
+#
+#   grantable_approvals:
+#     - mcp:soc_intel:write_note
+#
+# 名单为空 = 批准只能来自本文件（默认）。这条名单是"第二入口不变成后门"的唯一护栏：
+# 没有它，任何能发一次 HTTP 的登录用户都能给自己的 write 能力签字。
+# 过滤发生在引擎的闸门（core/mcp.py: partition_approvals），不在 API 层——
+# 所以绕过 HTTP 直接构造调用的，走的也是同一条判定。
+# 名单里点一个不存在的工具名会在装载时报错，不会安静地"批不动"。
 approvals: {}
+grantable_approvals: []

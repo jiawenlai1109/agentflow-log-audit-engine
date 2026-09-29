@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -13,22 +13,37 @@ class LoginRequest(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    """分析请求：数据源二选一。
+    """分析请求：数据源二选一，可选场景包与外部工具批准。
 
     `dataset_id` = 历史单文件路径；`bundle_id` = M2 的多文件快照。两条都缺或都给都拒——
     让调用方猜"哪个优先"是把歧义留在系统里。
+
+    `extra="forbid"` 是有牙齿的一条：默认行为是**静默忽略未知键**，于是拼错的
+    `pack`（写成 `packk`）会表现成"跑了一次普通分析"，而调用方以为自己已经在跑分诊。
+    多字段请求模型不该有这种失败方式。
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=1)
     dataset_id: int | None = None
     bundle_id: str | None = None
     mode: str = Field(default="mock", pattern="^(mock|real)$")
     session_id: str | None = None
+    pack: str | None = None
+    mcp_approvals: dict[str, bool] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "AnalyzeRequest":
         if bool(self.dataset_id) == bool(self.bundle_id):
             raise ValueError("dataset_id 与 bundle_id 必须且只能提供一个")
+        if self.pack and self.session_id:
+            # 会话表只绑一个单文件 dataset_path，接不上多源 Bundle；
+            # 让带包的续轮静默丢掉包 = 第二轮悄悄变成普通分析，那比拒掉危险得多。
+            raise ValueError(
+                "场景包运行暂不支持会话续轮：会话只绑定单文件数据集（sessions.dataset_path），"
+                "请先不带 session_id 跑包分析"
+            )
         return self
 
 
@@ -56,6 +71,9 @@ class JobOut(BaseModel):
     run_id: str | None = None
     error: str | None = None
     question: str
+    # 跑的是哪个领域场景。历史页与审计要能一眼分开"普通分析"与"分诊"——
+    # 只看问题文本分不出来，而分歧恰恰发生在"同一个问题、不同场景口径"的时候
+    pack: str | None = None
 
 
 class DatasetOut(BaseModel):

@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     question TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'mock',
     session_id TEXT,
+    pack TEXT,
     run_id TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     progress INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +114,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     # Bundle 子表带 user_id：归属谓词要能写进每一条子表查询，而不是靠"先查父行"
     "bundle_files": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
     "bundle_tables": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
+    # 场景包：本地已有库要能补上这一列，否则老库上跑新代码会在 INSERT 处直接崩
+    "jobs": {"pack": "TEXT"},
 }
 
 

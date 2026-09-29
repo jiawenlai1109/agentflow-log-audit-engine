@@ -102,6 +102,21 @@ config/mcp.yaml             # 外部 server 白名单、能力分级、出站 SQ
 
 MCP 侧复用现有的四条强制链（白名单 / 参数守卫 / 审计 / 预算），工具以 `mcp:<server>:<tool>` 注册进同一张 ToolRegistry，**不另开通道**。三条安全线：外部结果一律标 `untrusted` 且默认 `evidence_only`（只作证据，进不了数字来源池，所以它一旦被引用追溯率就判红）；默认零文件系统权限（路径类入参按键拒）；出站数据标记（发了哪些键、什么形状、给了哪个 server）。能力分 `read/compute/write/network` 四级，后两级没有人在环批准就拒——**且请求根本不会发出**。骨架自带的第一个 server 是只读 SQLite 直连（stdlib、行分隔 JSON-RPC over stdio）；resources/prompts/sampling、HTTP 传输与真实 npm server 的互操作尚未实现，边界写进 `core/mcp.py` 的 docstring。
 
+### Web 侧也能跑场景包（#33）
+
+`GET /api/packs` 列出可用场景包（连**装载失败的目录和原因**一起给），`POST /api/analyze` 收 `pack` 字段，于是 SOC 多源分诊不再只能从 CLI 进：
+
+```powershell
+# 建三源 Bundle → 带包运行 → 轮询 job → 取报告
+curl -X POST localhost:8000/api/bundles -H "Authorization: Bearer $TOK" -F "files=@demo/data/triage/auth.csv" -F "files=@demo/data/triage/assets.csv" -F "files=@demo/data/triage/edr.csv"
+curl -X POST localhost:8000/api/analyze -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" `
+  -d '{"question":"生产域主机的异常告警有哪些？哪些需要立刻处置","bundle_id":"<上一步返回>","mode":"mock","pack":"sigma_triage"}'
+```
+
+边界上有四条 422（都不留 `jobs` 行）：包名不在名单或形状不合法（`../`、大小写、空串）、数据缺包要求的列（**点名缺哪几列**）、`pack` 与会话续轮同时出现、请求批准了不在 `grantable_approvals` 名单里的外部工具。最后一条是"批准的第二入口不变成后门"的护栏：**运维点名哪些工具可由请求签字**，过滤只在 `McpHub.resolve_approvals` 一处发生——闸门与审计同一次解析，不会出现"审计写着没生效、系统其实批了"的分叉。`AnalyzeRequest` 是 `extra="forbid"`：拼成 `packk` 的键不会被静默当成"没选包"。
+
+前端还差三件事（Workbench 只有单数据集选择器、`DatasetsView` 那条"追问"是第二个无进度流的调用方、选包时要禁会话），已单列待办；活体探针是 `scripts/e2e_packs.py`（真起服务 + 真 multipart + 临时库，14 项断言；不碰本机 `.appdata/app.db`）。
+
 ## 评估 harness
 
 自动化评估是这套运行时的一部分，不是事后补的报表：
@@ -178,7 +193,7 @@ evals/          # 冻结评测集 suite.yaml（27 题）+ 基线 baseline.json
 scripts/        # CLI 入口、demo 数据生成（零售/登录日志/SOC 三源/外部情报库）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
 .github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
 demo/data/      # 固定验收数据集（含 triage/ 三源与 soc_intel.sqlite）
-tests/          # 366 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档/skill/MCP）
+tests/          # 371 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档/skill/MCP）
 outputs/        # 运行产物（不入 git）
 ```
 
@@ -189,8 +204,8 @@ outputs/        # 运行产物（不入 git）
 ## 测试与质量
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q     # 366 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 371 passed
 .\.venv\Scripts\python.exe scripts\run_eval.py   # 27/27 pass，gate 断言 125 全绿（gap 12 条按设计全红）
 ```
 
-测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）→ 289（+18 报告分档闸门、+3 评分器与量具用例）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。
+测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）→ 289（+18 报告分档闸门、+3 评分器与量具用例）→ 366（+77 M4 能力面：prompts 32 / skill 25 / MCP 20）→ 371（+5 配置路径不再静默退默认，含变异复测用例）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。

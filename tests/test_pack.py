@@ -11,7 +11,14 @@ import pytest
 import yaml
 
 from agentflow.core.executor import LocalBackend
-from agentflow.core.pack import SEVERITY_ORDER, load_pack, pack_plan_tasks, verify_findings
+from agentflow.core.pack import (
+    SEVERITY_ORDER,
+    available_columns_from,
+    load_pack,
+    missing_required,
+    pack_plan_tasks,
+    verify_findings,
+)
 from agentflow.core.tools import DEFAULT_TOOL_WHITELIST, _check_report, _validate_rules
 from agentflow.pipeline import run_analysis
 
@@ -237,3 +244,62 @@ def test_whitelist_contains_verify_findings():
         (PROJECT_ROOT / "config" / "agents.yaml").read_text(encoding="utf-8")
     )
     assert "verify_findings" in cfg["agents"]["inspector"]["tools"]
+
+# ---------------------------------------------------------------- 包名是授权面
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["../packs", "../../etc/passwd", "a/b", "sigma_triage/", "..", "x" * 65, " login_audit", ""],
+)
+def test_load_pack_refuses_names_that_are_not_plain_directory_names(bad_name):
+    """包名进 `PACKS_DIR / name` 之前先过形状检查。
+
+    Web 层会再按"可用包名单"拒一次，但那是第二道：引擎侧的下限不能依赖调用方自觉——
+    将来任何新入口（批次、定时任务、别的传输层）忘了查名单，就直接把仓库上一级目录当成包目录读了。
+    名单会漏，形状校验不会。
+    """
+    with pytest.raises(ValueError, match="非法场景包名"):
+        load_pack(bad_name)
+
+
+def test_list_packs_reports_broken_dirs_instead_of_hiding_them(tmp_path, monkeypatch):
+    """发现与运行同一份判据：能装载的进 packs，装不起来的进 broken（带原因），不静默蒸发。"""
+    from agentflow.core import pack as pack_module
+
+    real = pack_module.PACKS_DIR
+    good = tmp_path / "good_pack"
+    good.mkdir()
+    (good / "rules.yaml").write_text(        "pack:" + chr(10) + "  name: good_pack" + chr(10) + "rules:" + chr(10) + "  - id: G1" + chr(10),
+        encoding="utf-8",
+    )
+    (good / "report_template.md").write_text("# G1 清单" + chr(10), encoding="utf-8")
+    (tmp_path / "bad_pack").mkdir()
+    (tmp_path / "bad_pack" / "rules.yaml").write_text("rules: []" + chr(10), encoding="utf-8")
+    monkeypatch.setattr(pack_module, "PACKS_DIR", tmp_path)
+    try:
+        packs, broken = pack_module.list_packs()
+        assert [item.name for item in packs] == ["good_pack"]
+        assert [item["dir"] for item in broken] == ["bad_pack"], "坏包要被列出来而不是蒸发"
+        assert sorted(item.name for item in packs) == sorted(pack_module.pack_names())
+    finally:
+        monkeypatch.setattr(pack_module, "PACKS_DIR", real)
+
+
+def test_available_columns_from_is_the_shared_judge():
+    """边界预检与 planner 预检共用同一套底层：别名归一只在 `pack.canonical` 一处发生。"""
+    pack = load_pack("sigma_triage")
+    complete = available_columns_from(
+        pack,
+        [
+            ["time", "account", "auth_result", "service", "src_ip", "严重级"],
+            ["主机", "是否生产"],
+        ],
+    )
+    assert "主机" in complete, "src_ip 应当被包内别名认成同一实体"
+    assert missing_required(pack, complete) == [], "列齐时不该报缺列"
+    partial = available_columns_from(
+        pack,
+        [["time", "account", "auth_result", "service", "src_ip", "严重级"]],
+    )
+    assert missing_required(pack, partial) == ["是否生产"], "缺资产台账时要点名这一列"

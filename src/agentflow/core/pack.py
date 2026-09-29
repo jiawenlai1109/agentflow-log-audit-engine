@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]  # core/pack.py → agentflow → src → 项目根
 PACKS_DIR = PROJECT_ROOT / "packs"
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# 场景包名是**授权面**的一部分，不是展示字符串：一旦 Web/API 收下调用方给的包名，
+# `PACKS_DIR / name` 里带 `..` 或路径分隔符就能把仓库上一级目录当成包目录读进来。
+# 这里按名字形状先拒（引擎侧下限），API 侧再按"可用包名单"拒（业务侧下限）。
+PACK_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
 
 
 @dataclass
@@ -101,6 +107,11 @@ def load_pack(name: str) -> ScenarioPack:
     """装载场景包；目录/规则缺失即抛 ValueError（由编排器走降级路径）。"""
     import yaml
 
+    if not PACK_NAME_RE.match(str(name)):
+        raise ValueError(
+            f"非法场景包名：{name!r}（只允许字母/数字/下划线开头，可含 . 与 -，长度 ≤64，"
+            "不接受路径分隔符或 ..）"
+        )
     root = PACKS_DIR / name
     rules_path = root / "rules.yaml"
     template_path = root / "report_template.md"
@@ -174,16 +185,73 @@ def role_env(pack: ScenarioPack, bundle: Any, rule: PackRule) -> dict[str, str]:
     }
 
 
+def list_packs() -> tuple[list[ScenarioPack], list[dict[str, str]]]:
+    """列出可用场景包，返回 (可用的包, 坏掉的目录及原因)。
+
+    坏目录**不静默跳过**：装载失败被藏起来，用户只会看到"没有这个场景包"，
+    而那通常是 rules.yaml 少了一行——和"配置静默不生效"是同一类事故。
+    这里只读目录，不改变 `load_pack` 的严格性：真要跑，仍然只有可用的包能跑。
+
+    没有 `packs_dir` 参数是刻意的：装载走的是模块级 `PACKS_DIR`，发现若另开一个目录参数，
+    就会出现"在 A 目录列出的包、去 B 目录装载"的第二个真源（测试通过 monkeypatch
+    `PACKS_DIR` 换目录，两条路径自然同源）。
+    """
+    root = PACKS_DIR
+    if not root.exists():
+        return [], []
+    packs: list[ScenarioPack] = []
+    broken: list[dict[str, str]] = []
+    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+        if not PACK_NAME_RE.match(directory.name):
+            broken.append({"dir": directory.name, "reason": "目录名不是合法的场景包名"})
+            continue
+        try:
+            packs.append(load_pack(directory.name))
+        except Exception as error:  # noqa: BLE001 - 发现过程要把每一份坏包的原因原样带回去
+            broken.append({"dir": directory.name, "reason": f"{type(error).__name__}: {str(error)[:200]}"})
+    return packs, broken
+
+
+def pack_names() -> set[str]:
+    """可运行的场景包名集合（API 侧的白名单就取这里，不在别处再维护一份）。"""
+    packs, _broken = list_packs()
+    return {pack.name for pack in packs}
+
+
+def available_columns_from(
+    pack: ScenarioPack, table_columns: Iterable[Sequence[Any]]
+) -> set[str]:
+    """给定"若干张表各自的列名"，算出这批数据能提供的规范列全集。
+
+    单独抽出来是为了让**边界预检**（HTTP 派发前）与**规划预检**（planner 内）用同一个判据：
+    前者手上只有 `datasets.columns` 里存的字符串数组，后者有真 Bundle，两处若各写一遍
+    别名归一，就会出现在界面上放行、跑起来才缺列的分叉结果。
+    """
+    columns: set[str] = set()
+    for names in table_columns:
+        columns |= {pack.canonical(str(column)) for column in (names or [])}
+    return columns
+
+
+def missing_required(pack: ScenarioPack, available: set[str]) -> list[str]:
+    """必需列里这批数据给不出来的那些，保持包内声明顺序。
+
+    判"缺不缺"只有这一处：派发前的边界预检（Web 层）与派发时的规划预检（planner）
+    必须给出**同一个清单**，否则会出现界面上放行、跑起来才拒的分叉。
+    """
+    return [column for column in pack.required_columns if column not in available]
+
+
 def available_columns(pack: ScenarioPack, bundle: Any) -> set[str]:
     """这个 Bundle 能提供的规范列全集（跨所有表，按别名归一）。
 
     场景包的必需列校验原先只看主表——多源输入下 `域` 在资产表、`auth_result` 在防火墙表，
     只看主表会把合法的多源包判成"缺列"。
     """
-    columns: set[str] = set()
-    for table in getattr(bundle, "tables", []) or []:
-        columns |= {pack.canonical(column) for column in table.columns}
-    return columns
+    return available_columns_from(
+        pack,
+        (getattr(table, "columns", []) or [] for table in (getattr(bundle, "tables", []) or [])),
+    )
 
 
 def pack_plan_tasks(pack: ScenarioPack, bundle: Any = None) -> list[dict[str, Any]]:

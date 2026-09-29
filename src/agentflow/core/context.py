@@ -89,7 +89,8 @@ class RunContext:
     pack: Any = None  # 场景包（ScenarioPack）：登录审计等领域规则包（工作规划 §6.2）
     skills: Any = None  # 已装载的方法（SkillSet）：谁被注入、谁被拒装
     mcp: Any = None  # 外部工具门面（McpHub）：None = 本次一个外部 server 都没接
-    mcp_approvals: dict[str, bool] = field(default_factory=dict)  # 人在环批准结果（write/network 必需）
+    mcp_approvals: dict[str, bool] = field(default_factory=dict)  # 请求侧签字（由 hub 按 grantable 名单过滤）
+    run_origin: dict[str, Any] = field(default_factory=dict)  # 这次运行从哪来、谁批准的：只用于留痕，不参与判定
     external_evidence: list[dict[str, Any]] = field(default_factory=list)  # 外部证据（只作证据，不进数字来源）
     clarify: dict[str, Any] | None = None  # v1.2：非阻塞澄清请求
     join_preflight: dict[str, Any] = field(default_factory=dict)  # M2-3：派发前 join 预检留痕

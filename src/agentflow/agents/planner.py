@@ -17,6 +17,7 @@ from agentflow.core.memory import (
 )
 from agentflow.core.messages import AgentMessage
 from agentflow.core.pack import available_columns as pack_available_columns
+from agentflow.core.pack import missing_required as pack_missing
 from agentflow.core.pack import pack_plan_tasks
 from agentflow.schemas.clarify import ClarifyRequest
 from agentflow.schemas.plan import TaskList
@@ -77,8 +78,8 @@ class PlannerAgent(BaseAgent):
         if message.kind == "replan_request":
             return self._pack_replan(ctx, message)
         pack = ctx.pack
-        available = pack_available_columns(pack, ctx.bundle)
-        missing = [col for col in pack.required_columns if col not in available]
+        # 缺列判据只有 pack.py 一处：边界预检与这里必须给同一份清单
+        missing = pack_missing(pack, pack_available_columns(pack, ctx.bundle))
         if missing:
             raise ValueError(
                 f"数据缺少场景包 {pack.name} 必需列：{'、'.join(missing)}"

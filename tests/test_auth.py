@@ -103,6 +103,7 @@ PROTECTED = [
     ("post", "/api/datasets"),
     ("delete", "/api/datasets/1"),
     ("post", "/api/analyze"),
+    ("get", "/api/packs"),
     ("get", "/api/jobs/job_nope"),
     ("get", "/api/jobs/job_nope/events"),
     ("get", "/api/sessions"),

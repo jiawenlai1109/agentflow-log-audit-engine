@@ -32,6 +32,7 @@ from agentflow.core.mcp import (  # noqa: E402
 from agentflow.core.tools import ToolError, build_default_registry  # noqa: E402
 
 INTEL_DB = ROOT / "demo" / "data" / "soc_intel.sqlite"
+TRIAGE = ROOT / "demo" / "data" / "triage"
 SERVER_MODULE = "agentflow.mcp_servers.sqlite_server"
 
 
@@ -351,13 +352,35 @@ def test_registered_tool_names_are_three_part_and_marked_external():
         registry.register_mcp_tool(name="mcp:soc_intel", description="", handler=lambda **kw: None)
 
 
-def test_absent_config_means_no_external_server_at_all(tmp_path):
-    registry = build_default_registry(load_config(None))
-    assert attach_tools(registry, load_config(None), config_path=tmp_path / "nope.yaml") is None
-    from agentflow.core.tools import ToolError as _ToolError
+def test_absent_default_config_means_no_external_server(tmp_path, monkeypatch):
+    """默认路径下没有 `config/mcp.yaml` = 一个外部 server 都不接（正常状态，不是错误）。"""
+    from agentflow.core import mcp as mcp_module
 
-    with pytest.raises(_ToolError, match="未注册的工具"):
+    monkeypatch.setattr(mcp_module, "DEFAULT_MCP_CONFIG_PATH", tmp_path / "absent.yaml")
+    registry = build_default_registry(load_config(None))
+    assert attach_tools(registry, load_config(None)) is None
+    from agentflow.core.tools import ToolError
+
+    with pytest.raises(ToolError, match="未注册的工具"):
         registry.get("mcp:soc_intel:query")
+
+
+def test_explicitly_named_mcp_config_must_exist(tmp_path):
+    """显式点名了外部 server 配置却读不到 ⇒ 报错，不能退成"什么都没接"。
+
+    与 `load_config` 同一条规矩：否则"以为接了情报库"与"压根没接"在下游长成同一个样子
+    （只是 external_evidence 为空），而这两种情况的处置完全不同。
+    """
+    registry = build_default_registry(load_config(None))
+    with pytest.raises(FileNotFoundError, match="MCP 配置不存在"):
+        attach_tools(registry, load_config(None), config_path=tmp_path / "typo.yaml")
+
+
+def test_config_with_no_servers_is_not_an_error(tmp_path):
+    registry = build_default_registry(load_config(None))
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("servers: []\n", encoding="utf-8")
+    assert attach_tools(registry, load_config(None), config_path=empty) is None
 
 
 # ---------------------------------------------------------------- server 自带的下限
@@ -392,6 +415,153 @@ def test_server_forces_an_outer_limit():
     assert len(payload["rows"]) == 2 and payload["truncated"] is True
     with pytest.raises(McpError):  # server 侧 isError 回传，不当成成功空集
         hub.invoke("db", "query", {"sql": "DELETE FROM intel"}, agent_name="explorer")
+
+
+
+
+# ---------------------------------------------------------------- 请求侧批准（第二入口）
+
+
+def _write_db_config(tmp_path: Path, approvals: dict[str, bool], grantable: list[str]):
+    """起一只真带 write 工具的 server，批准与可授予名单都按参数给。"""
+    import yaml
+
+    database = tmp_path / "note.db"
+    sqlite3.connect(database).close()
+    config = {
+        "servers": [
+            {
+                "name": "db",
+                "command": [
+                    "{python}", "-m", SERVER_MODULE,
+                    "--db", str(INTEL_DB), "--writable-db", str(database),
+                ],
+                "allowed_agents": ["explorer"],
+                "tools": [{"name": "write_note", "tier": "write"}],
+            }
+        ],
+        "approvals": approvals,
+        "grantable_approvals": grantable,
+    }
+    path = tmp_path / "mcp.yaml"
+    path.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+    return load_mcp_config(path)
+
+
+def test_request_approval_only_counts_for_grantable_tools(tmp_path):
+    """第二入口的正面与反面：名单里 ⇒ 请求签字生效；名单外 ⇒ 照旧拒，并留下"被丢掉"的痕迹。
+
+    这条刻意**不经 HTTP**直接调 hub：判定权如果在 API 层，绕过 API 的调用方就把闸门绕开了。
+    """
+    transcript = FakeTranscript()
+    config = _write_db_config(tmp_path, approvals={}, grantable=["mcp:db:write_note"])
+    hub = _hub(config, transcript=transcript)
+    outcome = hub.invoke(
+        "db", "write_note", {"host": "h", "note": "n"},
+        agent_name="explorer", approvals={"mcp:db:write_note": True},
+    )
+    assert outcome["result"]["inserted"] is True
+
+    other = _write_db_config(tmp_path, approvals={}, grantable=[])
+    hub2 = _hub(other, transcript=transcript)
+    with pytest.raises(McpApprovalRequired):
+        hub2.invoke(
+            "db", "write_note", {"host": "h", "note": "n"},
+            agent_name="explorer", approvals={"mcp:db:write_note": True},
+        )
+    ignored = transcript.find("mcp_approval_ignored")
+    assert ignored and ignored[0]["tool"] == "mcp:db:write_note"
+    assert hub2.summary()["ignored_approvals"], "被丢掉的批准也要进 summary"
+
+
+def test_request_may_revoke_a_grantable_config_approval(tmp_path):
+    """降权永远安全：运维签过的，请求可以这一次不消。"""
+    config = _write_db_config(
+        tmp_path, approvals={"mcp:db:write_note": True}, grantable=["mcp:db:write_note"]
+    )
+    hub = _hub(config)
+    with pytest.raises(McpApprovalRequired):
+        hub.invoke(
+            "db", "write_note", {"host": "h", "note": "n"},
+            agent_name="explorer", approvals={"mcp:db:write_note": False},
+        )
+
+
+def test_ungrantable_names_are_visible_in_the_summary(tmp_path):
+    config = _write_db_config(tmp_path, approvals={"mcp:db:write_note": True}, grantable=[])
+    summary = _hub(config).summary()
+    assert summary["approvals_from_config"] == {"mcp:db:write_note": True}
+    assert summary["grantable"] == [], "名单是空的这件事本身要能被查见"
+
+
+def test_grantable_naming_an_absent_tool_fails_at_load(tmp_path):
+    """名单里点了不存在的工具 ⇒ 装载就报错。
+
+    留到运行时的样子是"我明明批了却还是缺批准"，那种红看着像闸门坏了，
+    其实是配置写错了名字——两类原因必须在这里就分开。
+    """
+    import yaml
+
+    payload = {
+        "servers": [
+            {
+                "name": "db",
+                "command": ["{python}", "-m", SERVER_MODULE, "--db", str(INTEL_DB)],
+                "tools": [{"name": "query", "tier": "read"}],
+            }
+        ],
+        "grantable_approvals": ["mcp:db:no_such_tool"],
+    }
+    path = tmp_path / "mcp.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="并不存在"):
+        load_mcp_config(path)
+
+
+def test_partition_approvals_is_a_pure_function():
+    """纯函数级钉住语义：名单外只丢真值（false 本来就是 no-op，不该报"被拒"）。"""
+    from agentflow.core.mcp import McpConfig, partition_approvals
+
+    config = McpConfig(servers=[], grantable=frozenset({"mcp:a:b"}))
+    accepted, rejected = partition_approvals(
+        config, {"mcp:a:b": True, "mcp:x:y": True, "mcp:q:r": False, "mcp:a:b2": False}
+    )
+    assert accepted == {"mcp:a:b": True}
+    assert rejected == ["mcp:x:y"]
+
+
+def test_run_origin_and_approval_breakdown_reach_the_transcript(tmp_path):
+    """批准链有第二个入口之后，"谁批的、批了算不算数"必须查得回来。
+
+    这里走真 run_analysis（不经 HTTP），用仓库默认 MCP 配置：
+    `grantable_approvals` 默认为空 ⇒ 请求带来的签字应当**全部被丢**，
+    而 `mcp_attached` 事件要同时留下"运维签的""请求想批的""被丢的"三栏。
+    """
+    from agentflow.pipeline import run_analysis
+
+    result = run_analysis(
+        "生产域主机的异常告警有哪些",
+        [str(TRIAGE / "auth.csv"), str(TRIAGE / "assets.csv"), str(TRIAGE / "edr.csv")],
+        outputs_root=tmp_path,
+        pack="sigma_triage",
+        mcp_approvals={"mcp:soc_intel:write_note": True},
+        run_origin={"source": "web", "actor_user_id": 7, "actor_username": "p_owner"},
+    )
+    entries = [
+        json.loads(line)
+        for line in (Path(result["outputs_dir"]) / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    attached = [entry for entry in entries if entry.get("event") == "mcp_attached"][0]
+    assert attached["approvals_requested"] == {"mcp:soc_intel:write_note": True}
+    assert attached["approvals_accepted"] == {}, "默认名单为空，请求签字不该生效"
+    assert attached["approvals_rejected"] == ["mcp:soc_intel:write_note"]
+    assert attached["grantable"] == []
+    origin = [entry for entry in entries if entry.get("event") == "run_origin"][0]
+    assert origin["actor_username"] == "p_owner" and origin["source"] == "web"
+    # 外部证据照旧只作证据：报告里不许出现只存在于外部库的那个数字
+    report = (Path(result["outputs_dir"]) / "report.md").read_text(encoding="utf-8")
+    assert "4242" not in report
 
 
 # ---------------------------------------------------------------- 数字来源这条线（I1）
