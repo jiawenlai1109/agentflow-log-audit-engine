@@ -1,6 +1,7 @@
 """v1.2 机制回归测试：白名单强制 / grants 授权 / 独立校验 / 错误路由与澄清 / 有界历史 / recall 回退。"""
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -305,10 +306,14 @@ def test_parse_window_days():
 EXTENDED = "\\\\?\\"   # Windows 扩展长度路径前缀：\\?\
 
 
+@pytest.mark.skipif(os.name != "nt", reason="\\?\\ 是 Windows 特有的扩展长度路径前缀")
 def test_key_normalizes_forms_but_resolve_keeps_the_capable_one():
     r"""比较走 `_key`（归一形态），放行/读写走 `_resolve`（保留真值）。
 
     超过 260 字符的路径确实要靠 `\\?\` 前缀才能打开，所以归一只能发生在比较侧。
+    这条测的就是 Windows 的那层形态：Linux 上 `_resolve` 会把整串当成一个相对文件名，
+    `\\?\` 前缀根本不存在，断言的语义在别的平台上没有对应物——所以标平台门，
+    而不是把断言放宽成"两边都过"。
     """
     from agentflow.core.tools import _key, _resolve
 

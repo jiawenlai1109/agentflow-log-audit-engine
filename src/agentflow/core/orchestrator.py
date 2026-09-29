@@ -28,21 +28,38 @@ from agentflow.core.transcript import TranscriptWriter
 _FRAME_RE = re.compile(r'File "[^"]+", line \d+(?:, in [^\n]*)?')
 _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"<>|]+|/(?:Users|home|var|tmp|opt|usr|private|appdata)[^\s'\"<>|]*", re.IGNORECASE)
 _LINE_NO_RE = re.compile(r"\bline \d+\b", re.IGNORECASE)
+# 纯栈帧行与 traceback 里的波浪线指示行：它们不是"错误说的是什么"，一句都不该进正文
+_FRAME_LINE_RE = re.compile(r'^File "[^"]*", line \d+(, in .*)?$')
+_CARET_LINE_RE = re.compile(r"^[\^~\s]+$")
+_ERROR_SUMMARY_RE = re.compile(r"\w*(Error|Exception|Warning)\s*:")
 
 
 def display_error(error: Any, limit: int = 300) -> str:
     """把错误正文压成一句可以说给用户听的话：挑出异常摘要行，再抹掉栈帧、绝对路径与行号。
 
-    取"最后一行像异常摘要的那行"而不是首行：子进程 stderr 的末行才是 `KeyError: '利润率'`
+    取"像异常摘要的那一行"而不是首行：子进程 stderr 的末行才是 `KeyError: '利润率'`
     这种可行动信息，首行往往是 `Traceback (most recent call last):` 或被截断剩下的半条路径。
+
+    挑不到摘要行时**宁可说一句"没取到"**，也不回落到某一行栈帧——CI 上就发生过：
+    上游先把正文截到 500 字，Linux 的检出路径更长，于是 `KeyError` 那行被截掉了，
+    报告里剩下 `失败原因：File "<路径>` 这种谁也不懂的话。**脱敏脱成不可读，等于没脱敏**。
     """
     text = str(error or "").strip()
     if not text:
         return "（无错误详情）"
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    summary = lines[-1]
-    for line in reversed(lines):
-        if re.search(r"(\w*Error|\w*Exception|\w*Warning)\s*:", line):
+    candidates = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+        and not _FRAME_LINE_RE.match(line.strip())
+        and not _CARET_LINE_RE.match(line.strip())
+        and not line.strip().startswith("Traceback (most recent call last)")
+    ]
+    if not candidates:
+        return "（未取到异常摘要，完整记录见 transcript 的 run_failed_traceback）"
+    summary = candidates[-1]
+    for line in reversed(candidates):
+        if _ERROR_SUMMARY_RE.search(line):
             summary = line
             break
     cleaned = _FRAME_RE.sub("<栈帧>", summary)
@@ -157,7 +174,9 @@ class Orchestrator:
                 ctx.degraded_reason = "pack_contract"
                 failure_info = {
                     "error_class": exc.error_class,
-                    "error": str(exc)[:500],
+                    # 2000 而不是 500：摘要行是在展示侧挑的，截得太短会把摘要行本身截掉
+                    # （CI 上 Linux 检出路径更长，500 字里只剩栈帧，报告就变成 `File "<路径>`）
+                    "error": str(exc)[:2000],
                     "suggestion": exc.suggestion,
                     "missing_columns": exc.missing,
                 }
@@ -169,7 +188,7 @@ class Orchestrator:
                     # 这里留原文：脱敏发生在写报告的那一步（`display_error`），
                     # 而 transcript 与本报告共用这一份 failure_info——两处各脱一次敏，
                     # 就会出现"报告干净、别处漏"的分叉。
-                    "error": str(exc)[:500],
+                    "error": str(exc)[:2000],
                     "suggestion": (
                         "检查 LLM 配置（OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）"
                         if is_llm_error
@@ -184,7 +203,8 @@ class Orchestrator:
             transcript.write(
                 {"event": "run_failed_traceback", "traceback": traceback.format_exc()[-3000:]}
             )
-            self._emit({"type": "error", "error": str(exc)[:500]})
+            # 第三条出口：SSE 事件会进浏览器与访问日志，同样只说脱敏后的那一句
+            self._emit({"type": "error", "error": display_error(exc)})
         finally:
             duration = round(time.monotonic() - started, 3)
             self._write_evaluation(ctx, status, duration)

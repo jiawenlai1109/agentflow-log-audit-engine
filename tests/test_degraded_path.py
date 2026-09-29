@@ -107,20 +107,79 @@ class _BoomLLM:
         raise RuntimeError(self.text)
 
 
+def test_display_error_finds_the_summary_beyond_the_first_500_chars():
+    """摘要行离得很远也要挑得出来——CI 上挂的就是这一条。
+
+    现场：GitHub Actions 的检出路径比本机长，`failure_info["error"]` 被截到 500 字之后
+    `KeyError: '利润率'` 那行整个被切掉，于是报告里剩下 `失败原因：File "<路径>`。
+    这条用例与路径长度、平台都无关：直接把"摘要行在第 500 字之后"这个形状写死。
+    """
+    deep = "".join(
+        f'  File "/home/runner/work/agentflow-log-audit-engine/agentflow-log-audit-engine'
+        f'/deep/nested/frame_{i}.py", line {1000 + i}, in helper_{i}\n'
+        for i in range(6)
+    )
+    text = f"Traceback (most recent call last):\n{deep}KeyError: '利润率'"
+    assert len(text) > 500, "前提：摘要行确实落在 500 字之外"
+    shown = display_error(text)
+    assert "利润率" in shown, shown
+    assert "frame_" not in shown and "1005" not in shown, shown
+
+
+def test_run_level_summary_survives_a_long_checkout_path(tmp_path):
+    """把 CI 那个失败形状钉成用例：检出路径很长 ⇒ 摘要行落在 500 字之外。
+
+    修之前 CI 报的是 `失败原因：File "<路径>`；这条走的是**真实代码路径**
+    （异常 → `failure_info` → 降级报告），不是只测 `display_error` 一个函数。
+    """
+    deep = "".join(
+        f'  File "/home/runner/work/agentflow-log-audit-engine/agentflow-log-audit-engine'
+        f'/deep/nested/frame_{i}.py", line {1000 + i}, in helper_{i}\n'
+        for i in range(8)
+    )
+    long_traceback = f"Traceback (most recent call last):\n{deep}KeyError: '利润率'"
+    assert len(long_traceback) > 500, "前提：摘要行在 500 字之外，正是 CI 的形状"
+    result = run_analysis(
+        question="各品类销售额是多少？",
+        sources=str(PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"),
+        mode="mock",
+        llm=_BoomLLM(long_traceback),
+        outputs_root=tmp_path,
+    )
+    report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
+    assert "利润率" in report, report[:600]
+    assert "frame_" not in report and "1007" not in report, report[:600]
+
+
+def test_display_error_refuses_to_print_a_bare_frame_line():
+    """只剩栈帧时宁可说"没取到摘要"，也不把一行 `File "…"` 端给用户。"""
+    only_frames = 'Traceback (most recent call last):\n  File "/a/b/c.py", line 9, in <module>\n'
+    shown = display_error(only_frames)
+    assert "未取到异常摘要" in shown, shown
+    assert "File" not in shown and "c.py" not in shown, shown
+
+
 def test_run_level_degraded_report_is_sanitized_too(tmp_path):
     """降级报告有两条出口：任务失败的模板与运行级兜底。只堵一条等于没堵。"""
+    events: list[dict] = []
     result = run_analysis(
         question="各品类销售额是多少？",
         sources=str(PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"),
         mode="mock",
         llm=_BoomLLM(REAL_TRACEBACK),
         outputs_root=tmp_path,
+        on_event=events.append,
     )
     assert result["status"] == "degraded"
     report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
     assert ".venv" not in report and "site-packages" not in report, report[:600]
     assert str(PROJECT_ROOT)[:8] not in report, report[:600]
     assert "利润率" in report, "脱敏之后仍要说清到底哪儿错了"
+
+    # 第三条出口：SSE 的 error 事件会进浏览器与访问日志，同样不许带环境布局
+    emitted = json.dumps([e for e in events if e.get("type") == "error"], ensure_ascii=False)
+    assert emitted != "[]", "没有 error 事件 ⇒ 这条出口没被走到，断言是空的"
+    assert ".venv" not in emitted and "site-packages" not in emitted, emitted[:400]
 
 
 def test_sanitizing_the_report_does_not_blind_the_fact_layer(tmp_path):
