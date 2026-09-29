@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -253,9 +255,21 @@ class Bundle:
         }
 
     def write(self) -> Path:
+        """清单是**发布的最后一步**，而且原子替换：在场就等于全套都在。
+
+        读侧（`pipeline._load_cached_bundle`）把"manifest 存在 + 成员数对得上"当作
+        缓存可用的唯一信号，所以这里不能边写边被看见。
+        """
         self.root.mkdir(parents=True, exist_ok=True)
         target = self.root / MANIFEST_NAME
-        target.write_text(json.dumps(self.manifest(), ensure_ascii=False, indent=2), encoding="utf-8")
+        staging = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex[:8]}")
+        try:
+            staging.write_text(
+                json.dumps(self.manifest(), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(staging, target)
+        finally:
+            staging.unlink(missing_ok=True)
         return target
 
     @classmethod

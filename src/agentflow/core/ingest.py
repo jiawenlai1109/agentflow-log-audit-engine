@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -139,7 +141,8 @@ def importlib_import(package: str) -> None:
 def _copy_to_sources(bundle: Bundle, path: Path) -> Path:
     target = bundle.root / SOURCES_DIR / path.name
     if target.resolve() != path.resolve():
-        shutil.copyfile(path, target)
+        # 原件副本同样走"临时名 + rename"：读者拿到的一定是完整的一份原件
+        _write_atomically(target, lambda staging: shutil.copyfile(path, staging))
     return target
 
 
@@ -219,6 +222,22 @@ def _read_excel_or_parquet(path: Path, suffix: str) -> pd.DataFrame:
         raise IngestError(f"解析失败：{str(error)[:120]}") from error
 
 
+def _write_atomically(target: Path, writer: Callable[[Path], Any]) -> Path:
+    """先写临时名、再整体 rename —— 读者只会看到"旧的完整一份"或"新的完整一份"。
+
+    Bundle 缓存是跨 run 共享的目录，而归一化是好几个文件依次落盘。没有这一步时，
+    并发冷启动的第二个请求可能读到"表文件已存在、内容只写了一半"的状态。
+    rename 在同盘理论上是原子的；跨进程竞争由调用方的目录锁 + "manifest 最后写"兜住。
+    """
+    staging = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex[:8]}")
+    try:
+        writer(staging)
+        os.replace(staging, target)
+    finally:
+        staging.unlink(missing_ok=True)
+    return target
+
+
 def _store_table(
     bundle: Bundle, frame: pd.DataFrame, source_file: str, source_path: Path, digest: str, encoding: str
 ) -> Table:
@@ -227,7 +246,9 @@ def _store_table(
     frame.columns = [str(name).strip() for name in frame.columns]
     normalized = bundle.root / TABLES_DIR / f"{table_id}.csv"
     # utf-8-sig：让 Excel 与下游 pandas 都不用猜编码
-    frame.to_csv(normalized, index=False, encoding="utf-8-sig")
+    _write_atomically(
+        normalized, lambda target: frame.to_csv(target, index=False, encoding="utf-8-sig")
+    )
     return Table(
         id=table_id,
         source_file=source_file,

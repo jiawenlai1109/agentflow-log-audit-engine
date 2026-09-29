@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,34 @@ def _bundle_fingerprint(sources: list[Path]) -> str:
     return digest.hexdigest()[:12]
 
 
+_BUNDLE_LOCKS: dict[str, threading.Lock] = {}
+_BUNDLE_LOCKS_GUARD = threading.Lock()
+
+
+def _bundle_lock(key: str) -> threading.Lock:
+    """锁按缓存目录分，不是全局一把：不同批源文件之间不该互相排队。"""
+    with _BUNDLE_LOCKS_GUARD:
+        lock = _BUNDLE_LOCKS.get(key)
+        if lock is None:
+            lock = _BUNDLE_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _load_cached_bundle(root: Path, expected_members: int) -> Any:
+    """读缓存：清单不在、读坏了、成员数对不上，一律当"没有缓存"，绝不当"部分可用"。"""
+    from agentflow.core.bundle import Bundle
+
+    if not (root / "manifest.json").exists():
+        return None
+    try:
+        cached = Bundle.load(root)
+    except Exception:  # noqa: BLE001 - 一次坏 manifest 不该卡住所有跑批
+        return None
+    if len(cached.tables) + len(cached.documents) != expected_members:
+        return None
+    return cached
+
+
 def as_bundle(sources: Any, outputs_root: Path) -> Any:
     """把"Bundle / 单个路径 / 路径列表"归一成一个 Bundle。
 
@@ -115,14 +144,18 @@ def as_bundle(sources: Any, outputs_root: Path) -> Any:
     if not paths:
         raise ValueError("没有输入文件")
     root = outputs_root / "bundles" / f"bd_{_bundle_fingerprint(paths)}"
-    if (root / "manifest.json").exists():
-        try:
-            cached = Bundle.load(root)
-        except Exception:  # noqa: BLE001 - 缓存坏了就重建，别让一次坏 manifest 卡住所有跑批
-            cached = None
-        if cached is not None and len(cached.tables) + len(cached.documents) == len(paths):
+    # 这份缓存跨 run 共享，而"建缓存"是一串文件写入：两个请求同时冷启动同一批文件时，
+    # 后来者可能读到半成品（表落了一半、manifest 还没写），于是拿到少一张表的快照。
+    # 三道下限：①按目录加锁，同进程内串行（Web 的 max_workers=2 就是同进程）；
+    # ②每个文件写临时名再整体 rename（见 ingest 的 `_atomic_replace`），读者不会读到半个 csv；
+    # ③manifest 最后写且原子替换——"清单在场"就等于"全套都在"，读侧只有这两种状态，没有中间态。
+    # 不用"整目录建到临时名再 rename"：Bundle 的 manifest 存的是表的**绝对路径**，
+    # 目录一换名那些路径就指向已经不存在的目录（这条是改第一版把 4 条流水线用例跑红学到的）。
+    with _bundle_lock(str(root)):
+        cached = _load_cached_bundle(root, len(paths))
+        if cached is not None:
             return cached
-    return build_bundle(paths, root, strict=True)
+        return build_bundle(paths, root, strict=True)
 
 
 def run_analysis(

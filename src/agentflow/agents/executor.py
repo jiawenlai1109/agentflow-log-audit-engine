@@ -8,9 +8,11 @@ from typing import Any
 
 from agentflow.agents.base import BaseAgent
 from agentflow.core import dataset_scope
+from agentflow.core.executor import ExecutionOutcome
 from agentflow.core.llm import LLMError, MockLLM, extract_json
 from agentflow.core.memory import clean_summary
 from agentflow.core.messages import AgentMessage
+from agentflow.core.tools import ToolError
 from agentflow.schemas.result import ErrorClass, TaskExecutionResult
 from agentflow.core.prompts import load_prompt
 
@@ -53,6 +55,7 @@ class ExecutorAgent(BaseAgent):
         result: TaskExecutionResult | None = None
         last_outcome: Any = None
         last_error_text: str | None = None
+        attempts_used = 0
         max_attempts = int(
             ctx.config.get("execution", {}).get("max_executor_attempts", 3)
         )
@@ -60,6 +63,7 @@ class ExecutorAgent(BaseAgent):
         bumped_timeout = False
 
         for attempt in range(1, max_attempts + 1):
+            attempts_used = attempt
             try:
                 code = self.complete(
                     ctx, self._task_prompt(ctx, task), messages=history.to_llm_messages()
@@ -75,11 +79,11 @@ class ExecutorAgent(BaseAgent):
                 )
                 break
             code = strip_code_fence(code)
-            outcome = self.registry.call(
-                self.name,
-                "execute_python",
+            outcome, contained = self._execute(
                 ctx,
-                _scope={
+                task_id=task_id,
+                attempt=attempt,
+                scope={
                     "task_id": task_id,
                     "grants": upstream["grants"],
                     "dataset_refs": self._refs(task),
@@ -94,6 +98,10 @@ class ExecutorAgent(BaseAgent):
                     **upstream["env"],
                 },
             )
+            if contained:
+                # 守卫拒绝的东西重写三轮也还是越界，直接结束这个任务的自愈
+                last_outcome = outcome
+                break
             if outcome.success:
                 summary = self._parse_summary(outcome.stdout)
                 if summary and summary.get("error"):
@@ -153,7 +161,9 @@ class ExecutorAgent(BaseAgent):
                 error_class=error_class,
                 missing_columns=missing,
                 duration_seconds=outcome.duration_seconds if outcome else 0.0,
-                attempts=max_attempts,
+                # 记**实际跑过的轮数**，不是上限：守卫收容会提前 break，
+                # 写 max_attempts 等于让产物谎报"我试了三轮"。
+                attempts=attempts_used or max_attempts,
                 suggestion=self._suggestion(error_class),
             )
 
@@ -174,17 +184,57 @@ class ExecutorAgent(BaseAgent):
             artifacts=[str(step_file)],
         )
 
+    def _execute(
+        self,
+        ctx: Any,
+        *,
+        task_id: int,
+        attempt: int,
+        scope: dict[str, Any],
+        **params: Any,
+    ) -> tuple[Any, bool]:
+        """调用 `execute_python`，并把守卫异常收容成"这一个任务的这次失败"。
+
+        以前两个调用点（自愈循环 / 规则包参考实现）都没有 try：`PathViolationError`
+        与 `ToolError` 会穿出 `registry.call` → 穿出任务线程 → 穿出编排器的
+        `future.result()`，于是整条 run 被判 degraded、`task_states` 清空，
+        同一 run 里**已经完成并出图的任务一起作废**。单任务失败本来就有正规出口。
+
+        返回 `(结果, 是否被收容)`：被收容时调用方**不要自愈重试**——守卫拒绝的是
+        "这段代码不该被允许跑"，再写三轮也还是越界，只会把预算烧在同一个越界上。
+        """
+        try:
+            return (
+                self.registry.call(self.name, "execute_python", ctx, _scope=scope, **params),
+                False,
+            )
+        except ToolError as exc:
+            if ctx.transcript is not None:
+                ctx.transcript.write(
+                    {
+                        "event": "task_guard_contained",
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                        "note": "按单任务失败处理，不作废整条 run",
+                    }
+                )
+            return (
+                ExecutionOutcome(success=False, stderr=f"{type(exc).__name__}: {exc}"),
+                True,
+            )
+
     def _run_rule_reference(
         self, ctx: Any, task: dict[str, Any], work_dir: Any, rule_params: dict[str, Any]
     ) -> TaskExecutionResult:
         """mock 模式规则任务：执行规则包自带参考实现（与 verify_code 异构，校验器另算）。"""
         task_id = int(task["task_id"])
         rule = ctx.pack.rule(str(rule_params.get("id", "")))
-        outcome = self.registry.call(
-            self.name,
-            "execute_python",
+        outcome, _ = self._execute(
             ctx,
-            _scope={"task_id": task_id, "grants": [], "dataset_refs": self._refs(task)},
+            task_id=task_id,
+            attempt=1,
+            scope={"task_id": task_id, "grants": [], "dataset_refs": self._refs(task)},
             code=rule.reference_code,
             work_dir=work_dir,
             timeout=self._task_timeout(ctx),
