@@ -233,6 +233,38 @@ def available_columns_from(
     return columns
 
 
+class PackContractError(ValueError):
+    """数据不满足场景包声明的契约（这里就是缺必需列）。
+
+    带类型而不是抛裸 `ValueError`：运行级兜底只看异常类型，裸 ValueError 一律落成
+    `degraded_reason=run_error` + `错误分类：UNKNOWN` + `建议：检查运行日志`——
+    用户在报告里看到的就是这三行废话，而这个信息明明是可行动的（缺哪几列、去哪看约定）。
+    `missing` 原样带出去，分类与文案都从这一份数据生成，不两处各数一遍。
+    """
+
+    def __init__(self, pack_name: str, missing: Sequence[str], required: Sequence[str]) -> None:
+        self.pack_name = pack_name
+        self.missing = [str(column) for column in missing]
+        self.required = [str(column) for column in required]
+        super().__init__(
+            f"数据缺少场景包 {pack_name} 必需列：{'、'.join(self.missing)}"
+            f"（需要：{self.required}，见 packs/{pack_name}/data_convention.md）"
+        )
+
+    @property
+    def error_class(self) -> str:
+        return "MISSING_COLUMN"
+
+    @property
+    def suggestion(self) -> str:
+        """建议要能直接照着做：点名缺的列，并给出对照约定的位置。"""
+        return (
+            f"补齐 {'、'.join(self.missing)} 这几列（或换用带这些列的数据源），"
+            f"列名约定见 packs/{self.pack_name}/data_convention.md；"
+            "整包拒绝出结论是刻意的——静默少一条加权规则比没有结论更危险"
+        )
+
+
 def missing_required(pack: ScenarioPack, available: set[str]) -> list[str]:
     """必需列里这批数据给不出来的那些，保持包内声明顺序。
 

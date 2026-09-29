@@ -16,6 +16,7 @@ from agentflow.core.memory import (
     score_turn,
 )
 from agentflow.core.messages import AgentMessage
+from agentflow.core.pack import PackContractError
 from agentflow.core.pack import available_columns as pack_available_columns
 from agentflow.core.pack import missing_required as pack_missing
 from agentflow.core.pack import pack_plan_tasks
@@ -81,10 +82,7 @@ class PlannerAgent(BaseAgent):
         # 缺列判据只有 pack.py 一处：边界预检与这里必须给同一份清单
         missing = pack_missing(pack, pack_available_columns(pack, ctx.bundle))
         if missing:
-            raise ValueError(
-                f"数据缺少场景包 {pack.name} 必需列：{'、'.join(missing)}"
-                f"（需要：{pack.required_columns}，见 packs/{pack.name}/data_convention.md）"
-            )
+            raise PackContractError(pack.name, missing, pack.required_columns)
         tasks = pack_plan_tasks(pack, ctx.bundle)
         task_list = {
             "question": ctx.question,

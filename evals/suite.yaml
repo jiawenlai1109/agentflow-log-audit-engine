@@ -256,7 +256,8 @@ cases:
         # mock 把派生列"利润率"当真实列 → MISSING_COLUMN → 路由后降级。
         # 诚实失败（degraded + 澄清）是合法终态；把数字编出来才算破。
         status: [success, partial, degraded]
-        report_excludes: ["家居"]
+        # 降级报告的正文里不许出现环境布局：同一批文本还被追溯率当成"没有出处的数字"
+        report_excludes: ["家居", ".venv", "site-packages"]
       gap:
         # 真值是 0 行（(利润/销售额<0).sum()==0）——空结果是合法答案
         rows: { expect_any: 0 }
@@ -264,7 +265,7 @@ cases:
       gate:
         status: success
         rows: { expect_any: 0 }
-        report_excludes: ["利润率为负的类别有"]
+        report_excludes: ["利润率为负的类别有", ".venv", "site-packages"]
         verifier: pass_all
 
   - id: E08
@@ -299,6 +300,7 @@ cases:
         clarify: true
         replan: { max: 1 }
         report_contains: ["建议"]
+        report_excludes: [".venv", "site-packages"]
         llm_calls_max: 8
       gap: {}
     real:
@@ -306,6 +308,7 @@ cases:
         status: degraded
         clarify: true
         report_contains: ["建议"]
+        report_excludes: [".venv", "site-packages"]
 
   - id: E10
     type: 空结果
@@ -658,12 +661,16 @@ cases:
         # 立场：缺表时**拒绝出结论**并点名缺哪一列，而不是"能算几条算几条"。
         # 安全报告静默少一条加权规则，比一份没有结论的降级报告危险得多。
         status: degraded
+        # 分类也要能咬：只断 status 的话，缺列退化成 run_error 仍然全绿
+        degraded_reason: pack_contract
         report_contains: ["必需列", "是否生产"]
         report_excludes: ["分诊队列", "全部规则未命中"]
       gap: {}
     real:
       gate:
         status: degraded
+        # 分类也要能咬：只断 status 的话，缺列退化成 run_error 仍然全绿
+        degraded_reason: pack_contract
         report_contains: ["必需列", "是否生产"]
 
   # ---------------------------------------------------------------- 能力面（M4 骨架追加）

@@ -18,6 +18,41 @@ from agentflow.core.messages import AgentMessage
 from agentflow.core.transcript import TranscriptWriter
 
 
+
+# ------------------------------------------------------------ 面向用户的错误正文
+# 降级报告是会被截图、被转发的产物：`.venv/Lib/site-packages/...` 与项目绝对路径等于
+# 把环境布局寄出去。同一批文本里的 pandas 内部行号（4378 / 3648）还会被追溯率当成
+# "报告里冒出没有出处的数字"——隐私与量具噪声在这里是同一件事的两面。
+# 完整 traceback 仍然留在 transcript 的 run_failed_traceback 事件与 task 产物里：
+# **事实层留全，展示层脱敏**，脱敏不许反过来削弱可诊断性。
+_FRAME_RE = re.compile(r'File "[^"]+", line \d+(?:, in [^\n]*)?')
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"<>|]+|/(?:Users|home|var|tmp|opt|usr|private|appdata)[^\s'\"<>|]*", re.IGNORECASE)
+_LINE_NO_RE = re.compile(r"\bline \d+\b", re.IGNORECASE)
+
+
+def display_error(error: Any, limit: int = 300) -> str:
+    """把错误正文压成一句可以说给用户听的话：挑出异常摘要行，再抹掉栈帧、绝对路径与行号。
+
+    取"最后一行像异常摘要的那行"而不是首行：子进程 stderr 的末行才是 `KeyError: '利润率'`
+    这种可行动信息，首行往往是 `Traceback (most recent call last):` 或被截断剩下的半条路径。
+    """
+    text = str(error or "").strip()
+    if not text:
+        return "（无错误详情）"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    summary = lines[-1]
+    for line in reversed(lines):
+        if re.search(r"(\w*Error|\w*Exception|\w*Warning)\s*:", line):
+            summary = line
+            break
+    cleaned = _FRAME_RE.sub("<栈帧>", summary)
+    cleaned = _ABS_PATH_RE.sub("<路径>", cleaned)
+    cleaned = _LINE_NO_RE.sub("line <N>", cleaned)
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "…（正文已截断，完整记录见产物与 transcript）"
+    return cleaned
+
+
 class Orchestrator:
     """把七个角色 Agent 串成流水线：EXPLORE → PLAN → EXECUTE → VERIFY → VISUALIZE → REPORT → REVIEW。"""
 
@@ -112,19 +147,35 @@ class Orchestrator:
             self._emit({"type": "done", "status": status, "run_id": run_id})
         except Exception as exc:  # noqa: BLE001 - 运行级兜底
             from agentflow.core.llm import LLMError
+            from agentflow.core.pack import PackContractError
 
-            is_llm_error = isinstance(exc, LLMError)
             status = "degraded"
-            ctx.degraded_reason = "llm_error" if is_llm_error else "run_error"
-            failure_info = {
-                "error_class": "LLM_ERROR" if is_llm_error else "UNKNOWN",
-                "error": str(exc)[:500],
-                "suggestion": (
-                    "检查 LLM 配置（OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）"
-                    if is_llm_error
-                    else "检查运行日志"
-                ),
-            }
+            if isinstance(exc, PackContractError):
+                # 数据不满足场景包契约是**可行动**的失败：分类与建议由异常自己带出来。
+                # 落到下面那条兜底会变成 "UNKNOWN / 检查运行日志"，等于把用户支去翻日志，
+                # 而系统其实知道缺哪几列、约定写在哪个文件里。
+                ctx.degraded_reason = "pack_contract"
+                failure_info = {
+                    "error_class": exc.error_class,
+                    "error": str(exc)[:500],
+                    "suggestion": exc.suggestion,
+                    "missing_columns": exc.missing,
+                }
+            else:
+                is_llm_error = isinstance(exc, LLMError)
+                ctx.degraded_reason = "llm_error" if is_llm_error else "run_error"
+                failure_info = {
+                    "error_class": "LLM_ERROR" if is_llm_error else "UNKNOWN",
+                    # 这里留原文：脱敏发生在写报告的那一步（`display_error`），
+                    # 而 transcript 与本报告共用这一份 failure_info——两处各脱一次敏，
+                    # 就会出现"报告干净、别处漏"的分叉。
+                    "error": str(exc)[:500],
+                    "suggestion": (
+                        "检查 LLM 配置（OPENAI_API_KEY / OPENAI_BASE_URL / LLM_MODEL）"
+                        if is_llm_error
+                        else "检查运行日志"
+                    ),
+                }
             try:
                 self._write_degraded_report(ctx, failure_info)
             except Exception:  # noqa: BLE001 - 降级报告失败不影响状态记录
@@ -599,7 +650,9 @@ class Orchestrator:
         # 直接透传会让 FailureInfo 的 pydantic 校验抛异常（把降级路径变成 run_error）
         return {
             "error_class": first.get("error_class") or "UNKNOWN",
-            "error": first.get("error") or "任务执行失败",
+            # 子进程 stderr 里带绝对路径与库内部行号：报告正文只收一句摘要，
+            # 原文仍在 task 产物与 transcript 里（事实层不删，展示层脱敏）
+            "error": display_error(first.get("error") or "任务执行失败"),
             "suggestion": first.get("suggestion") or "请检查列名或数据源",
         }
 
@@ -783,10 +836,13 @@ class Orchestrator:
     ) -> None:
         """LLM/运行级失败时写出可读的降级报告，避免"只留下 json 无报告"。"""
         report_path = ctx.outputs_dir / "report.md"
+        # 失败原因走 display_error：这一段是会被截图、被转发的正文。原始 traceback
+        # 仍然完整留在 transcript 的 run_failed_traceback 事件里（事实层不删东西）。
+        shown = display_error(failure_info.get("error", ""))
         text = (
             "# 数据分析报告（未完成）\n\n"
             f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"- 失败原因：{failure_info.get('error', '')}\n"
+            f"- 失败原因：{shown}\n"
             f"- 错误分类：{failure_info.get('error_class', 'UNKNOWN')}\n"
             f"- 建议：{failure_info.get('suggestion', '')}\n"
         )
@@ -794,8 +850,8 @@ class Orchestrator:
         ctx.report = {
             "report_path": str(report_path),
             "degraded": True,
-            "failure_info": failure_info,
-            "summary": "分析未完成：" + str(failure_info.get("error", ""))[:100],
+            "failure_info": {**failure_info, "error": shown},
+            "summary": "分析未完成：" + shown[:100],
         }
 
     def _request(
