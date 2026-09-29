@@ -21,24 +21,27 @@ from agentflow.pipeline import run_analysis
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRIAGE = PROJECT_ROOT / "demo" / "data" / "triage"
+# 主场景是登录日志安全审计：夹具与假 traceback 里的列名都用这个场景的词
+LOGIN = PROJECT_ROOT / "demo" / "data" / "login_auth.csv"
+LOGIN_QUESTION = "统计各账号的登录失败次数，列出风险最高的账号"
 
-# 一条真实形态的子进程 stderr（E07 现场：缺"利润率"列）
+# 一条真实形态的子进程 stderr（生成的代码去读一个不存在的列）
 REAL_TRACEBACK = (
     'Traceback (most recent call last):\n'
     f'  File "{PROJECT_ROOT}\\outputs\\work\\2\\script.py", line 6, in <module>\n'
-    "    print(df['利润率'].sum())\n"
-    '          ~~^^^^^^^^^^\n'
+    '    print(df[df["auth_result"] != "SUCCESS"].shape[0])\n'
+    '               ~~^^^^^^^^^^^^^^\n'
     f'  File "{PROJECT_ROOT}\\.venv\\Lib\\site-packages\\pandas\\core\\frame.py", line 4378, in __getitem__\n'
     "    indexer = self.columns.get_loc(key)\n"
     f'  File "{PROJECT_ROOT}\\.venv\\Lib\\site-packages\\pandas\\core\\indexes\\base.py", line 3648, in get_loc\n'
     "    raise KeyError(key) from err\n"
-    "KeyError: '利润率'"
+    "KeyError: 'auth_result'"
 )
 
 
 def test_display_error_keeps_the_actionable_line_and_drops_the_environment():
     shown = display_error(REAL_TRACEBACK)
-    assert "利润率" in shown, shown
+    assert "auth_result" in shown, shown
     # 绝对路径与环境布局不许出现在给人看的正文里
     assert ".venv" not in shown and "site-packages" not in shown, shown
     assert str(PROJECT_ROOT)[:8] not in shown, shown
@@ -111,7 +114,7 @@ def test_display_error_finds_the_summary_beyond_the_first_500_chars():
     """摘要行离得很远也要挑得出来——CI 上挂的就是这一条。
 
     现场：GitHub Actions 的检出路径比本机长，`failure_info["error"]` 被截到 500 字之后
-    `KeyError: '利润率'` 那行整个被切掉，于是报告里剩下 `失败原因：File "<路径>`。
+    `KeyError: 'auth_result'` 那行整个被切掉，于是报告里剩下 `失败原因：File "<路径>`。
     这条用例与路径长度、平台都无关：直接把"摘要行在第 500 字之后"这个形状写死。
     """
     deep = "".join(
@@ -119,10 +122,10 @@ def test_display_error_finds_the_summary_beyond_the_first_500_chars():
         f'/deep/nested/frame_{i}.py", line {1000 + i}, in helper_{i}\n'
         for i in range(6)
     )
-    text = f"Traceback (most recent call last):\n{deep}KeyError: '利润率'"
+    text = f"Traceback (most recent call last):\n{deep}KeyError: 'auth_result'"
     assert len(text) > 500, "前提：摘要行确实落在 500 字之外"
     shown = display_error(text)
-    assert "利润率" in shown, shown
+    assert "auth_result" in shown, shown
     assert "frame_" not in shown and "1005" not in shown, shown
 
 
@@ -137,17 +140,17 @@ def test_run_level_summary_survives_a_long_checkout_path(tmp_path):
         f'/deep/nested/frame_{i}.py", line {1000 + i}, in helper_{i}\n'
         for i in range(8)
     )
-    long_traceback = f"Traceback (most recent call last):\n{deep}KeyError: '利润率'"
+    long_traceback = f"Traceback (most recent call last):\n{deep}KeyError: 'auth_result'"
     assert len(long_traceback) > 500, "前提：摘要行在 500 字之外，正是 CI 的形状"
     result = run_analysis(
-        question="各品类销售额是多少？",
-        sources=str(PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"),
+        question=LOGIN_QUESTION,
+        sources=str(LOGIN),
         mode="mock",
         llm=_BoomLLM(long_traceback),
         outputs_root=tmp_path,
     )
     report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
-    assert "利润率" in report, report[:600]
+    assert "auth_result" in report, report[:600]
     assert "frame_" not in report and "1007" not in report, report[:600]
 
 
@@ -163,8 +166,8 @@ def test_run_level_degraded_report_is_sanitized_too(tmp_path):
     """降级报告有两条出口：任务失败的模板与运行级兜底。只堵一条等于没堵。"""
     events: list[dict] = []
     result = run_analysis(
-        question="各品类销售额是多少？",
-        sources=str(PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"),
+        question=LOGIN_QUESTION,
+        sources=str(LOGIN),
         mode="mock",
         llm=_BoomLLM(REAL_TRACEBACK),
         outputs_root=tmp_path,
@@ -174,7 +177,7 @@ def test_run_level_degraded_report_is_sanitized_too(tmp_path):
     report = Path(result["report"]["report_path"]).read_text(encoding="utf-8")
     assert ".venv" not in report and "site-packages" not in report, report[:600]
     assert str(PROJECT_ROOT)[:8] not in report, report[:600]
-    assert "利润率" in report, "脱敏之后仍要说清到底哪儿错了"
+    assert "auth_result" in report, "脱敏之后仍要说清到底哪儿错了"
 
     # 第三条出口：SSE 的 error 事件会进浏览器与访问日志，同样不许带环境布局
     emitted = json.dumps([e for e in events if e.get("type") == "error"], ensure_ascii=False)

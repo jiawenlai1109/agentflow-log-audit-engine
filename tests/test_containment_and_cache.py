@@ -99,8 +99,8 @@ def test_self_heal_loop_stops_on_a_guard_violation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ToolRegistry, "call", counting)
     result = run_analysis(
-        question="各品类销售额是多少？",
-        sources=str(PROJECT_ROOT / "demo" / "data" / "retail_sales.csv"),
+        question="统计各账号的登录失败次数，列出风险最高的账号",
+        sources=str(PROJECT_ROOT / "demo" / "data" / "login_auth.csv"),
         mode="mock",
         outputs_root=tmp_path,
     )
