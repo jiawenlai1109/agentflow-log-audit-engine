@@ -5,6 +5,9 @@
 """
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -485,3 +488,36 @@ def test_multi_table_row_counts_are_provenance():
     evidence["evaluation"]["dataset_tables"] = [{"source_file": "edr.csv", "row_count": 4}]
     ratio, unexplained = numbers_traceable(evidence)
     assert "282" in unexplained and ratio < 1.0
+
+
+# ---------------------------------------------------------------- runner 的输出下限
+
+
+def test_eval_runner_survives_a_non_utf8_console(tmp_path):
+    """量具自己不能把一次全绿的运行报成崩溃。
+
+    2026-09-29 实测缺陷：题号标记用 ✔✘▲，Windows 上 stdout 被管道/文件接走时解释器按本地码页
+    （cp936）编码，于是 **27 题全部跑完之后**炸在 print_report 第一行、非零退出、汇总数字一行都
+    打不出来。这里强制 `PYTHONIOENCODING=gbk` 真起子进程跑一题——不测某个函数的返回值，
+    因为这条缺陷只在整条 CLI 路径上现形（交互终端与 ubuntu CI 都不会现，只有落日志会）。
+    """
+    environment = dict(os.environ, PYTHONIOENCODING="gbk")
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "run_eval.py"),
+            "--only",
+            "E21",
+            "--outputs",
+            str(tmp_path / "eval"),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        cwd=str(PROJECT_ROOT),
+        timeout=300,
+    )
+    assert process.returncode == 0, (process.stdout[-400:] + process.stderr[-400:])
+    assert "题数 1" in process.stdout  # 汇总真要打出来，"没崩但也没输出"不算过

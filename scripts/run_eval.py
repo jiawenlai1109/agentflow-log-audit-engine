@@ -501,7 +501,19 @@ def preflight_credentials(mode: str) -> str:
     return ""
 
 
+def harden_streams() -> None:
+    """把输出钉在 UTF-8 上：一次已经跑完的运行不该被输出编码判成失败。
+
+    Windows 下 stdout 被重定向或管道接走时按本地码页编码（本机实测 cp936），而报告里有 ✔ ✘ ⚠
+    这类码页外字符——2026-09-29 实测：27 题全部跑完，炸在 print_report 第一行，非零退出，
+    汇总数字一行都打不出来。交互终端与 CI（ubuntu）都不会现，只有"把数字落进日志"这个动作会。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    harden_streams()
     parser = argparse.ArgumentParser(description="冻结评测集 runner + 回归门禁")
     parser.add_argument("--mode", default="mock", choices=["mock", "real"])
     parser.add_argument("--only", default=None, help="逗号分隔用例号，如 E01,E04")
