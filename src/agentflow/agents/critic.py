@@ -77,20 +77,18 @@ class CriticAgent(BaseAgent):
             llm_error_text = str(exc)[:150]
 
         all_issues = issues + [issue.model_dump() for issue in llm_review.issues]
-        if llm_unavailable:
-            # v1.2：fail-open 的降级必须留痕，否则评估数据无法区分"通过"与"评审没跑成"
-            all_issues.append(
-                {
-                    "severity": "low",
-                    "section": "评审",
-                    "message": f"LLM 语义评审不可用（{llm_error_text or '原因未知'}），本次仅完成确定性检查",
-                }
-            )
+        # 运维级失败**不折算成内容 issue**（#13）：issues 只描述报告哪里不对，
+        # "评审器自己没跑成"走 infrastructure_error 单独一栏。混在一起有两个后果：
+        # ① 一次基础设施故障长得像一次内容判定，② 内容判定会驱动 Reporter 重写，
+        # 而重写修不好一个没接通的评审器——只会把剩余预算继续烧在无效重试上。
         verdict = "FAIL" if (all_issues or llm_review.verdict == "FAIL") else "PASS"
         review = Review(
             verdict=verdict,
             rounds=1,
             issues=[ReviewIssue(**issue) for issue in all_issues],
+            infrastructure_error=(
+                f"LLM 语义评审不可用：{llm_error_text or '原因未知'}" if llm_unavailable else None
+            ),
         )
         return self.reply(ctx, "orchestrator", "review", review.model_dump_json())
 

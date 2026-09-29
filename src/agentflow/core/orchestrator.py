@@ -635,6 +635,7 @@ class Orchestrator:
             or int(ctx.config.get("execution", {}).get("max_review_rounds", 2)),
         )
         ctx.critic_passed = False
+        ctx.review_ran = True
         for _ in range(max_rounds):
             payload = json.dumps(
                 {
@@ -652,6 +653,23 @@ class Orchestrator:
                 .run(ctx, self._request(ctx, "critic", "review_report", payload))
                 .content
             )
+            infra = review.get("infrastructure_error")
+            if infra:
+                # 评审器自己没跑成（LLM 不可用、预算耗尽）。这条既不并进 critic_pass，也不触发重写：
+                # 重写修不好一个没接通的评审器，只会把剩余预算烧在无效重试上。#13 原来的形态是
+                # 把它折成一条 severity=low 的**内容** issue ⇒ 运维级失败长得像内容判红，
+                # 而运行照样以 success 收口——门禁对这类失败完全失明。
+                ctx.critic_passed = False
+                ctx.review_infra_error = str(infra)[:300]
+                if ctx.transcript is not None:
+                    ctx.transcript.write(
+                        {
+                            "event": "review_unavailable",
+                            "reason": ctx.review_infra_error,
+                            "note": "语义评审未完成：不折算成内容结论，也不触发自愈重写",
+                        }
+                    )
+                return
             if review["verdict"] == "PASS":
                 ctx.critic_passed = True
                 return
@@ -720,6 +738,10 @@ class Orchestrator:
             "degraded_reason": ctx.degraded_reason,
             "chart_success": chart_success if chart_attempted else None,
             "critic_pass": ctx.critic_passed,
+            # "评审跑没跑"与"评审判没判红"是两件事（#13）。只有 critic_pass 一栏时，
+            # 一次 LLM 预算耗尽的运行与一次"报告真有问题"的运行长得一模一样。
+            "review_ran": ctx.review_ran,
+            "review_infra_error": ctx.review_infra_error,
             # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
             "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
             # 多源报告头部会逐张表报行数（"auth.csv 282 行、assets.csv 24 行…"）。

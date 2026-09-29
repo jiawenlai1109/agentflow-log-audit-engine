@@ -102,6 +102,11 @@ class RunContext:
     task_states: dict[int, str] = field(default_factory=dict)
     degraded_reason: str | None = None
     critic_passed: bool | None = None
+    # 评审这一步自身的状态与"报告有没有毛病"分开记（#13）：review_ran 表示评审阶段执行过，
+    # review_infra_error 表示评审器自己没跑成（LLM 不可用/预算耗尽）。两者合起来才回答
+    # "这次运行敢不敢自称被评审过"——只有 critic_passed=False 答不出：判红与没评是两件事。
+    review_ran: bool = False
+    review_infra_error: str | None = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

@@ -39,6 +39,7 @@ from agentflow.core.grading import (  # noqa: E402
     fingerprint,
     lint_suite,
     load_evidence,
+    review_state,
 )
 from agentflow.pipeline import AGENT_ROSTER, run_analysis  # noqa: E402
 
@@ -252,6 +253,30 @@ def _data_path(suite: dict[str, Any], ref: str) -> Any:
     return str(PROJECT_ROOT / entry)
 
 
+def review_gate_check(evidence: dict[str, Any]) -> Check | None:
+    """一条不写在题里的下限：**不许一边宣称运行成功、一边承认语义评审没跑完**（#13 的门禁侧）。
+
+    为什么放 runner 而不是 suite.yaml：这不是某一题的内容期望，是所有题共用的保护——
+    写进题里就等于"没写到的题没有这条保护"。`verdict` 是从 checks 算出来的属性，
+    所以这条红会真的把一题判成 fail 并让 exit code 变红，不是"记一笔就算了"。
+    降级运行返回 None：它本来就不进评审阶段，报它一条红会让人去看错的地方。
+    """
+    evaluation = evidence.get("evaluation") or {}
+    if str(evaluation.get("status")) not in ("success", "partial"):
+        return None
+    state = review_state(evaluation)
+    return Check(
+        kind="review_completed",
+        passed=state == "clean",
+        detail=(
+            "语义评审跑完且无运维失败"
+            if state == "clean"
+            else f"review={state}：{evaluation.get('review_infra_error') or '评审阶段没执行'}"
+        ),
+        tier=TIER_GATE,
+    )
+
+
 def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path) -> dict[str, Any]:
     """单题执行：支持多轮（session）与重复（repeat，用于一致性断言）。"""
     case_id = str(case["id"])
@@ -283,6 +308,11 @@ def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path)
     graded = runs[-1]  # 断言打在最后一轮（多轮题考的是续轮行为）
     evidence = load_evidence(graded["outputs_dir"])
     result = evaluate_case(case, evidence, mode)
+
+    # 一条不写在题里的下限：以 success/partial 收口的运行，不许同时承认语义评审没跑完（#13）。
+    review_check = review_gate_check(evidence)
+    if review_check is not None:
+        result.checks.append(review_check)
 
     if case.get("require_consistent") and len(runs) > 1:
         signatures = {

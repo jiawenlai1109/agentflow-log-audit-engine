@@ -352,6 +352,32 @@ def _p_critic(evidence, params, mode):
     return bool(actual) is bool(params == "pass"), f"critic_pass={actual} 期望={params}"
 
 
+def review_state(evaluation: dict[str, Any] | None) -> str:
+    """评审这一步的状态：`clean` / `unavailable` / `skipped`。
+
+    谓词与 runner 共用这一个判据（与 report_lint 同一个道理）——两处各写一遍，
+    就会出现"审计说没跑成、门禁照旧绿"这种分叉。
+    """
+    evaluation = evaluation or {}
+    if not evaluation.get("review_ran"):
+        return "skipped"
+    return "unavailable" if evaluation.get("review_infra_error") else "clean"
+
+
+def _p_review(evidence, params, mode):
+    """评审这一步**自己**的状态：clean=跑完且无运维失败 / unavailable=评审器没跑成 / skipped=没进评审。
+
+    与 `critic` 谓词分开是刻意的（#13）：`critic_pass` 只回答"内容判没判红"，
+    而"LLM 预算耗尽导致语义评审根本没跑"是另一类失败。过去引擎把后者折成一条
+    low issue 塞进 issues ⇒ 一次运维级失败长得像一次内容判定，运行仍以 success 收口，
+    而 `critic: pass` 的断言也只是碰巧变红，看不出红在哪一层。
+    """
+    evaluation = evidence["evaluation"] or {}
+    state = review_state(evaluation)
+    error = evaluation.get("review_infra_error")
+    return state == params, f"review={state} 期望={params}" + (f"（{error}）" if error else "")
+
+
 def _p_replan(evidence, params, mode):
     actual = int((evidence["evaluation"] or {}).get("replan_used") or 0)
     if isinstance(params, int):
@@ -557,6 +583,7 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "skills_active": _p_skills_active,
     "external_evidence": _p_external_evidence,
     "critic": _p_critic,
+    "review": _p_review,
     "replan": _p_replan,
     "clarify": _p_clarify,
     "join_preflight": _p_join_preflight,
