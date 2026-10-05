@@ -76,14 +76,20 @@ def build_agents(
 
 
 def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
-    """按 Agent 配置覆盖模型（真实模式下为每个 Agent 克隆一个带指定模型的客户端）。"""
+    """按 Agent 配置覆盖模型与思考档位（真实模式下克隆一个带指定参数的客户端）。
+
+    思考档位按角色分开是有理由的：写代码/画图的那几个要的是稳定与省预算，
+    评审与叙述可以慢慢想。克隆时不带 `thinking` 就等于让全部角色共用一个档位。
+    """
     model = agent_cfg.get("model")
-    if model and isinstance(llm, OpenAILLM):
+    thinking = agent_cfg.get("thinking")
+    if isinstance(llm, OpenAILLM) and (model or thinking):
         clone = OpenAILLM(
             api_key=llm.api_key,
             base_url=llm.base_url,
-            model=model,
+            model=model or llm.model,
             max_retries=llm.max_retries,
+            thinking=thinking or llm.thinking,
         )
         clone.budget = llm.budget
         return clone
@@ -199,6 +205,7 @@ def run_analysis(
             else OpenAILLM(
                 base_url=llm_cfg.get("base_url") or None,
                 model=llm_cfg.get("model") or None,
+                thinking=llm_cfg.get("thinking") or None,
             )
         )
 

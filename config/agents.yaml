@@ -2,6 +2,11 @@ llm:
   model: ""                   # 留空 → 使用 .env 的 LLM_MODEL；显式填写才覆盖环境变量
   base_url: ""                # 留空则用 OPENAI_BASE_URL（默认 https://api.openai.com/v1）
   temperature: 0.2
+  # thinking: disabled        # 思考档位（enabled / disabled / 留空=不发这个字段）。
+  #                             真实模式踩过：思考档把 max_tokens 花在 reasoning 上时，
+  #                             content 返回 null，客户端从此处起判 LLMError 而不是让 None 往下漏。
+  #                             留空是为了不改变默认请求体——上游认不认 thinking 需要实测，
+  #                             "配置写了"不等于"思考关了"。
 
 execution:
   max_concurrency: 3

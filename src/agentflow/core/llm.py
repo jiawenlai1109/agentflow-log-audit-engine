@@ -135,6 +135,7 @@ class OpenAILLM(BaseLLM):
         model: str | None = None,
         timeout: int = 120,
         max_retries: int = 2,
+        thinking: str | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -145,6 +146,14 @@ class OpenAILLM(BaseLLM):
         self.model = model or os.getenv("LLM_MODEL") or "gpt-4o-mini"
         self.timeout = timeout
         self.max_retries = int(os.getenv("LLM_MAX_RETRIES", str(max_retries)))
+        # 思考档位：enabled / disabled，留空 = 连这个字段都不发（保持接线前的线上行为）。
+        # 形状按 OpenAI 兼容网关常见的 `thinking: {"type": ...}` 发送；
+        # **上游认不认只能实测**——不认的网关会静默忽略或直接 400，
+        # 所以"配置里写了 disabled"不等于"思考真的关了"。
+        thinking = (thinking or "").strip().lower() or None
+        if thinking not in (None, "enabled", "disabled"):
+            raise LLMError(f"llm.thinking 只接受 enabled / disabled / 留空，收到 {thinking!r}")
+        self.thinking = thinking
 
     def complete(
         self,
@@ -159,6 +168,8 @@ class OpenAILLM(BaseLLM):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.thinking:
+            payload["thinking"] = {"type": self.thinking}
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -195,10 +206,29 @@ class OpenAILLM(BaseLLM):
                 int(usage.get("prompt_tokens", 0) or 0),
                 int(usage.get("completion_tokens", 0) or 0),
             )
-        try:
-            return data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"LLM 响应结构异常: {data}") from exc
+        choices = data.get("choices")
+        if not choices:
+            raise LLMError(f"LLM 响应结构异常: {str(data)[:300]}")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            # 思考档模型会把 max_tokens 花在 reasoning 上，此时正文返回的是 null（不是空串）。
+            # 原样把 None 交出去，下游会在 `strip_code_fence` / `extract_json` 的 .strip()
+            # 上炸成 AttributeError——错误类型与真原因毫无关系，还会穿出 DAG 把整条 run 打死
+            # （2026-10-05 real 模式实测）。在这里判死，它才能落到既有的 LLM_ERROR 错误路由
+            # 与"运维失败不冒充内容结论"（#13）那条通道上。
+            reasoning = message.get("reasoning_content") or ""
+            finish = choices[0].get("finish_reason")
+            hint = (
+                "预算被思考链吃满：配 llm.thinking=disabled 或提 max_tokens"
+                if reasoning
+                else "上游没给正文，也没记 reasoning（多半是网关/模型返回结构异常）"
+            )
+            raise LLMError(
+                f"LLM 返回的 content 不是文本（finish_reason={finish}、"
+                f"reasoning_content {len(reasoning)} 字）：{hint}"
+            )
+        return content
 
     @staticmethod
     def _backoff(attempt: int, retry_after: str | None) -> float:
