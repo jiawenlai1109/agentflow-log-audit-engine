@@ -37,6 +37,7 @@ from agentflow.core.grading import (  # noqa: E402
     Check,
     evaluate_case,
     fingerprint,
+    guard_state,
     lint_suite,
     load_evidence,
     review_state,
@@ -283,6 +284,31 @@ def review_gate_check(evidence: dict[str, Any]) -> Check | None:
     )
 
 
+def guard_gate_check(evidence: dict[str, Any]) -> Check | None:
+    """一条不写在题里的下限：**闸门坏了就不许全身而过**（#19 表级授权的门禁侧）。
+
+    引擎每次运行收尾都会拿一张未声明的表走自己的调用点要权限（`_table_guard_selfcheck`），
+    被拒才算 `passed`。这里只拦两种结果：`violated`（该拒的没拒 / 拒错了异常类型）与
+    `missing`（那一栏根本没记 ⇒ 自检被摘掉了）。`skipped` 放行但有原因——单表 run 按
+    `dataset_scope` 的策略不做表级收窄，那种情况下不存在"未声明的表"可试，
+    假装绿灯比说"这次测不着"更坏。
+
+    放 runner 而不是只写进题里，理由与 `review_completed` 同一条：这是所有题共用的保护。
+    """
+    evaluation = evidence.get("evaluation") or {}
+    record = evaluation.get("guard_selfcheck") or {}
+    state = guard_state(evaluation)
+    if state in ("passed", "skipped"):
+        detail = f"guard={state}：{str(record.get('reason') or '')[:120]}"
+    else:
+        detail = (
+            "guard=violated：越表没被表级闸门拒掉，未声明的表在读得到"
+            if state == "violated"
+            else f"guard={state}：{str(record.get('reason') or 'evaluation.json 里没有 guard_selfcheck 这一栏')[:160]}"
+        )
+    return Check(kind="guard_selfcheck", passed=state not in ("violated", "missing"), detail=detail, tier=TIER_GATE)
+
+
 def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path) -> dict[str, Any]:
     """单题执行：支持多轮（session）与重复（repeat，用于一致性断言）。"""
     case_id = str(case["id"])
@@ -319,6 +345,10 @@ def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path)
     review_check = review_gate_check(evidence)
     if review_check is not None:
         result.checks.append(review_check)
+
+    # 另一条不写在题里的下限：表级授权闸门坏了不许全身而过（#19 的自检侧）。
+    # 它挂在**每一题**上，包括降级的题——自检在 `finally` 里跑，降级运行同样该有记录。
+    result.checks.append(guard_gate_check(evidence))
 
     if case.get("require_consistent") and len(runs) > 1:
         signatures = {

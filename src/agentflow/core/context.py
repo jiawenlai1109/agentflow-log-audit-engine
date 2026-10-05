@@ -107,6 +107,10 @@ class RunContext:
     # "这次运行敢不敢自称被评审过"——只有 critic_passed=False 答不出：判红与没评是两件事。
     review_ran: bool = False
     review_infra_error: str | None = None
+    # 表级授权闸门的每跑自检结论（state: passed/skipped/violated）。
+    # 与 join_preflight 同一立场：**闸门接没接线要有个确定的地方能问**，
+    # 否则"表级授权实现了"与"表级授权这次生效了"只能靠读代码猜。
+    guard_selfcheck: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

@@ -367,6 +367,10 @@ class ToolRegistry:
                             "declared_refs": list(dataset_refs or []),
                             "path": str(value),
                             "reason": str(error),
+                            # 自检探针必须自证是探针：不带这个标记，transcript 里就会出现
+                            # 一条"某角色试图读未声明的表"的记录，而它其实是系统在测试自己
+                            # ——留痕不能让人误读成对模型的指控。
+                            **({"probe": scope.get("probe")} if scope.get("probe") else {}),
                         },
                     )
                     raise

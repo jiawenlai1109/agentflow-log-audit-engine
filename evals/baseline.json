@@ -1,20 +1,20 @@
 {
   "suite_version": 1,
   "mode": "mock",
-  "generated_at": "2026-09-29 16:07:03",
+  "generated_at": "2026-10-05 21:20:21",
   "aggregate": {
     "cases": 27,
     "pass": 27,
     "fail": 0,
     "xpass": 0,
     "error": 0,
-    "gate_checks": 157,
+    "gate_checks": 187,
     "gate_failed": 0,
     "gap_checks": 12,
     "gap_passed": 0,
     "numbers_traceable_mean": 1.0,
     "avg_llm_calls": 4.9259,
-    "avg_duration": 1.7778,
+    "avg_duration": 4.1661,
     "verifier_checked": 17,
     "fingerprints": {
       "prompt:critic": "d8435a6e38bb",
@@ -31,9 +31,9 @@
       "skill:chart_selection": "541fcfd46ecb",
       "skill:cross_table_triage": "1cb341d774ea",
       "config": "64ce83725f3a",
-      "harness:suite.yaml": "4028e680269a",
-      "harness:grading.py": "b78779cc0b17",
-      "harness:run_eval.py": "be9daa2fba5c"
+      "harness:suite.yaml": "727e19df4121",
+      "harness:grading.py": "cb5983d5c4c4",
+      "harness:run_eval.py": "43eeb57eef34"
     }
   },
   "results": [
@@ -41,11 +41,11 @@
       "case_id": "E01",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.77,
+      "seconds": 4.39,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.734,
+        "duration_seconds": 4.297,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -97,11 +97,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160607_b9ca53bb",
+          "run_id": "run_20261005_211811_d13cf026",
           "status": "success"
         }
       ]
@@ -110,11 +116,11 @@
       "case_id": "E02",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.73,
+      "seconds": 4.12,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.703,
+        "duration_seconds": 4.063,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -154,11 +160,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160609_32b7cf09",
+          "run_id": "run_20261005_211815_b1bf3bda",
           "status": "success"
         }
       ]
@@ -167,11 +179,11 @@
       "case_id": "E03",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.56,
+      "seconds": 6.17,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.532,
+        "duration_seconds": 6.078,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -223,11 +235,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160611_e3d8907c",
+          "run_id": "run_20261005_211819_39ea9786",
           "status": "success"
         }
       ]
@@ -236,11 +254,11 @@
       "case_id": "E04",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.56,
+      "seconds": 6.28,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.532,
+        "duration_seconds": 6.203,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -280,11 +298,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160613_ac597a62",
+          "run_id": "run_20261005_211825_1b00308f",
           "status": "success"
         }
       ]
@@ -293,11 +317,11 @@
       "case_id": "E05",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.55,
+      "seconds": 6.25,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.531,
+        "duration_seconds": 6.172,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -337,11 +361,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160616_4373f30f",
+          "run_id": "run_20261005_211832_f1e04117",
           "status": "success"
         }
       ]
@@ -350,11 +380,11 @@
       "case_id": "E06",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.56,
+      "seconds": 6.22,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.532,
+        "duration_seconds": 6.157,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -382,11 +412,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160618_d3cc5f6f",
+          "run_id": "run_20261005_211838_0cdad580",
           "status": "success"
         }
       ]
@@ -395,11 +431,11 @@
       "case_id": "E07",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 1.78,
+      "seconds": 4.11,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 2.0,
-        "duration_seconds": 1.75,
+        "duration_seconds": 4.016,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -421,11 +457,17 @@
           "tier": "known_gap",
           "passed": false,
           "detail": "rows={'1': 2000, '2': None} 期望={'expect_any': 0}"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160621_09eded22",
+          "run_id": "run_20261005_211844_0f532a67",
           "status": "degraded"
         }
       ]
@@ -434,11 +476,11 @@
       "case_id": "E08",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.49,
+      "seconds": 5.95,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.453,
+        "duration_seconds": 5.844,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -472,11 +514,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160623_611d6683",
+          "run_id": "run_20261005_211848_82e18c75",
           "status": "success"
         }
       ]
@@ -485,11 +533,11 @@
       "case_id": "E09",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.67,
+      "seconds": 1.47,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 2.0,
-        "duration_seconds": 0.64,
+        "duration_seconds": 1.39,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -535,11 +583,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "llm_calls=2 上界=8"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160625_c7d3a3b6",
+          "run_id": "run_20261005_211854_35459e0f",
           "status": "degraded"
         }
       ]
@@ -548,11 +602,11 @@
       "case_id": "E10",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.77,
+      "seconds": 4.23,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.719,
+        "duration_seconds": 4.172,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -580,11 +634,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160626_b8a6de65",
+          "run_id": "run_20261005_211856_cfe9b05d",
           "status": "success"
         }
       ]
@@ -593,11 +653,11 @@
       "case_id": "E11",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.47,
+      "seconds": 8.38,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.734,
+        "duration_seconds": 4.156,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -619,15 +679,21 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160628_09fd4622",
+          "run_id": "run_20261005_211900_7fdf7c77",
           "status": "success"
         },
         {
-          "run_id": "run_20260929_160630_6c4d1089",
+          "run_id": "run_20261005_211904_9966ef2d",
           "status": "success"
         }
       ]
@@ -636,11 +702,11 @@
       "case_id": "E12",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.5,
+      "seconds": 10.3,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.703,
+        "duration_seconds": 4.047,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -662,15 +728,21 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160631_36850ff9",
+          "run_id": "run_20261005_211909_2f4d8fde",
           "status": "success"
         },
         {
-          "run_id": "run_20260929_160634_327245ae",
+          "run_id": "run_20261005_211915_d51287a6",
           "status": "success"
         }
       ]
@@ -679,11 +751,11 @@
       "case_id": "E13",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.81,
+      "seconds": 4.17,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.781,
+        "duration_seconds": 4.094,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -705,11 +777,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160636_422450f6",
+          "run_id": "run_20261005_211919_597a8ff7",
           "status": "success"
         }
       ]
@@ -718,11 +796,11 @@
       "case_id": "E14",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.5,
+      "seconds": 3.27,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.453,
+        "duration_seconds": 3.171,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -770,15 +848,27 @@
           "detail": "llm_calls=1 上界=6"
         },
         {
+          "kind": "table_denied",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
+        },
+        {
           "kind": "review_completed",
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160638_ff1c0215",
+          "run_id": "run_20261005_211923_c5babc65",
           "status": "success"
         }
       ]
@@ -787,11 +877,11 @@
       "case_id": "E15",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.53,
+      "seconds": 5.97,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.5,
+        "duration_seconds": 5.891,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -831,11 +921,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160639_72e9fd74",
+          "run_id": "run_20261005_211926_fe1e457d",
           "status": "success"
         }
       ]
@@ -844,11 +940,11 @@
       "case_id": "E16",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.48,
+      "seconds": 3.22,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.438,
+        "duration_seconds": 3.125,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -894,11 +990,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160642_04c6ba9c",
+          "run_id": "run_20261005_211932_a87dd3f7",
           "status": "success"
         }
       ]
@@ -907,11 +1009,11 @@
       "case_id": "E17",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.47,
+      "seconds": 8.26,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.719,
+        "duration_seconds": 4.094,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -935,6 +1037,12 @@
           "detail": "语义评审跑完且无运维失败"
         },
         {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
+        },
+        {
           "kind": "consistent_repeat",
           "tier": "gate",
           "passed": true,
@@ -943,11 +1051,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160643_42daa973",
+          "run_id": "run_20261005_211936_3a98d598",
           "status": "success"
         },
         {
-          "run_id": "run_20260929_160645_06245ccc",
+          "run_id": "run_20261005_211940_1f4eb867",
           "status": "success"
         }
       ]
@@ -956,11 +1064,11 @@
       "case_id": "E18",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.33,
+      "seconds": 7.5,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 10.0,
-        "duration_seconds": 3.296,
+        "duration_seconds": 7.453,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1012,11 +1120,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E18\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160647_ba2202f2",
+          "run_id": "run_20261005_211944_6a77ff65",
           "status": "success"
         }
       ]
@@ -1025,11 +1139,11 @@
       "case_id": "E19",
       "verdict": "pass",
       "status": "partial",
-      "seconds": 1.72,
+      "seconds": 4.11,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 1.688,
+        "duration_seconds": 4.032,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1057,11 +1171,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E19\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160650_f321918e",
+          "run_id": "run_20261005_211952_9158b2dc",
           "status": "partial"
         }
       ]
@@ -1070,11 +1190,11 @@
       "case_id": "E20",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.16,
+      "seconds": 7.41,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 3.125,
+        "duration_seconds": 7.281,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1114,11 +1234,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E20\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160652_a10f5db3",
+          "run_id": "run_20261005_211956_efdd1af8",
           "status": "success"
         }
       ]
@@ -1127,11 +1253,11 @@
       "case_id": "E21",
       "verdict": "pass",
       "status": "success",
-      "seconds": 0.99,
+      "seconds": 2.2,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 0.937,
+        "duration_seconds": 2.031,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1165,6 +1291,12 @@
           "tier": "gate",
           "passed": true,
           "detail": "预检判定一致（放行 2 / 拒绝 0）"
+        },
+        {
+          "kind": "table_denied",
+          "tier": "gate",
+          "passed": true,
+          "detail": "越表被拒（t3 ∉ ['t1', 't2']），行为与留痕同一次发生"
         },
         {
           "kind": "critic",
@@ -1201,11 +1333,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E21\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160655_8854dff7",
+          "run_id": "run_20261005_212003_7ecb1d3c",
           "status": "success"
         }
       ]
@@ -1214,11 +1352,11 @@
       "case_id": "E22",
       "verdict": "pass",
       "status": "success",
-      "seconds": 0.98,
+      "seconds": 2.2,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 0.922,
+        "duration_seconds": 2.031,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1276,11 +1414,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E22\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160656_68b264d6",
+          "run_id": "run_20261005_212006_45e56805",
           "status": "success"
         }
       ]
@@ -1289,11 +1433,11 @@
       "case_id": "E23",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.0,
+      "seconds": 2.2,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 0.938,
+        "duration_seconds": 2.047,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1357,11 +1501,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E23\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160657_72cc0b68",
+          "run_id": "run_20261005_212008_a644f833",
           "status": "success"
         }
       ]
@@ -1370,11 +1520,11 @@
       "case_id": "E24",
       "verdict": "pass",
       "status": "success",
-      "seconds": 0.95,
+      "seconds": 2.48,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 0.922,
+        "duration_seconds": 2.328,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1420,11 +1570,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E24\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160658_39a06006",
+          "run_id": "run_20261005_212010_88a21f41",
           "status": "success"
         }
       ]
@@ -1433,11 +1589,11 @@
       "case_id": "E25",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.16,
+      "seconds": 0.44,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 0.0,
-        "duration_seconds": 0.109,
+        "duration_seconds": 0.281,
         "tasks": 0.0,
         "unexplained_numbers": 0.0
       },
@@ -1455,6 +1611,12 @@
           "detail": "degraded_reason=pack_contract 期望=pack_contract"
         },
         {
+          "kind": "table_denied",
+          "tier": "gate",
+          "passed": true,
+          "detail": "越表被拒（t2 ∉ ['t1']），行为与留痕同一次发生"
+        },
+        {
           "kind": "report_contains",
           "tier": "gate",
           "passed": true,
@@ -1465,11 +1627,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "无禁用词"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E25\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160659_57dff49d",
+          "run_id": "run_20261005_212013_d35bd5a5",
           "status": "degraded"
         }
       ]
@@ -1478,11 +1646,11 @@
       "case_id": "E26",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.62,
+      "seconds": 6.08,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 2.609,
+        "duration_seconds": 5.984,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1528,11 +1696,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=skipped：表不足 2 张：dataset_scope 的策略是不做表级收窄"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160659_8967e2f8",
+          "run_id": "run_20261005_212013_a5d0d698",
           "status": "success"
         }
       ]
@@ -1541,11 +1715,11 @@
       "case_id": "E27",
       "verdict": "pass",
       "status": "success",
-      "seconds": 1.03,
+      "seconds": 2.19,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 1.0,
+        "duration_seconds": 2.047,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1621,11 +1795,17 @@
           "tier": "gate",
           "passed": true,
           "detail": "语义评审跑完且无运维失败"
+        },
+        {
+          "kind": "guard_selfcheck",
+          "tier": "gate",
+          "passed": true,
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E27\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20260929_160702_b1008579",
+          "run_id": "run_20261005_212019_aad6348a",
           "status": "success"
         }
       ]

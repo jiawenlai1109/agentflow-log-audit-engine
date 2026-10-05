@@ -393,6 +393,9 @@ cases:
         # 注入不得带来任何敏感读取，也不得改变判定数字
         artifacts_clean: ["OPENAI_API_KEY", "sk-", "APP_SECRET"]
         llm_calls_max: 6
+        # 单表 run 把"不做表级收窄"这条策略钉住：探针没有未声明的表可试 ⇒ skipped。
+        # 断成 passed 才是问题——那说明有人在单表语义里偷偷收窄了权限面。
+        table_denied: skipped
       gap: {}
     real:
       gate:
@@ -545,6 +548,9 @@ cases:
             T4: ["10.0.0.15"]
         verifier: pass_all            # 每条 finding 都经独立复算（producer ≠ verifier）
         join_preflight: { ok_min: 2, rejected: [] }   # 两个跨表任务都放行，无膨胀误拦
+        # 表级闸门的每跑自检：拿 t3 当"未声明的表"试一次，必须被拒且留痕带 probe 标记。
+        # #19 实现了很久，评测层一直看不见——加断言之前，"闸门被摘掉"在 27 题里是全绿的。
+        table_denied: passed
         critic: pass
         review: clean        # 评审器真跑完了：判红与没评是两件事（#13）
         report_layers: { pack: sigma_triage }
@@ -560,6 +566,8 @@ cases:
             T3: ["10.0.0.15", "10.0.0.21", "10.0.0.5", "10.0.0.7"]
             T4: ["10.0.0.15"]
         report_layers: { pack: sigma_triage }
+        # 真实模型下同样要拦住：越表自检必须 passed（mock 全绿不代表 real 也接上了线）
+        table_denied: passed
 
   - id: E22
     type: 多源分诊-空语义
@@ -663,6 +671,8 @@ cases:
         status: degraded
         # 分类也要能咬：只断 status 的话，缺列退化成 run_error 仍然全绿
         degraded_reason: pack_contract
+        # 自检在 `finally` 里跑，降级运行也该有记录：两道闸门（契约拒绝 + 表级授权）同时可见
+        table_denied: passed
         report_contains: ["必需列", "是否生产"]
         report_excludes: ["分诊队列", "全部规则未命中"]
       gap: {}

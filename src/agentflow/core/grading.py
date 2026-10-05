@@ -378,6 +378,51 @@ def _p_review(evidence, params, mode):
     return state == params, f"review={state} 期望={params}" + (f"（{error}）" if error else "")
 
 
+def guard_state(evaluation: dict[str, Any] | None) -> str:
+    """表级授权闸门这次的状态：`passed` / `skipped` / `violated` / `missing`。
+
+    判据只有一份，谓词与 runner 下限共用它（与 `review_state` 同一个道理）——两处各写一遍
+    就会出现"审计写着闸门没生效、门禁照旧绿"的分叉。
+    `missing` 表示引擎压根没记这一栏：自检被摘掉了，这是回归，不能当成"没测到"。
+    """
+    record = (evaluation or {}).get("guard_selfcheck") or {}
+    if not record.get("ran"):
+        return "missing"
+    return str(record.get("state") or "missing")
+
+
+def _p_table_denied(evidence, params, mode):
+    """表级授权闸门的**每跑自检**结论（#19 那道闸门进 harness）。
+
+    断言的不是"某个模型试图越表"，而是"系统自己试了一次，闸门拒了"——所以除了 state
+    还要求 transcript 里那条 `tool_denied_table` **带着 probe 标记**：行为与留痕必须同一次
+    发生，否则就成了"报告说拦下了、审计里查不到"。`denied_table` 必须在 `declared_refs`
+    之外，否则这道题测的根本不是收窄（探针自己把权限点全了 = 假通过）。
+    """
+    evaluation = evidence["evaluation"] or {}
+    record = evaluation.get("guard_selfcheck") or {}
+    state = guard_state(evaluation)
+    if state != params:
+        return False, f"guard={state} 期望={params}：" + str(record.get("reason") or "没有自检记录")
+    if state != "passed":
+        return True, f"guard={state}：{record.get('reason')}"
+    denied = str(record.get("denied_table") or "")
+    declared = [str(ref) for ref in (record.get("declared_refs") or [])]
+    if denied and denied in declared:
+        return False, f"探针点名的表 {denied} 就在 declared_refs {declared} 里：这道题没在测收窄"
+    probe_events = [
+        entry
+        for entry in evidence["transcript"]
+        if entry.get("event") == "tool_denied_table" and entry.get("probe") == "table_guard_selfcheck"
+    ]
+    if not probe_events:
+        return False, "自检判 passed，但 transcript 里没有带 probe 标记的 tool_denied_table：行为与留痕分叉了"
+    last = probe_events[-1]
+    if str(last.get("declared_refs")) != str(declared):
+        return False, f"留痕的 declared_refs={last.get('declared_refs')} 与自检记录 {declared} 不一致"
+    return True, f"越表被拒（{denied} ∉ {declared}），行为与留痕同一次发生"
+
+
 def _p_replan(evidence, params, mode):
     actual = int((evidence["evaluation"] or {}).get("replan_used") or 0)
     if isinstance(params, int):
@@ -587,6 +632,7 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "replan": _p_replan,
     "clarify": _p_clarify,
     "join_preflight": _p_join_preflight,
+    "table_denied": _p_table_denied,
     "report_layers": _p_report_layers,
     "transcript_has": _p_transcript_has,
     "artifacts_clean": _p_artifacts_clean,

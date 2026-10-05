@@ -12,9 +12,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from agentflow.core import dataset_scope
 from agentflow.core.budget import BudgetCounter
 from agentflow.core.context import RunContext, new_run_id
 from agentflow.core.messages import AgentMessage
+from agentflow.core.tools import TableViolationError
 from agentflow.core.transcript import TranscriptWriter
 
 
@@ -207,6 +209,7 @@ class Orchestrator:
             self._emit({"type": "error", "error": display_error(exc)})
         finally:
             duration = round(time.monotonic() - started, 3)
+            self._table_guard_selfcheck(ctx)
             self._write_evaluation(ctx, status, duration)
             if ctx.mcp is not None:
                 # 外部 server 是子进程：不关就是每跑一次漏一个进程，
@@ -788,6 +791,80 @@ class Orchestrator:
             )
         ctx.results[task_id]["intermediate_file"] = str(target)
 
+    # ------------------------------------------------------------ 表级授权每跑自检
+    def _table_guard_selfcheck(self, ctx: RunContext) -> None:
+        """拿一张"没被声明"的表，走引擎自己的调用点去要读权限——被拒才算闸门接在线路上。
+
+        为什么写在 `finally` 而不是只塞进某道评测题：表级授权是每次运行都依赖的下限，
+        只有被点名的题会跑到，就等于"没被点名的 run 不设防"（与 runner 侧
+        `review_completed` 下限同一条理由）。
+
+        三种结果分开记，不压成一个布尔：
+        - `passed`：探针被 `TableViolationError` 拒掉 ⇒ 闸门在场且生效；
+        - `skipped`：这次测不着——表不足两张（`dataset_scope` 的策略是不做表级收窄，
+          偷偷收窄等于改语义），或探针用的工具压根不在角色白名单里（没走到闸门，
+          跳过不能算通过）；
+        - `violated`：该被拒却没被拒（闸门失效），或被**别的**异常类型拒了
+          （以为在测表级闸门、其实在测别的那道——两种都危险，都留着让人看得见）。
+
+        探针只被拒、不改判：返回内容一律丢弃（免得把未授权数据落进产物），
+        自检自己出任何意外也只记录，不许把一次健康运行打成 degraded。
+        """
+        tables = list(getattr(ctx.bundle, "tables", []) or [])
+        minimum = dataset_scope.MIN_MULTI_REFS
+        result: dict[str, Any] = {
+            "ran": True,
+            "tables": len(tables),
+            "state": "skipped",
+            "reason": f"表不足 {minimum} 张：dataset_scope 的策略是不做表级收窄",
+        }
+        if len(tables) >= minimum:
+            target = tables[-1]
+            declared = [str(table.id) for table in tables[:-1]]
+            probe = next(
+                (
+                    (agent, "read_artifact")
+                    for agent in ("executor", "visualizer")
+                    if "read_artifact" in self.registry.whitelist_for(agent)
+                ),
+                None,
+            )
+            result.update(declared_refs=declared, denied_table=str(target.id))
+            if probe is None:
+                result["reason"] = (
+                    "read_artifact 不在 executor/visualizer 白名单里：探针走不到表级闸门，跳过不算通过"
+                )
+            else:
+                agent_name, tool_name = probe
+                try:
+                    self.registry.call(
+                        agent_name,
+                        tool_name,
+                        ctx,
+                        _scope={
+                            "task_id": 0,
+                            "grants": [],
+                            "dataset_refs": declared,
+                            # 探针必须自证是探针：不带标记，transcript 里就会留下一条
+                            # "某角色试图读未声明的表"，而那其实是系统在测试自己——
+                            # 留痕不能让人误读成对模型的指控。
+                            "probe": "table_guard_selfcheck",
+                        },
+                        path=str(target.path),
+                    )
+                except TableViolationError as exc:
+                    result.update(state="passed", reason=str(exc)[:200])
+                except Exception as exc:  # noqa: BLE001 - 异常类型不对也要落成记录
+                    result.update(
+                        state="violated",
+                        reason=f"越表没有落成 TableViolationError，实际是 {type(exc).__name__}: {str(exc)[:180]}",
+                    )
+                else:
+                    result.update(state="violated", reason="越表读被放行：表级授权闸门未生效")
+        ctx.guard_selfcheck = result
+        if ctx.transcript is not None:
+            ctx.transcript.write({"event": "guard_selfcheck", **result})
+
     def _write_evaluation(self, ctx: RunContext, status: str, duration: float) -> None:
         figures = ctx.figures
         chart_attempted = sum(
@@ -807,6 +884,9 @@ class Orchestrator:
             "clarify": ctx.clarify,
             # M2-3：派发前 join 预检的逐任务判定（含基数与被拒原因），数字可追回键列计数
             "join_preflight": ctx.join_preflight,
+            # 表级授权闸门这次到底生没生效（state: passed/skipped/violated）。
+            # 没有这一栏，"闸门实现了"与"闸门还接在线路上"只能靠读代码猜。
+            "guard_selfcheck": ctx.guard_selfcheck,
             "task_states": ctx.task_states,
             "degraded_reason": ctx.degraded_reason,
             "chart_success": chart_success if chart_attempted else None,
