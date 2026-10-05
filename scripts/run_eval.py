@@ -48,13 +48,18 @@ SUITE_PATH = PROJECT_ROOT / "evals" / "suite.yaml"
 BASELINE_PATH = PROJECT_ROOT / "evals" / "baseline.json"
 HARNESS_FILES = [SUITE_PATH, PROJECT_ROOT / "src" / "agentflow" / "core" / "grading.py", Path(__file__)]
 
-# 指标回归容差：低于这个幅度的波动视为噪声，不阻塞
-METRIC_TOLERANCE = {
-    "numbers_traceable_mean": 0.02,   # 绝对差
+# 指标回归容差：低于这个幅度的波动视为噪声，不阻塞。
+# 方向一律写成「变坏才红」：符号写反会放行成本上涨、反而把一次提速判成回归（真踩过）。
+METRIC_TOLERANCE: dict[str, float] = {
+    "numbers_traceable_mean": 0.02,   # 绝对降幅
     "verifier_checked": 0,            # 校验覆盖数只许持平或涨
-    "avg_llm_calls": 0.25,            # 相对涨幅 25%
-    "avg_duration": 0.5,              # 相对涨幅 50%
+    "avg_llm_calls": 0.25,            # 相对涨幅：多调 25% 的模型就是多花 25% 的钱
 }
+
+# 只记录、不阻塞：墙钟在 CI(ubuntu) 与本机(Windows) 之间、空载与满载之间没有可比性。
+# 把它留在阻塞集里，等于给门禁装一个必然抖的触发器——真回归会被负载噪声淹掉。
+# 超阈值照样打印出来给人看，但它不改判、不影响退出码。
+METRIC_WATCH: dict[str, float] = {"avg_duration": 0.5}
 
 
 # ---------------------------------------------------------------- golden 重算
@@ -437,13 +442,19 @@ def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def compare_baseline(current: dict[str, Any], baseline: dict[str, Any], check_aggregate: bool = True) -> list[str]:
-    """回归判定：逐题 gate 结论 + 聚合指标双路。
+def compare_baseline(
+    current: dict[str, Any], baseline: dict[str, Any], check_aggregate: bool = True
+) -> tuple[list[str], list[str]]:
+    """回归判定：逐题 gate 结论 + 聚合指标双路。返回 `(判红, 只记录的提示)` 两栏。
 
     题集不一致时调用方应传 check_aggregate=False——均值在不同题数之间没有可比性，
     只有逐题 gate 结论可比。
+
+    两栏的分工是本批的门禁立场：只有可比且会变坏的量进 `判红`，墙钟那类跨机器不可比
+    的量进 `只记录的提示`——判红会改 exit code，提示不会。
     """
     problems: list[str] = []
+    notices: list[str] = []
     previous = {r["case_id"]: r for r in baseline.get("results", [])}
     for case in current["results"]:
         before = previous.get(case["case_id"])
@@ -453,24 +464,39 @@ def compare_baseline(current: dict[str, Any], baseline: dict[str, Any], check_ag
         if before and before.get("verdict") == "pass" and case["verdict"] == "xpass":
             problems.append(f"{case['case_id']} XPASS：已知缺口被填上，请重新分类 gap→gate")
     if not check_aggregate:
-        return problems
+        return problems, notices
     base_agg = baseline.get("aggregate") or {}
     for key, tolerance in METRIC_TOLERANCE.items():
         now, was = current["aggregate"].get(key), base_agg.get(key)
         if now is None or was is None:
             continue
-        if key in ("numbers_traceable_mean",):
-            if was - now > tolerance:
-                problems.append(f"指标回归：{key} {was} → {now}（容差 {tolerance}）")
-        elif key == "verifier_checked":
-            if now < was - tolerance:
-                problems.append(f"指标回归：{key} {was} → {now}（校验覆盖率下降）")
-        elif was and (was - now) / was > tolerance:
-            problems.append(f"指标回归：{key} {was} → {now}（容差 {tolerance:.0%}）")
-    return problems
+        # 「变坏」的定义分两族：覆盖类指标只看下降，成本类指标只看上涨。
+        if key in ("numbers_traceable_mean", "verifier_checked"):
+            worse = was - now
+            broke = worse > tolerance
+        else:
+            worse = (now - was) / was if was else 0.0
+            broke = worse > tolerance
+        if broke:
+            problems.append(f"指标回归：{key} {was} → {now}（容差 {tolerance}）")
+    for key, tolerance in METRIC_WATCH.items():
+        now, was = current["aggregate"].get(key), base_agg.get(key)
+        if now is None or was is None or not was:
+            continue
+        delta = (now - was) / was
+        if abs(delta) > tolerance:
+            notices.append(
+                f"{key} {was} → {now}（{delta:+.0%}，墙钟跨机器/跨负载不可比，只记录不阻塞）"
+            )
+    return problems, notices
 
 
-def print_report(results: list[dict[str, Any]], summary: dict[str, Any], problems: list[str]) -> None:
+def print_report(
+    results: list[dict[str, Any]],
+    summary: dict[str, Any],
+    problems: list[str],
+    notices: list[str] | None = None,
+) -> None:
     print("=" * 78)
     for row in results:
         if "checks" not in row:
@@ -505,6 +531,11 @@ def print_report(results: list[dict[str, Any]], summary: dict[str, Any], problem
         print("门禁判红：")
         for line in problems:
             print(f"  ✘ {line}")
+    if notices:
+        print("-" * 78)
+        print("只记录的提示（不改判、不影响退出码）：")
+        for line in notices:
+            print(f"  ▲ {line}")
     print("=" * 78)
 
 
@@ -598,6 +629,7 @@ def main() -> int:
         Path(args.json).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     problems: list[str] = []
+    notices: list[str] = []
     if args.update_baseline:
         # 重定基线这一次不做回归比对：与一份不可比的旧基线（题数/模式不同）判红没有意义
         print("提示：--update-baseline 本次不做回归比对，仅以当前结果重写基线")
@@ -610,9 +642,9 @@ def main() -> int:
                 f"提示：基线 {len(baseline.get('results') or [])} 题、本次 {len(results)} 题，"
                 "题集不一致时聚合指标不可比，只做逐题 gate 比对"
             )
-            problems = compare_baseline(payload, baseline, check_aggregate=False)
+            problems, notices = compare_baseline(payload, baseline, check_aggregate=False)
         else:
-            problems = compare_baseline(payload, baseline)
+            problems, notices = compare_baseline(payload, baseline)
     else:
         print("提示：还没有基线（evals/baseline.json），本次只出结果不设门禁")
 
@@ -637,7 +669,7 @@ def main() -> int:
         if wanted:
             print("  ⚠ 注意：本次是子集运行，基线只覆盖被跑到的题——全量门禁请对全量写基线")
 
-    print_report(results, summary, problems)
+    print_report(results, summary, problems, notices)
     failed_cases = [r for r in results if r.get("verdict") in ("fail", "error", "xpass")]
     return 1 if (problems or failed_cases) else 0
 

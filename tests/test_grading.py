@@ -521,3 +521,128 @@ def test_eval_runner_survives_a_non_utf8_console(tmp_path):
     )
     assert process.returncode == 0, (process.stdout[-400:] + process.stderr[-400:])
     assert "题数 1" in process.stdout  # 汇总真要打出来，"没崩但也没输出"不算过
+
+
+# ---------------------------------------------------- 聚合容差：方向与「判红 / 只记录」两栏
+
+# 现场：判据 `(was - now) / was > tolerance` 与注释里写的「相对涨幅」方向相反，于是
+# 平均 LLM 调用涨 10 倍、平均耗时涨 5 倍都照样放行，而一次无害的提速反而被判成回归。
+# 这条路此前在 tests/ 里零覆盖——门禁自己没被门禁管过。
+
+
+def _agg(**overrides):
+    """与 baseline.json 的 aggregate 同形的合成读数（基准取真实全量跑出来的值）。"""
+    return {
+        "numbers_traceable_mean": 1.0,
+        "verifier_checked": 17,
+        "avg_llm_calls": 4.9259,
+        "avg_duration": 1.7778,
+        **overrides,
+    }
+
+
+def _payload(aggregate):
+    return {"results": [], "aggregate": aggregate}
+
+
+@pytest.mark.parametrize(
+    ("key", "now"),
+    [
+        ("avg_llm_calls", 12.0),  # 贵 2.4 倍：多调模型就是多花钱
+        ("avg_llm_calls", 50.0),  # 贵 10 倍
+        ("numbers_traceable_mean", 0.90),  # 追溯率掉下来
+        ("verifier_checked", 12),  # 校验覆盖掉下来
+    ],
+)
+def test_worse_aggregate_metrics_are_gate_failures(key, now):
+    """变坏的那一侧必须判红——旧代码在成本/耗时这一侧永远不红。"""
+    runner = _load_runner()
+    problems, notices = runner.compare_baseline(_payload(_agg(**{key: now})), _payload(_agg()))
+    assert any(key in line for line in problems), (problems, notices)
+
+
+@pytest.mark.parametrize(
+    ("key", "now"),
+    [
+        ("avg_llm_calls", 3.0),  # 便宜 39%：旧代码把它判成回归
+        ("avg_llm_calls", 4.5),  # 略降：噪声区
+        ("avg_llm_calls", 5.5),  # 涨 12%：容差内的噪声
+        ("verifier_checked", 20),  # 覆盖变多是改进
+        ("numbers_traceable_mean", 1.0),  # 持平
+    ],
+)
+def test_better_or_flat_metrics_never_block(key, now):
+    """改进与噪声都不该改判，否则门禁会把人支去查一个不存在的退化。"""
+    runner = _load_runner()
+    problems, notices = runner.compare_baseline(_payload(_agg(**{key: now})), _payload(_agg()))
+    assert problems == [], problems
+
+
+def test_wall_clock_is_recorded_not_blocked():
+    """墙钟跨机器/跨负载不可比：超阈值照样说出来，但不改判。
+
+    数字取 2026-10-05 那次实测（本机满载 5.8958s vs 基线空载 1.7778s，+232%）。
+    """
+    runner = _load_runner()
+    problems, notices = runner.compare_baseline(_payload(_agg(avg_duration=5.8958)), _payload(_agg()))
+    assert problems == [], "耗时不可比，不该进阻塞集"
+    assert len(notices) == 1, notices
+    assert "avg_duration" in notices[0] and "5.8958" in notices[0], notices
+    assert "+" in notices[0] and "%" in notices[0], "提示要说清涨了多少，只报个键名等于没报"
+
+
+def test_every_compare_baseline_call_site_unwraps_both_halves():
+    """接线：两栏判据都得被调用点接走——只接 problems 就等于把提示静默吞掉。
+
+    「下限存在」与「下限每次真的挂上去」是两件事（#13 的 D 位点当初就是这么漏的），
+    所以这条不测函数返回值，测 `main` 里每个调用点的解包形状。
+    """
+    import ast
+
+    tree = ast.parse((PROJECT_ROOT / "scripts" / "run_eval.py").read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "compare_baseline"
+    ]
+    assert len(calls) >= 2, f"调用点比预期少（{len(calls)}），这条守卫的覆盖面在缩"
+    unwrapped = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        if not (isinstance(node.value.func, ast.Name) and node.value.func.id == "compare_baseline"):
+            continue
+        if isinstance(node.targets[0], ast.Tuple) and len(node.targets[0].elts) == 2:
+            unwrapped.add(id(node.value))
+    assert len(unwrapped) == len(calls), "有调用点没把「只记录的提示」接走"
+
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    for node in ast.walk(main):
+        if isinstance(node, ast.Return) and node.value is not None:
+            names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            if "problems" in names:
+                assert "notices" not in names, "提示被塞进退出码了——墙钟会重新变成必然抖的触发器"
+
+
+def test_notices_reach_the_report(capsys):
+    """提示真要打印出来：不打印的提示等于没有，而它也不该伪装成判红。"""
+    runner = _load_runner()
+    summary = {
+        "cases": 27,
+        "pass": 27,
+        "fail": 0,
+        "xpass": 0,
+        "error": 0,
+        "gate_checks": 157,
+        "gate_failed": 0,
+        "gap_checks": 12,
+        "gap_passed": 0,
+        "numbers_traceable_mean": 1.0,
+        "avg_llm_calls": 4.9259,
+        "avg_duration": 5.8958,
+        "verifier_checked": 17,
+    }
+    runner.print_report([], summary, [], ["avg_duration 1.7778 → 5.8958（+232%，只记录不阻塞）"])
+    out = capsys.readouterr().out
+    assert "只记录的提示" in out and "5.8958" in out, out[-300:]
+    assert "门禁判红" not in out, "提示不该借用判红那条通道（与 #13 同一个立场）"
