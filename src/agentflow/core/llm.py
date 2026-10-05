@@ -20,6 +20,19 @@ class LLMError(RuntimeError):
     """LLM 调用失败（网络 / 鉴权 / 响应结构异常 / 预算耗尽）。"""
 
 
+class EmptyContentError(LLMError):
+    """正文为空（`content` 不是字符串）的专用错误，带一份可比的结构化细节。
+
+    思考档模型会把 `max_tokens` 花在 `reasoning_content` 上，此时正文是 `null`。
+    带出 `detail` 是为了让"这一次为什么没正文"能落到产物里被归因——
+    只留一句 human text，事后谁也分不出是网关坏了还是预算被思考吃满。
+    """
+
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 class OutputValidationError(RuntimeError):
     """LLM 输出无法解析为期望的结构。"""
 
@@ -136,6 +149,9 @@ class OpenAILLM(BaseLLM):
         timeout: int = 120,
         max_retries: int = 2,
         thinking: str | None = None,
+        thinking_budget_retry: bool = False,
+        thinking_budget_factor: float = 2.0,
+        max_tokens_cap: int = 8000,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -154,6 +170,12 @@ class OpenAILLM(BaseLLM):
         if thinking not in (None, "enabled", "disabled"):
             raise LLMError(f"llm.thinking 只接受 enabled / disabled / 留空，收到 {thinking!r}")
         self.thinking = thinking
+        # 预算被思考吃满时是否提额重试一次（默认关：多打一次真实调用就是要多花一次钱，
+        # 该由运维显式开）。配置一律用 `.get` 读，不塞进 DEFAULT_CONFIG——
+        # 往默认配置里加键会改变 `config` 归因指纹，制造一次"配置变了而行为没变"的噪声。
+        self.thinking_budget_retry = bool(thinking_budget_retry)
+        self.thinking_budget_factor = float(thinking_budget_factor)
+        self.max_tokens_cap = int(max_tokens_cap)
 
     def complete(
         self,
@@ -170,6 +192,35 @@ class OpenAILLM(BaseLLM):
         }
         if self.thinking:
             payload["thinking"] = {"type": self.thinking}
+        data = self._request(payload)
+        text, empty = self._text_of(data, max_tokens=max_tokens)
+        if text is not None:
+            return text
+        # 只有"reasoning 在场 + finish_reason=length"才是预算被思考吃满的签名，
+        # 值得再花一次真实调用去提额重试；结构异常重试十次也一样坏。
+        retry_at = self._retry_target(max_tokens, empty)
+        if retry_at:
+            data = self._request({**payload, "max_tokens": retry_at})
+            text, second = self._text_of(data, max_tokens=retry_at)
+            if text is not None:
+                self._note({**empty, "recovered_with": retry_at})
+                return text
+            empty = second
+        self._note(empty)
+        hint = (
+            "预算被思考链吃满：配 llm.thinking=disabled、llm.thinking_budget_retry=true 或提 max_tokens"
+            if empty["reasoning_chars"]
+            else "上游没给正文，也没记 reasoning（多半是网关/模型返回结构异常）"
+        )
+        raise EmptyContentError(
+            f"LLM 返回的 content 不是文本（调用方={empty['agent']}、"
+            f"finish_reason={empty['finish_reason']}、"
+            f"reasoning_content {empty['reasoning_chars']} 字）：{hint}",
+            detail=empty,
+        )
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """发一次 chat/completions，含传输层退避重试与 usage 记账。"""
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -206,29 +257,40 @@ class OpenAILLM(BaseLLM):
                 int(usage.get("prompt_tokens", 0) or 0),
                 int(usage.get("completion_tokens", 0) or 0),
             )
+        return data
+
+    def _text_of(self, data: dict[str, Any], *, max_tokens: int) -> tuple[str | None, dict[str, Any]]:
+        """取正文；取不到时返回 `(None, 形状细节)`——细节里没有正文，也没有凭据。"""
         choices = data.get("choices")
         if not choices:
             raise LLMError(f"LLM 响应结构异常: {str(data)[:300]}")
         message = choices[0].get("message") or {}
         content = message.get("content")
-        if not isinstance(content, str):
-            # 思考档模型会把 max_tokens 花在 reasoning 上，此时正文返回的是 null（不是空串）。
-            # 原样把 None 交出去，下游会在 `strip_code_fence` / `extract_json` 的 .strip()
-            # 上炸成 AttributeError——错误类型与真原因毫无关系，还会穿出 DAG 把整条 run 打死
-            # （2026-10-05 real 模式实测）。在这里判死，它才能落到既有的 LLM_ERROR 错误路由
-            # 与"运维失败不冒充内容结论"（#13）那条通道上。
-            reasoning = message.get("reasoning_content") or ""
-            finish = choices[0].get("finish_reason")
-            hint = (
-                "预算被思考链吃满：配 llm.thinking=disabled 或提 max_tokens"
-                if reasoning
-                else "上游没给正文，也没记 reasoning（多半是网关/模型返回结构异常）"
-            )
-            raise LLMError(
-                f"LLM 返回的 content 不是文本（finish_reason={finish}、"
-                f"reasoning_content {len(reasoning)} 字）：{hint}"
-            )
-        return content
+        if isinstance(content, str):
+            # 空串与 null 分两类：空串是"模型说了句没有内容的話"，交回下游按内容判定
+            return content, {}
+        reasoning = message.get("reasoning_content") or ""
+        return None, {
+            "agent": getattr(self.agent_local, "agent", None) or "unknown",
+            "finish_reason": choices[0].get("finish_reason"),
+            "reasoning_chars": len(reasoning),
+            "max_tokens": max_tokens,
+            "thinking": self.thinking,
+        }
+
+    def _retry_target(self, max_tokens: int, empty: dict[str, Any]) -> int:
+        """要不要提额重试，判据写成可审计的一条：签名对、开关开、还没顶到封顶。"""
+        if not self.thinking_budget_retry:
+            return 0
+        if empty.get("finish_reason") != "length" or not empty.get("reasoning_chars"):
+            return 0
+        raised = min(int(max_tokens * self.thinking_budget_factor), self.max_tokens_cap)
+        return raised if raised > max_tokens else 0
+
+    def _note(self, empty: dict[str, Any]) -> None:
+        """空正文的形状进本次 run 的预算对象——`evaluation.json` 与 transcript 都从那里取。"""
+        if self.budget is not None:
+            self.budget.note_empty_content(empty)
 
     @staticmethod
     def _backoff(attempt: int, retry_after: str | None) -> float:

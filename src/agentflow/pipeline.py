@@ -90,6 +90,10 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
             model=model or llm.model,
             max_retries=llm.max_retries,
             thinking=thinking or llm.thinking,
+            # 这三个也要跟着克隆走：漏一个就等于"按角色换了个模型，顺手把预算重试的开关弄丢了"
+            thinking_budget_retry=llm.thinking_budget_retry,
+            thinking_budget_factor=llm.thinking_budget_factor,
+            max_tokens_cap=llm.max_tokens_cap,
         )
         clone.budget = llm.budget
         return clone
@@ -206,6 +210,9 @@ def run_analysis(
                 base_url=llm_cfg.get("base_url") or None,
                 model=llm_cfg.get("model") or None,
                 thinking=llm_cfg.get("thinking") or None,
+                thinking_budget_retry=llm_cfg.get("thinking_budget_retry") or False,
+                thinking_budget_factor=llm_cfg.get("thinking_budget_factor") or 2.0,
+                max_tokens_cap=llm_cfg.get("max_tokens_cap") or 8000,
             )
         )
 

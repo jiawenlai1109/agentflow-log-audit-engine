@@ -34,14 +34,33 @@ class _Response(io.BytesIO):
 
 def install(monkeypatch, payload: dict[str, Any]) -> list[dict[str, Any]]:
     """把 `llm.urllib.request.urlopen` 换成回放器，返回被发出的请求体列表。"""
+    return install_sequence(monkeypatch, [payload])
+
+
+def install_sequence(monkeypatch, payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按次序回放多个响应——测"提额重试"必须能让第二次调用看到不同形状。"""
     sent: list[dict[str, Any]] = []
+    queue = list(payloads)
 
     def fake_urlopen(request, timeout=None):  # noqa: ANN001 - 与被替换函数的形状一致
         sent.append(json.loads(request.data.decode("utf-8")))
+        payload = queue.pop(0) if queue else payloads[-1]
         return _Response(json.dumps(payload).encode("utf-8"))
 
     monkeypatch.setattr("agentflow.core.llm.urllib.request.urlopen", fake_urlopen)
     return sent
+
+
+def _null_payload(reasoning: str = "先想一步" * 4, finish: str = "length") -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": None, "reasoning_content": reasoning},
+                "finish_reason": finish,
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 8},
+    }
 
 
 def _llm(**kwargs: Any) -> OpenAILLM:
@@ -142,3 +161,74 @@ def test_null_content_does_not_crash_through_the_dag(monkeypatch, tmp_path):
     assert evaluation["degraded_reason"] == "llm_error", evaluation["degraded_reason"]
     report = (Path(result["outputs_dir"]) / "report.md").read_text(encoding="utf-8")
     assert "NoneType" not in report, "错误正文又变成一句没人看得懂的 AttributeError 了"
+    # 空正文的形状必须留在产物里：只有一行报错文本闪过，事后没人能归因是哪一步在烧思考
+    evaluation = json.loads((Path(result["outputs_dir"]) / "evaluation.json").read_text(encoding="utf-8"))
+    assert evaluation["llm_empty_content"], "空正文没落进 evaluation.json"
+    assert evaluation["llm_empty_content"][0]["finish_reason"] == "length"
+    events = [
+        json.loads(line)
+        for line in (Path(result["outputs_dir"]) / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [e for e in events if e.get("event") == "llm_empty_content"], "transcript 里查不到这次空正文"
+
+
+# ------------------------------------------------------------------ 预算被思考吃满时的提额重试
+
+
+def test_retry_off_by_default_costs_one_call(monkeypatch):
+    """默认不开重试：多打一次真实调用就是要多花一次钱，这个开关不该由系统替用户做主。"""
+    sent = install(monkeypatch, _null_payload())
+    with pytest.raises(LLMError):
+        _llm().complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=200)
+    assert len(sent) == 1, sent
+
+
+def test_budget_retry_recovers_with_a_larger_envelope(monkeypatch):
+    """签名对（length + reasoning 在场）时提额重试一次，并把"靠多大预算救回来"记下来。"""
+    install_sequence(monkeypatch, [_null_payload(), _text_payload("print(1)")])
+    llm = _llm(thinking_budget_retry=True)
+    from agentflow.core.budget import BudgetCounter
+
+    llm.budget = BudgetCounter(limit=30)
+    assert llm.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=200) == "print(1)"
+    assert llm.budget.empty_content == [
+        {
+            "agent": "unknown",
+            "finish_reason": "length",
+            "reasoning_chars": 16,
+            "max_tokens": 200,
+            "thinking": None,
+            "recovered_with": 400,
+        }
+    ], llm.budget.empty_content
+
+
+def test_retry_never_exceeds_the_cap(monkeypatch):
+    """封顶是不许突破的：救不回来就报错，不能把用户的额度顶到未知深度。"""
+    sent = install_sequence(monkeypatch, [_null_payload(), _null_payload()])
+    llm = _llm(thinking_budget_retry=True, max_tokens_cap=256)
+    with pytest.raises(LLMError):
+        llm.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=200)
+    assert [call["max_tokens"] for call in sent] == [200, 256], sent
+
+
+def test_structural_emptiness_is_not_worth_retrying(monkeypatch):
+    """没有 reasoning、也不是 length ⇒ 不是"预算被吃满"，重试只是白烧一次调用。"""
+    sent = install(monkeypatch, _null_payload(reasoning="", finish="stop"))
+    llm = _llm(thinking_budget_retry=True)
+    with pytest.raises(LLMError):
+        llm.complete("你是评审", [{"role": "user", "content": "x"}], max_tokens=200)
+    assert len(sent) == 1, sent
+
+
+def test_clone_carries_every_budget_knob():
+    """按角色换模型时，档位与预算旋钮必须跟着走——漏一个就是"换了模型顺手把开关弄丢了"。"""
+    base = _llm(thinking="disabled", thinking_budget_retry=True, thinking_budget_factor=3.0, max_tokens_cap=4000)
+    clone = _agent_llm(base, {"model": "other"})
+    assert (clone.thinking, clone.thinking_budget_retry, clone.thinking_budget_factor, clone.max_tokens_cap) == (
+        "disabled",
+        True,
+        3.0,
+        4000,
+    )

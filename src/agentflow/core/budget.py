@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 
 class BudgetCounter:
@@ -11,6 +12,13 @@ class BudgetCounter:
         self._used = 0
         self._tokens: dict[str, dict[str, int]] = {}
         self._lock = threading.Lock()
+        # 空正文（思考档吃满预算）的逐次记录：real 批次归因要用，见 core/llm.py 的
+        # EmptyContentError。不记正文，只记形状。
+        self.empty_content: list[dict[str, Any]] = []
+
+    def note_empty_content(self, detail: dict[str, Any]) -> None:
+        with self._lock:
+            self.empty_content.append(detail)
 
     def spend(self, n: int = 1) -> bool:
         """尝试消费 n 次调用额度；超限返回 False。"""

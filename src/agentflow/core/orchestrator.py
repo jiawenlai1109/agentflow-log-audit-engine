@@ -895,6 +895,9 @@ class Orchestrator:
             # 一次 LLM 预算耗尽的运行与一次"报告真有问题"的运行长得一模一样。
             "review_ran": ctx.review_ran,
             "review_infra_error": ctx.review_infra_error,
+            # 空正文（思考档吃满预算）的形状记录：谁在什么预算档上没拿到正文。
+            # 只记形状不记正文——正文本来就没有，而形状是 real 批次归因唯一剩下的东西。
+            "llm_empty_content": list(getattr(ctx.budget, "empty_content", []) or []),
             # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
             "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
             # 多源报告头部会逐张表报行数（"auth.csv 282 行、assets.csv 24 行…"）。
@@ -930,6 +933,11 @@ class Orchestrator:
         (ctx.outputs_dir / "evaluation.json").write_text(
             json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        # 逐条落 transcript：只写在 evaluation 里的话，读一份 transcript 的人看不出
+        # "这一次跑到底有没有在思考上烧过预算"。空正文不是错误已被吞掉，是已经被处理过。
+        for empty in evaluation.get("llm_empty_content") or []:
+            if ctx.transcript is not None:
+                ctx.transcript.write({"event": "llm_empty_content", **empty})
 
     def _write_degraded_report(
         self, ctx: RunContext, failure_info: dict[str, Any]
