@@ -478,6 +478,54 @@ def _p_join_preflight(evidence, params, mode):
     return not problems, "；".join(problems) or f"预检判定一致（放行 {len(passed)} / 拒绝 {len(rejected)}）"
 
 
+def _verified_findings(evidence: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """只收"已被独立复算背书"的发现，并返回被跳过的任务号。
+
+    三元组这条线比的是"报告说的 == 账本记的"。账本自己有没有被复算过是上一道工序
+    （`verdict.verification`）的事——把没背书的东西当成本条线的依据，等于让一条没复核的
+    数字去给另一条数字作证，那就成了自证。跳过哪些任务必须说得出名字：
+    否则"这条线其实什么都没核对"和"全部对上"长得一模一样。
+    """
+    kept: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for task_id, result in sorted(_results(evidence).items(), key=lambda kv: int(str(kv[0]))):
+        findings = ((result or {}).get("summary") or {}).get("findings") or []
+        if not findings:
+            continue
+        if (result or {}).get("verdict", {}).get("verification") != "ok":
+            skipped.append(str(task_id))
+            continue
+        kept.extend(finding for finding in findings if isinstance(finding, dict))
+    return kept, skipped
+
+
+def _p_fact_triples(evidence, params, mode):
+    """事实层三元组逐行等值（主体, 指标, 数值）——追溯率管不到的那批小整数由这条线管。
+
+    为什么要有第二条线：数字可追溯率按大小决定核对哪些数，一百以下的整数被放过；
+    分诊场景里最要紧的数（`生产域失败次数 = 7`、`命中统计 T1=1`）恰好全在那条线之外。
+    而且那条线只问"这个数在不在账本里"，不问"这个数配的是不是这个主体"——把 A 主机的
+    7 印成 B 主机的 9，两个数都在同一本账里，追溯率一分不掉。SOC 里张冠李戴最贵。
+
+    params = `{pack: <包名>}`：档名从包读，不在 suite 里重抄（与 `_p_report_layers` 同一理由）。
+    """
+    from agentflow.core.pack import load_pack
+    from agentflow.core.report_lint import declared_layers, lint_fact_triples
+
+    pack_name = str((params or {}).get("pack") or "")
+    pack = load_pack(pack_name)
+    layers = declared_layers(pack)
+    if not layers:
+        return False, f"场景包 {pack_name} 未声明 report_layers，无承诺可核对"
+    findings, skipped = _verified_findings(evidence)
+    issues = lint_fact_triples(evidence["report"], findings, layers)
+    if issues:
+        return False, "三元组破口 " + "；".join(issue["message"] for issue in issues[:3])
+    if skipped:
+        return False, f"任务 {'、'.join(skipped)} 有发现但未通过独立复算，这条线拒绝为其背书"
+    return True, f"账本 {len(findings)} 条发现与事实层逐行等值（全部经独立复算背书）"
+
+
 def _p_report_layers(evidence, params, mode):
     """报告分档结构断言（M3-3 那道闸门进 harness）。
 
@@ -634,6 +682,7 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "join_preflight": _p_join_preflight,
     "table_denied": _p_table_denied,
     "report_layers": _p_report_layers,
+    "fact_triples": _p_fact_triples,
     "transcript_has": _p_transcript_has,
     "artifacts_clean": _p_artifacts_clean,
     "numbers_traceable_min": _p_numbers_traceable_min,

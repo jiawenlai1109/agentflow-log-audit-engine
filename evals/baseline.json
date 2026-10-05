@@ -1,20 +1,20 @@
 {
   "suite_version": 1,
   "mode": "mock",
-  "generated_at": "2026-10-05 21:20:21",
+  "generated_at": "2026-10-05 22:40:22",
   "aggregate": {
     "cases": 27,
     "pass": 27,
     "fail": 0,
     "xpass": 0,
     "error": 0,
-    "gate_checks": 187,
+    "gate_checks": 192,
     "gate_failed": 0,
     "gap_checks": 12,
     "gap_passed": 0,
     "numbers_traceable_mean": 1.0,
     "avg_llm_calls": 4.9259,
-    "avg_duration": 4.1661,
+    "avg_duration": 2.0938,
     "verifier_checked": 17,
     "fingerprints": {
       "prompt:critic": "d8435a6e38bb",
@@ -31,8 +31,8 @@
       "skill:chart_selection": "541fcfd46ecb",
       "skill:cross_table_triage": "1cb341d774ea",
       "config": "64ce83725f3a",
-      "harness:suite.yaml": "727e19df4121",
-      "harness:grading.py": "cb5983d5c4c4",
+      "harness:suite.yaml": "11cb2e48affe",
+      "harness:grading.py": "d16c649ecd40",
       "harness:run_eval.py": "43eeb57eef34"
     }
   },
@@ -41,11 +41,11 @@
       "case_id": "E01",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.39,
+      "seconds": 2.01,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.297,
+        "duration_seconds": 1.984,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -107,7 +107,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211811_d13cf026",
+          "run_id": "run_20261005_223916_0b0030ec",
           "status": "success"
         }
       ]
@@ -116,11 +116,11 @@
       "case_id": "E02",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.12,
+      "seconds": 2.05,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.063,
+        "duration_seconds": 2.0,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -170,7 +170,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211815_b1bf3bda",
+          "run_id": "run_20261005_223918_467ad627",
           "status": "success"
         }
       ]
@@ -179,11 +179,11 @@
       "case_id": "E03",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.17,
+      "seconds": 3.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 6.078,
+        "duration_seconds": 3.047,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -245,7 +245,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211819_39ea9786",
+          "run_id": "run_20261005_223920_de5ec44b",
           "status": "success"
         }
       ]
@@ -254,11 +254,11 @@
       "case_id": "E04",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.28,
+      "seconds": 3.01,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 6.203,
+        "duration_seconds": 2.969,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -308,7 +308,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211825_1b00308f",
+          "run_id": "run_20261005_223923_14241978",
           "status": "success"
         }
       ]
@@ -317,11 +317,11 @@
       "case_id": "E05",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.25,
+      "seconds": 3.06,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 6.172,
+        "duration_seconds": 3.0,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -371,7 +371,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211832_f1e04117",
+          "run_id": "run_20261005_223926_f91e481e",
           "status": "success"
         }
       ]
@@ -380,11 +380,11 @@
       "case_id": "E06",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.22,
+      "seconds": 3.08,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 6.157,
+        "duration_seconds": 3.032,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -422,7 +422,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211838_0cdad580",
+          "run_id": "run_20261005_223929_bc2f4391",
           "status": "success"
         }
       ]
@@ -431,11 +431,11 @@
       "case_id": "E07",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 4.11,
+      "seconds": 2.06,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 2.0,
-        "duration_seconds": 4.016,
+        "duration_seconds": 2.031,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -467,7 +467,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211844_0f532a67",
+          "run_id": "run_20261005_223933_10662ab1",
           "status": "degraded"
         }
       ]
@@ -476,11 +476,11 @@
       "case_id": "E08",
       "verdict": "pass",
       "status": "success",
-      "seconds": 5.95,
+      "seconds": 3.01,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 5.844,
+        "duration_seconds": 2.937,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -524,7 +524,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211848_82e18c75",
+          "run_id": "run_20261005_223935_af55bf67",
           "status": "success"
         }
       ]
@@ -533,11 +533,11 @@
       "case_id": "E09",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 1.47,
+      "seconds": 0.8,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 2.0,
-        "duration_seconds": 1.39,
+        "duration_seconds": 0.735,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -593,7 +593,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211854_35459e0f",
+          "run_id": "run_20261005_223938_5e3cd644",
           "status": "degraded"
         }
       ]
@@ -602,11 +602,11 @@
       "case_id": "E10",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.23,
+      "seconds": 2.03,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.172,
+        "duration_seconds": 1.984,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -644,7 +644,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211856_cfe9b05d",
+          "run_id": "run_20261005_223938_832bb704",
           "status": "success"
         }
       ]
@@ -653,11 +653,11 @@
       "case_id": "E11",
       "verdict": "pass",
       "status": "success",
-      "seconds": 8.38,
+      "seconds": 4.11,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.156,
+        "duration_seconds": 1.985,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -689,11 +689,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211900_7fdf7c77",
+          "run_id": "run_20261005_223941_ca45a587",
           "status": "success"
         },
         {
-          "run_id": "run_20261005_211904_9966ef2d",
+          "run_id": "run_20261005_223943_ab9d120c",
           "status": "success"
         }
       ]
@@ -702,11 +702,11 @@
       "case_id": "E12",
       "verdict": "pass",
       "status": "success",
-      "seconds": 10.3,
+      "seconds": 5.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.047,
+        "duration_seconds": 1.985,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -738,11 +738,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211909_2f4d8fde",
+          "run_id": "run_20261005_223945_c36f5084",
           "status": "success"
         },
         {
-          "run_id": "run_20261005_211915_d51287a6",
+          "run_id": "run_20261005_223948_04dd4ba7",
           "status": "success"
         }
       ]
@@ -751,11 +751,11 @@
       "case_id": "E13",
       "verdict": "pass",
       "status": "success",
-      "seconds": 4.17,
+      "seconds": 2.02,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.094,
+        "duration_seconds": 1.969,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -787,7 +787,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211919_597a8ff7",
+          "run_id": "run_20261005_223950_557cf046",
           "status": "success"
         }
       ]
@@ -796,11 +796,11 @@
       "case_id": "E14",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.27,
+      "seconds": 1.75,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 3.171,
+        "duration_seconds": 1.703,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -848,6 +848,12 @@
           "detail": "llm_calls=1 上界=6"
         },
         {
+          "kind": "fact_triples",
+          "tier": "gate",
+          "passed": true,
+          "detail": "账本 4 条发现与事实层逐行等值（全部经独立复算背书）"
+        },
+        {
           "kind": "table_denied",
           "tier": "gate",
           "passed": true,
@@ -868,7 +874,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211923_c5babc65",
+          "run_id": "run_20261005_223952_96f7a412",
           "status": "success"
         }
       ]
@@ -877,11 +883,11 @@
       "case_id": "E15",
       "verdict": "pass",
       "status": "success",
-      "seconds": 5.97,
+      "seconds": 3.06,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 5.891,
+        "duration_seconds": 3.016,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -931,7 +937,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211926_fe1e457d",
+          "run_id": "run_20261005_223954_56bb638e",
           "status": "success"
         }
       ]
@@ -940,11 +946,11 @@
       "case_id": "E16",
       "verdict": "pass",
       "status": "success",
-      "seconds": 3.22,
+      "seconds": 1.72,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 3.125,
+        "duration_seconds": 1.687,
         "tasks": 4.0,
         "unexplained_numbers": 0.0
       },
@@ -986,6 +992,12 @@
           "detail": "llm_calls=1 上界=6"
         },
         {
+          "kind": "fact_triples",
+          "tier": "gate",
+          "passed": true,
+          "detail": "账本 0 条发现与事实层逐行等值（全部经独立复算背书）"
+        },
+        {
           "kind": "review_completed",
           "tier": "gate",
           "passed": true,
@@ -1000,7 +1012,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211932_a87dd3f7",
+          "run_id": "run_20261005_223957_7879a273",
           "status": "success"
         }
       ]
@@ -1009,11 +1021,11 @@
       "case_id": "E17",
       "verdict": "pass",
       "status": "success",
-      "seconds": 8.26,
+      "seconds": 4.16,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.094,
+        "duration_seconds": 1.985,
         "tasks": 1.0,
         "unexplained_numbers": 0.0
       },
@@ -1051,11 +1063,11 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211936_3a98d598",
+          "run_id": "run_20261005_223958_29b077ec",
           "status": "success"
         },
         {
-          "run_id": "run_20261005_211940_1f4eb867",
+          "run_id": "run_20261005_224001_abd9d4b0",
           "status": "success"
         }
       ]
@@ -1064,11 +1076,11 @@
       "case_id": "E18",
       "verdict": "pass",
       "status": "success",
-      "seconds": 7.5,
+      "seconds": 4.05,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 10.0,
-        "duration_seconds": 7.453,
+        "duration_seconds": 4.016,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1125,12 +1137,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E18\\bundles\\b"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E18\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211944_6a77ff65",
+          "run_id": "run_20261005_224003_65a58d8c",
           "status": "success"
         }
       ]
@@ -1139,11 +1151,11 @@
       "case_id": "E19",
       "verdict": "pass",
       "status": "partial",
-      "seconds": 4.11,
+      "seconds": 2.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 6.0,
-        "duration_seconds": 4.032,
+        "duration_seconds": 2.031,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1176,12 +1188,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E19\\bundles\\b"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E19\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211952_9158b2dc",
+          "run_id": "run_20261005_224007_b6ab673b",
           "status": "partial"
         }
       ]
@@ -1190,11 +1202,11 @@
       "case_id": "E20",
       "verdict": "pass",
       "status": "success",
-      "seconds": 7.41,
+      "seconds": 3.88,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 7.281,
+        "duration_seconds": 3.797,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1239,12 +1251,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E20\\bundles\\b"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E20\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_211956_efdd1af8",
+          "run_id": "run_20261005_224009_8548db11",
           "status": "success"
         }
       ]
@@ -1253,11 +1265,11 @@
       "case_id": "E21",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.2,
+      "seconds": 1.14,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 2.031,
+        "duration_seconds": 1.062,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1317,6 +1329,12 @@
           "detail": "三档结构一致（6 条发现均落在事实层与建议层）"
         },
         {
+          "kind": "fact_triples",
+          "tier": "gate",
+          "passed": true,
+          "detail": "账本 6 条发现与事实层逐行等值（全部经独立复算背书）"
+        },
+        {
           "kind": "report_contains",
           "tier": "gate",
           "passed": true,
@@ -1338,12 +1356,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E21\\bun"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E21\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212003_7ecb1d3c",
+          "run_id": "run_20261005_224013_43293426",
           "status": "success"
         }
       ]
@@ -1352,11 +1370,11 @@
       "case_id": "E22",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.2,
+      "seconds": 1.16,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 2.031,
+        "duration_seconds": 1.078,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1419,12 +1437,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E22\\bun"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E22\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212006_45e56805",
+          "run_id": "run_20261005_224014_bf52205b",
           "status": "success"
         }
       ]
@@ -1433,11 +1451,11 @@
       "case_id": "E23",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.2,
+      "seconds": 1.17,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 2.047,
+        "duration_seconds": 1.094,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1485,6 +1503,12 @@
           "detail": "三档结构一致（6 条发现均落在事实层与建议层）"
         },
         {
+          "kind": "fact_triples",
+          "tier": "gate",
+          "passed": true,
+          "detail": "账本 6 条发现与事实层逐行等值（全部经独立复算背书）"
+        },
+        {
           "kind": "artifacts_clean",
           "tier": "gate",
           "passed": true,
@@ -1506,12 +1530,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E23\\bun"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E23\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212008_a644f833",
+          "run_id": "run_20261005_224015_a9bc14da",
           "status": "success"
         }
       ]
@@ -1520,11 +1544,11 @@
       "case_id": "E24",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.48,
+      "seconds": 1.23,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 2.328,
+        "duration_seconds": 1.156,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1566,6 +1590,12 @@
           "detail": "三档结构一致（6 条发现均落在事实层与建议层）"
         },
         {
+          "kind": "fact_triples",
+          "tier": "gate",
+          "passed": true,
+          "detail": "账本 6 条发现与事实层逐行等值（全部经独立复算背书）"
+        },
+        {
           "kind": "review_completed",
           "tier": "gate",
           "passed": true,
@@ -1575,12 +1605,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E24\\bun"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E24\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212010_88a21f41",
+          "run_id": "run_20261005_224016_c4723b33",
           "status": "success"
         }
       ]
@@ -1589,11 +1619,11 @@
       "case_id": "E25",
       "verdict": "pass",
       "status": "degraded",
-      "seconds": 0.44,
+      "seconds": 0.19,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 0.0,
-        "duration_seconds": 0.281,
+        "duration_seconds": 0.125,
         "tasks": 0.0,
         "unexplained_numbers": 0.0
       },
@@ -1632,12 +1662,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E25\\bundles\\b"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E25\\bundles\\b"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212013_d35bd5a5",
+          "run_id": "run_20261005_224018_aaf8dd97",
           "status": "degraded"
         }
       ]
@@ -1646,11 +1676,11 @@
       "case_id": "E26",
       "verdict": "pass",
       "status": "success",
-      "seconds": 6.08,
+      "seconds": 3.09,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 8.0,
-        "duration_seconds": 5.984,
+        "duration_seconds": 3.047,
         "tasks": 2.0,
         "unexplained_numbers": 0.0
       },
@@ -1706,7 +1736,7 @@
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212013_a5d0d698",
+          "run_id": "run_20261005_224018_97c5c348",
           "status": "success"
         }
       ]
@@ -1715,11 +1745,11 @@
       "case_id": "E27",
       "verdict": "pass",
       "status": "success",
-      "seconds": 2.19,
+      "seconds": 1.14,
       "metrics": {
         "numbers_traceable_ratio": 1.0,
         "llm_calls": 1.0,
-        "duration_seconds": 2.047,
+        "duration_seconds": 1.078,
         "tasks": 3.0,
         "unexplained_numbers": 0.0
       },
@@ -1800,12 +1830,12 @@
           "kind": "guard_selfcheck",
           "tier": "gate",
           "passed": true,
-          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_211811_mock\\E27\\bun"
+          "detail": "guard=passed：表级越权：任务声明的 dataset_refs=['t1', 't2'] 不包含该表，却试图读 D:\\my_agent_project\\多agent数据分析\\outputs\\eval_20261005_223916_mock\\E27\\bun"
         }
       ],
       "runs": [
         {
-          "run_id": "run_20261005_212019_aad6348a",
+          "run_id": "run_20261005_224021_1ecbc918",
           "status": "success"
         }
       ]

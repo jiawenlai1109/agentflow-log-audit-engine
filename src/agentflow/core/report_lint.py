@@ -14,6 +14,10 @@
    ——**模型可以解读，不可以造数**（I1 在报告侧的形式）。
 
 刻意不算的东西：语义是否"合理"、句子通不通——那是 LLM 评审的活，且不可判定。
+
+另有一个入口 `lint_fact_triples`：事实层每一行的 (主体, 指标, 数值) 与账本双向逐字相等。
+它不在上面四条里，因为那四条只查"主体在不在档里"，而分诊场景最要害的数值（失败几次、
+命中几条）全在一百以下，数字可追溯率那条线按大小把它们放过了。
 """
 
 from __future__ import annotations
@@ -168,3 +172,134 @@ def pack_thresholds(pack: Any) -> list[float]:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 out.append(float(value))
     return out
+
+
+_ALIGN_RE = re.compile(r"^:?-{2,}:?$")
+
+
+def row_cells(line: str) -> list[str] | None:
+    """把 markdown 表格行拆成单元格；非表格行返回 None。"""
+    text = line.strip()
+    if not text.startswith("|"):
+        return None
+    return [cell.strip() for cell in text.strip("|").split("|")]
+
+
+def _is_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(_ALIGN_RE.match(cell) for cell in cells)
+
+
+def fact_layer_rows(text: str, fact_names: Iterable[str]) -> list[list[str]]:
+    """取事实层里的数据行，跳过表头与对齐行。
+
+    表头按 markdown 惯例认"对齐行的上一行"，不靠列名——列名各包不同（而且按列名认
+    等于假设模板永远没人改）。中间隔一行空行也要认得出来，模板渲染会插空行。
+    """
+    lines = layer_text(text, fact_names).splitlines()
+
+    def next_cells(index: int) -> list[str] | None:
+        for cursor in range(index + 1, len(lines)):
+            if lines[cursor].strip():
+                return row_cells(lines[cursor])
+        return None
+
+    rows: list[list[str]] = []
+    for index, line in enumerate(lines):
+        cells = row_cells(line)
+        if cells is None or _is_separator(cells):
+            continue
+        following = next_cells(index)
+        if following is not None and _is_separator(following):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _as_cell(value: Any) -> str:
+    """数值按报告里印出来的样子比：整数不写成 3.0，否则每一行都对不上。"""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def finding_triple(finding: dict[str, Any]) -> tuple[str, str, str] | None:
+    """一条发现的 (主体, 指标, 数值) 三元组；缺任何一格就不构成可核对的一行。"""
+    subject = str(finding.get("subject") or "").strip()
+    metric = str(finding.get("metric") or "").strip()
+    value = finding.get("value")
+    if not subject or not metric or value is None:
+        return None
+    return subject, metric, _as_cell(value)
+
+
+def lint_fact_triples(
+    text: str, findings: list[dict[str, Any]], layers: dict[str, list[str]]
+) -> list[dict[str, str]]:
+    """事实层的每一行都必须与账本的一条发现逐字相等，且账本每条发现都要有一行——双向。
+
+    为什么要有这一条：数字可追溯率按"大小"决定哪些数字要核对，一百以下的整数被放过；
+    分诊场景里 `生产域失败次数 = 7`、`命中统计 T1=1` 这些最要紧的数恰好全在防线之外
+    （一份真实分诊报告过滤后剩 38 个数字，进那条线的只有 1 个）。而且那条线只问
+    "这个数在不在账本里"，不问"这个数配的是不是这个主体"——把 A 主机的 7 次印成
+    B 主机的 9 次，两个数都在同一本账里，追溯率一分不掉。SOC 里恰恰是这种张冠李戴
+    最贵（办公机被说成生产机，有人半夜去隔离错的主机）。
+
+    两个设计选择是这条线的命门，改了就不是同一条防线：
+
+    1. **整格相等，不用子串**。时间窗那一格 `2026-09-05 13:34:00 ~ …` 里也有一堆数字，
+       子串匹配会把 13 当成数值对上号——那种绿灯是假的。
+    2. **按格子集合匹配，不按列位置**。表 id 与列序取决于模板和上传顺序；
+       按位置取"第 6 列是数值"就是本项目已知的那类盲区（按 task_id 位置贴标签）。
+
+    调用方负责只传"已被独立复算背书"的发现：这里比的是"报告说的 == 账本记的"，
+    账本自己有没有被复算过属于上一道工序（`verdict.verification`），不在这条线的能力里。
+    """
+    issues: list[dict[str, str]] = []
+    section = "、".join(layers.get(FACT) or []) or FACT
+    rows = fact_layer_rows(text, layers.get(FACT) or [])
+    triples = [triples for triples in (finding_triple(item) for item in findings if isinstance(item, dict)) if triples]
+
+    if not triples and rows:
+        issues.append(
+            {
+                "severity": "high",
+                "section": section,
+                "message": f"账本零命中，事实层却印了 {len(rows)} 行：安全场景里这是误报，不是发现",
+            }
+        )
+        return issues
+
+    matched: set[int] = set()
+    for index, cells in enumerate(rows):
+        occupied = set(cells)
+        hit = next(
+            (
+                position
+                for position, (subject, metric, value) in enumerate(triples)
+                if subject in occupied and metric in occupied and value in occupied
+            ),
+            None,
+        )
+        if hit is None:
+            issues.append(
+                {
+                    "severity": "high",
+                    "section": section,
+                    "message": f"事实层第 {index + 1} 行在账本里找不到对应发现（数值配错了主体，或是凭空多印的行）：{' | '.join(cells)[:120]}",
+                }
+            )
+            continue
+        matched.add(hit)
+
+    for position, (subject, metric, value) in enumerate(triples):
+        if position not in matched:
+            issues.append(
+                {
+                    "severity": "high",
+                    "section": section,
+                    "message": f"账本里的发现 {subject}（{metric}={value}）在事实层没有对应行",
+                }
+            )
+    return issues
