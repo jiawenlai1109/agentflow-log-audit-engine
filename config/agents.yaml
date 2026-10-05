@@ -26,7 +26,7 @@ agents:
     tools: [execute_python, read_artifact]
     temperature: 0.1
     max_tokens: 2000
-    # model: deepseek-coder   # 可选：单独给 Executor 指定模型（覆盖全局）
+    # model: deepseek-v4-pro   # 可选：单独给 Executor 指定模型（覆盖全局）；型号名以 GET /models 为准
   inspector:
     tools: [validate_rules, verify_aggregate, verify_findings]
     temperature: 0.2
