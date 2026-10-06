@@ -238,7 +238,7 @@ class OpenAILLM(BaseLLM):
                     raw = resp.read().decode("utf-8", "ignore")
                 break
             except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "ignore")[:500]
+                body = self._mask(exc.read().decode("utf-8", "ignore"))[:500]
                 if exc.code in self.RETRYABLE_CODES and attempt < self.max_retries:
                     time.sleep(self._backoff(attempt, exc.headers.get("Retry-After")))
                     attempt += 1
@@ -264,10 +264,8 @@ class OpenAILLM(BaseLLM):
         except json.JSONDecodeError as exc:
             # 200 + 非 JSON：网关自己的配额页/登录页/错误页。重试十次拿到的还是那张页，
             # 所以不进入退避；正文要截断并把凭据抹掉——有的网关会把请求头回显在错误页里。
-            leak = self.api_key or ""
-            excerpt = raw.replace(leak, "<已抹掉的凭据>")[:120] if leak else raw[:120]
             raise LLMError(
-                f"LLM 响应不是 JSON（HTTP {code}，正文前 120 字：{excerpt!r}）："
+                f"LLM 响应不是 JSON（HTTP {code}，正文前 120 字：{self._mask(raw)[:120]!r}）："
                 "多半是网关返回了配额页/登录页/网关错误页，而不是模型输出"
             ) from exc
         if not isinstance(data, dict):
@@ -323,6 +321,17 @@ class OpenAILLM(BaseLLM):
         """空正文的形状进本次 run 的预算对象——`evaluation.json` 与 transcript 都从那里取。"""
         if self.budget is not None:
             self.budget.note_empty_content(empty)
+
+    def _mask(self, text: str) -> str:
+        """把凭据从任何要外印的网关正文里抹掉：错误文本会进 transcript、预检缓存与报告。
+
+        有些网关把请求头原样回显在错误页里，而"错误正文截断 120 字"这件事本身
+        并不能挡住回显。抹掉是一处修，所有出口都受益；什么都不印则会把真因一起丢掉。
+        """
+        leak = self.api_key or ""
+        if not leak:
+            return text
+        return text.replace(leak, "<已抹掉的凭据>")
 
     @staticmethod
     def _backoff(attempt: int, retry_after: str | None) -> float:

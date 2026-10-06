@@ -371,3 +371,17 @@ def test_404_names_both_causes(monkeypatch):
     text = str(raised.value)
     assert "/chat/completions 不存在" in text and "/v1" in text and "Anthropic" in text, text
     assert len(calls) == 1, f"404 换型号不会有用，重试只是白烧：{calls}"
+
+
+def test_http_error_body_never_echoes_the_key(monkeypatch):
+    """非 2xx 的错误正文同样可能回显请求头：抹凭据必须在一处修，两个出口都盖住。
+
+    这条与 `test_non_json_body_never_echoes_the_key` 是同一件事的两半——只盖 200 那条
+    等于让 401/404 的正文带着 key 进 transcript 与预检缓存。
+    """
+    install_http_error(monkeypatch, 401, "unauthorized, header was Bearer sk-echo-me-please")
+    client = OpenAILLM(api_key="sk-echo-me-please", base_url="https://llm.test/v1")
+    with pytest.raises(LLMError) as raised:
+        client.complete("你是评审", [{"role": "user", "content": "x"}])
+    assert "sk-echo-me-please" not in str(raised.value), "HTTP 错误正文里带着凭据原文"
+    assert "已抹掉的凭据" in str(raised.value), str(raised.value)

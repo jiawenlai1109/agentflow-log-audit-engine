@@ -569,28 +569,40 @@ def print_report(
     print("=" * 78)
 
 
-def preflight_credentials(mode: str) -> str:
-    """real 模式跑批前必做凭据预检（历史上 DeepSeek 两次 402 静默断供）。"""
+def preflight_credentials(mode: str) -> tuple[str, list[str]]:
+    """real 模式跑批前必做凭据预检（历史上 DeepSeek 两次 402 静默断供）。
+
+    返回 `(中止原因, 只打印不拦截的提示)`。凭据/连通性不过 ⇒ 中止（一次调用都不烧）；
+    型号可用性判死 ⇒ 中止；**没有预检缓存只出提示**——"缓存必须存在"若成了硬性前置，
+    预检自己就变成了一个新的隐性 fail-open 面（谁忘了跑就全体跑不了）。
+    """
     if mode != "real":
-        return ""
+        return "", []
     import os
 
     from agentflow.core.config import load_dotenv
 
     load_dotenv(PROJECT_ROOT / ".env")
     if not os.getenv("OPENAI_API_KEY"):
-        return "real 模式缺少 OPENAI_API_KEY（.env）"
+        return "real 模式缺少 OPENAI_API_KEY（.env）", []
+    base_url = os.getenv("OPENAI_BASE_URL") or ""
+    model = os.getenv("LLM_MODEL") or ""
     try:
         from agentflow.core.llm import OpenAILLM
 
         OpenAILLM(
             api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL") or None,
-            model=os.getenv("LLM_MODEL") or None,
+            base_url=base_url or None,
+            model=model or None,
         ).complete(system="ping", messages=[{"role": "user", "content": "回复 ok"}], max_tokens=8)
     except Exception as exc:  # noqa: BLE001 - 预检失败即中止，不烧一整批
-        return f"凭据预检失败，未跑批：{type(exc).__name__}: {str(exc)[:200]}"
-    return ""
+        return f"凭据预检失败，未跑批：{type(exc).__name__}: {str(exc)[:200]}", []
+
+    from agentflow.core.llm_preflight import gate_message, read_cache
+
+    report = read_cache(PROJECT_ROOT / ".appdata" / "llm_preflight.json")
+    abort, note = gate_message(base_url, model, report)
+    return abort, [note] if note else []
 
 
 def main() -> int:
@@ -624,8 +636,11 @@ def main() -> int:
     if args.check_golden:
         return 0
 
-    if message := preflight_credentials(args.mode):
-        print(message)
+    abort, notices = preflight_credentials(args.mode)
+    for line in notices:
+        print(f"  · {line}")
+    if abort:
+        print(abort)
         return 2
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
