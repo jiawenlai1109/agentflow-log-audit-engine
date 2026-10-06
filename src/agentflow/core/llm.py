@@ -166,6 +166,8 @@ class OpenAILLM(BaseLLM):
         thinking_budget_factor: float = 2.0,
         max_tokens_cap: int = 8000,
         fallback_models: list[str] | None = None,
+        envelope_multiplier: float = 1.0,
+        envelope_floor: int = 0,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -190,6 +192,13 @@ class OpenAILLM(BaseLLM):
         self.thinking_budget_retry = bool(thinking_budget_retry)
         self.thinking_budget_factor = float(thinking_budget_factor)
         self.max_tokens_cap = int(max_tokens_cap)
+        # 信封策略（片1）：思考档模型的 `max_tokens` 是"草稿 + 正文"共用的一个信封，
+        # 草稿写到封顶时正文就是 null（2026-10-06 real 全量实测：14 次白卷，每一次
+        # reasoning 字数都大于当时的 max_tokens）。抬上限本身不加钱——计费按实际写出的
+        # token 算，多出来的只是终于被写出来的正文；白卷那一次照样付了草稿钱却什么都没拿到。
+        # 倍率与下限只对"没关思考"的调用生效，关了思考没有草稿可挤。
+        self.envelope_multiplier = float(envelope_multiplier)
+        self.envelope_floor = int(envelope_floor)
         # 降级候选：**默认空 = 完全不启用**（多打一次真实调用就是要多花一次钱，
         # 而且换个型号产出的代码质量不同，会把"这次变绿"归因到模型身上）。
         # 一律 `.get` 读、不进 DEFAULT_CONFIG——加键会改 `config` 归因指纹。
@@ -242,6 +251,14 @@ class OpenAILLM(BaseLLM):
             return exc.code in self.RETRYABLE_CODES
         return isinstance(exc, LLMTransportError)
 
+    def _envelope(self, max_tokens: int) -> int:
+        """按成对策略放大自然语言的请求体上限；关思考或没配策略时原样返回（一字节不改）。"""
+        if self.thinking == "disabled" or self.envelope_multiplier <= 1.0:
+            return max_tokens
+        raised = max(int(max_tokens * self.envelope_multiplier), self.envelope_floor)
+        # 只在"变大"的方向走，且不许越过封顶：宁可保住角色原值，也不把某个角色调到比自己还小
+        return max(max_tokens, min(raised, self.max_tokens_cap))
+
     def _complete_once(
         self,
         model: str,
@@ -250,6 +267,7 @@ class OpenAILLM(BaseLLM):
         temperature: float,
         max_tokens: int,
     ) -> str:
+        max_tokens = self._envelope(max_tokens)
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}, *messages],

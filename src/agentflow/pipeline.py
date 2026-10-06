@@ -75,6 +75,56 @@ def build_agents(
     }
 
 
+def _real_llm(llm_cfg: dict[str, Any]) -> OpenAILLM:
+    """真实模式的客户端构造，带"思考档 ↔ 信封"的成对默认策略。
+
+    两条默认都是被 2026-10-06 那批 real 全量逼出来的（20 题 143 次调用里 14 次交白卷，
+    每次 reasoning 字数都大于当时的 max_tokens）：
+
+    1. **信封成对放大**（倍率 2、下限 2000、封顶 8000）：草稿与正文共用一个信封，
+       mock 时代按"不思考"定的角色上限装不下；抬上限不加钱，计费看实际写出的 token。
+    2. **提额重试默认开**：只做兜底（白卷签名对时再打一次），它才是真会多花一次调用的一环。
+
+    两个默认都可以被 `config/agents.yaml` 显式覆盖（写了 false 就是 false——"键存在与否"
+    与"值是假"是两回事，用 `or` 会把 false 读成没配）。关了思考就一律不抬信封。
+    """
+    thinking = llm_cfg.get("thinking") or None
+    retry = llm_cfg.get("thinking_budget_retry")
+    multiplier = float(llm_cfg.get("envelope_multiplier") or (1.0 if thinking == "disabled" else 2.0))
+    floor = int(llm_cfg.get("envelope_floor") or (0 if thinking == "disabled" else 2000))
+    return OpenAILLM(
+        base_url=llm_cfg.get("base_url") or None,
+        model=llm_cfg.get("model") or None,
+        thinking=thinking,
+        thinking_budget_retry=True if retry is None else bool(retry),
+        thinking_budget_factor=llm_cfg.get("thinking_budget_factor") or 2.0,
+        max_tokens_cap=llm_cfg.get("max_tokens_cap") or 8000,
+        fallback_models=llm_cfg.get("fallback_models") or [],
+        envelope_multiplier=multiplier,
+        envelope_floor=floor,
+    )
+
+
+def llm_policy(llm: Any) -> dict[str, Any]:
+    """本次实际生效的 LLM 策略（档位/信封/重试/降级候选）——归因用，不参与任何判定。
+
+    没有它，两次跑批的差异就分不清是"换了档位"还是"改了代码"；这正是 I3 要求的那一格。
+    """
+    if not isinstance(llm, OpenAILLM):
+        return {"provider": "mock", "model": None}
+    return {
+        "provider": "openai_compatible",
+        "model": llm.model,
+        "base_host": (llm.base_url or "").split("//")[-1].split("/")[0],
+        "thinking": llm.thinking,
+        "envelope_multiplier": llm.envelope_multiplier,
+        "envelope_floor": llm.envelope_floor,
+        "max_tokens_cap": llm.max_tokens_cap,
+        "thinking_budget_retry": llm.thinking_budget_retry,
+        "fallback_models": list(llm.fallback_models),
+    }
+
+
 def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
     """按 Agent 配置覆盖模型与思考档位（真实模式下克隆一个带指定参数的客户端）。
 
@@ -96,6 +146,9 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
             max_tokens_cap=llm.max_tokens_cap,
             # 降级链跟着克隆走：漏掉它等于"按角色换了个更稳的模型，顺手把兜底弄没了"
             fallback_models=llm.fallback_models,
+            # 信封策略同理：按角色换型号/换档位时把"草稿要占多大地方"弄丢，那个角色就会开始交白卷
+            envelope_multiplier=llm.envelope_multiplier,
+            envelope_floor=llm.envelope_floor,
         )
         clone.budget = llm.budget
         return clone
@@ -205,19 +258,7 @@ def run_analysis(
         pack_obj = load_pack(pack)
     if llm is None:
         llm_cfg = config.get("llm", {})
-        llm = (
-            MockLLM()
-            if mode == "mock"
-            else OpenAILLM(
-                base_url=llm_cfg.get("base_url") or None,
-                model=llm_cfg.get("model") or None,
-                thinking=llm_cfg.get("thinking") or None,
-                thinking_budget_retry=llm_cfg.get("thinking_budget_retry") or False,
-                thinking_budget_factor=llm_cfg.get("thinking_budget_factor") or 2.0,
-                max_tokens_cap=llm_cfg.get("max_tokens_cap") or 8000,
-                fallback_models=llm_cfg.get("fallback_models") or [],
-            )
-        )
+        llm = MockLLM() if mode == "mock" else _real_llm(llm_cfg)
 
     project_root = Path(__file__).resolve().parents[2]
     outputs_root = (
@@ -236,6 +277,7 @@ def run_analysis(
 
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
     llm.budget = budget  # v1.2：预算计数点下沉到 LLM 层（每次真实 API 调用计 1）
+    budget.llm_policy = llm_policy(llm)  # 档位/信封/重试/降级候选：进 evaluation.json 供归因
     # skill 装载必须在 build_agents 之前：注入发生在各角色 __init__ 里。
     # 权限预检用的就是运行时那一份白名单函数，两套口径必然打架（见 core/skill.py）。
     skills = load_skill_set(

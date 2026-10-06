@@ -19,6 +19,9 @@ class BudgetCounter:
         # 必须先能排除"其实是换了型号"这个变量（I3 归因）。见 core/llm.py 的 complete()。
         self.fallbacks: list[dict[str, Any]] = []
         self.models_used: list[str] = []
+        # 本次实际生效的 LLM 策略（档位/信封/重试/降级候选）：由 pipeline 写入。
+        # 两次跑批的差异必须先能排除"策略换了"，才谈得上归因到代码（I3）。
+        self.llm_policy: dict[str, Any] = {}
         # 真实 HTTP 请求次数。`used` 记的是**逻辑调用**（Agent 层每次计 1），
         # 而降级链与提额重试会让真实请求多于逻辑调用——这两个数必须分开记，
         # 否则"换了型号还多打了一次"会从成本指标上隐身。

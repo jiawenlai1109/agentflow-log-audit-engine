@@ -906,6 +906,8 @@ class Orchestrator:
             # 先要用它排除"其实是换了型号才变好的"，否则 I3 归因就是空话。
             "llm_fallbacks": list(getattr(ctx.budget, "fallbacks", []) or []),
             "models_used": list(getattr(ctx.budget, "models_used", []) or []),
+            # 本次生效的 LLM 策略（档位/信封/重试/降级候选）：跨批次比较先排掉"换了策略"
+            "llm_policy": dict(getattr(ctx.budget, "llm_policy", {}) or {}),
             # 真实 HTTP 请求次数：`llm_calls` 记的是逻辑调用（Agent 层计 1）。
             # 降级与提额重试只动前者——两个数一分开，"这次到底打了多少次上游"才看得见。
             "llm_http_attempts": int(getattr(ctx.budget, "http_attempts", 0) or 0),

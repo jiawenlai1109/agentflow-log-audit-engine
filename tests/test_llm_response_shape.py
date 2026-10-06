@@ -387,3 +387,98 @@ def test_http_error_body_never_echoes_the_key(monkeypatch):
         client.complete("你是评审", [{"role": "user", "content": "x"}])
     assert "sk-echo-me-please" not in str(raised.value), "HTTP 错误正文里带着凭据原文"
     assert "已抹掉的凭据" in str(raised.value), str(raised.value)
+
+
+# ---------------------------------------------------------------- 片1：思考档与信封必须成对
+
+
+def test_envelope_is_raised_for_thinking_models(monkeypatch):
+    """critic 的 800 装不下它的草稿（实测 reasoning 1452 字）⇒ 抬到下限 2000。"""
+    sent = install(monkeypatch, _text_payload())
+    _llm(envelope_multiplier=2.0, envelope_floor=2000).complete(
+        "你是评审", [{"role": "user", "content": "x"}], max_tokens=800
+    )
+    assert sent[-1]["max_tokens"] == 2000, sent[-1]
+
+
+def test_envelope_doubling_applies_to_larger_roles(monkeypatch):
+    """executor 的 2000 翻倍成 4000：实测它的草稿要写 3793~4837 字。"""
+    sent = install(monkeypatch, _text_payload())
+    _llm(envelope_multiplier=2.0, envelope_floor=2000).complete(
+        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert sent[-1]["max_tokens"] == 4000, sent[-1]
+
+
+def test_envelope_never_shrinks_and_never_crosses_the_cap(monkeypatch):
+    """只在变大的方向走，且不越过封顶：宁可回到角色原值，也不能把某个角色调到比自己还小。"""
+    sent = install(monkeypatch, _text_payload())
+    _llm(envelope_multiplier=2.0, envelope_floor=2000, max_tokens_cap=3000).complete(
+        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert sent[-1]["max_tokens"] == 3000, sent[-1]
+
+    sent2 = install(monkeypatch, _text_payload())
+    _llm(envelope_multiplier=0.5, envelope_floor=100).complete(
+        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert sent2[-1]["max_tokens"] == 2000, "倍率配小了也不许把角色的信封削薄"
+
+
+def test_disabled_thinking_keeps_the_envelope_untouched(monkeypatch):
+    """关思考就没有草稿要挤 ⇒ 抬信封纯属多花钱。策略必须成对，不许两个旋钮各转各的。"""
+    sent = install(monkeypatch, _text_payload())
+    _llm(thinking="disabled", envelope_multiplier=2.0, envelope_floor=2000).complete(
+        "你是评审", [{"role": "user", "content": "x"}], max_tokens=800
+    )
+    assert sent[-1]["max_tokens"] == 800, sent[-1]
+    assert sent[-1]["thinking"] == {"type": "disabled"}, sent[-1]
+
+
+def test_pipeline_defaults_pair_the_thinking_tier_with_a_bigger_envelope(tmp_path, monkeypatch):
+    """片1 的接线用例：真实客户端由 pipeline 构造时，信封与重试两个默认必须成对生效。
+
+    只测 `OpenAILLM` 的纯函数逻辑不够——默认值长在 `pipeline._real_llm` 里，
+    那里没接上就等于线上还是 mock 时代的信封（正是这批 real 全量 14 次白卷的来路）。
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    from agentflow.pipeline import _real_llm, llm_policy
+
+    client = _real_llm({"model": "m"})
+    assert client.envelope_multiplier == 2.0 and client.envelope_floor == 2000, llm_policy(client)
+    assert client.thinking_budget_retry is True, "白卷兜底默认开：显式配 false 才关"
+
+    # 显式写 false 必须是 false——用 `or` 会把"关掉"读成"没配"
+    assert _real_llm({"model": "m", "thinking_budget_retry": False}).thinking_budget_retry is False
+    # 关思考 ⇒ 不抬信封（成对），也不留一个用不上的倍率
+    off = _real_llm({"model": "m", "thinking": "disabled"})
+    assert off.envelope_multiplier == 1.0 and off.envelope_floor == 0, llm_policy(off)
+
+    policy = llm_policy(client)
+    assert policy["thinking_budget_retry"] is True and policy["model"] == "m", policy
+
+
+def test_policy_and_clone_travel_together():
+    """按角色换型号/换档位时，信封策略必须跟着克隆走，否则那个角色会重新开始交白卷。"""
+    base = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    clone = _agent_llm(base, {"model": "other"})
+    assert (clone.envelope_multiplier, clone.envelope_floor) == (2.0, 2000)
+
+
+def test_llm_policy_lands_in_the_artifacts(monkeypatch, tmp_path):
+    """策略要落进 evaluation.json：跨批次比较先排掉"换了档位/信封"这个变量。"""
+    from pathlib import Path
+
+    install(monkeypatch, _text_payload())
+    client = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    result = run_analysis(
+        question="统计各账号的登录失败次数，列出风险最高的账号",
+        sources=str(Path(__file__).resolve().parents[1] / "demo" / "data" / "login_auth.csv"),
+        mode="real",
+        llm=client,
+        outputs_root=tmp_path / "outputs",
+    )
+    evaluation = json.loads((Path(result["outputs_dir"]) / "evaluation.json").read_text(encoding="utf-8"))
+    policy = evaluation.get("llm_policy") or {}
+    assert policy.get("envelope_multiplier") == 2.0, policy
+    assert policy.get("model") == client.model, policy
