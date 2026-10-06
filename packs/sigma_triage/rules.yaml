@@ -95,6 +95,7 @@ rules:
           span = (moments[-1] - moments[0]).total_seconds() / 60.0
           if len(moments) >= 8 and span <= 5:
               findings.append({'rule_id': 'T1', 'subject': f'{src_ip}->{account}',
+                               'metric': '窗口内失败次数',
                                'value': len(moments),
                                'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
                                'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
@@ -158,7 +159,9 @@ rules:
       for host, stamps in buckets.items():
           moments = sorted(datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S') for stamp in stamps)
           if len(moments) >= 3:
-              findings.append({'rule_id': 'T3', 'subject': host, 'value': len(moments),
+              findings.append({'rule_id': 'T3', 'subject': host,
+                               'metric': '生产域失败次数',
+                               'value': len(moments),
                                'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
                                'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
       findings.sort(key=lambda item: (-item['value'], item['subject']))
@@ -220,7 +223,9 @@ rules:
       for host, stamps in buckets.items():
           moments = sorted(datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S') for stamp in stamps)
           if len(moments) >= 2:
-              findings.append({'rule_id': 'T4', 'subject': host, 'value': len(moments),
+              findings.append({'rule_id': 'T4', 'subject': host,
+                               'metric': '高危告警伴随失败次数',
+                               'value': len(moments),
                                'window_start': moments[0].strftime('%Y-%m-%d %H:%M:%S'),
                                'window_end': moments[-1].strftime('%Y-%m-%d %H:%M:%S')})
       findings.sort(key=lambda item: (-item['value'], item['subject']))

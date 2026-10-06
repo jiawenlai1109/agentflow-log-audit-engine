@@ -186,10 +186,10 @@ def _evidence(outputs_dir: Path) -> dict[str, Any]:
     return load_evidence(str(outputs_dir))
 
 
-def _predicate(evidence: dict[str, Any], pack: str) -> tuple[bool, str]:
+def _predicate(evidence: dict[str, Any], pack: str, **extra: Any) -> tuple[bool, str]:
     from agentflow.core.grading import PREDICATES
 
-    return PREDICATES["fact_triples"](evidence, {"pack": pack}, "mock")
+    return PREDICATES["fact_triples"](evidence, {"pack": pack, **extra}, "mock")
 
 
 def test_predicate_certifies_a_real_triage_run(tmp_path):
@@ -271,6 +271,163 @@ def test_the_suite_actually_consumes_the_predicate():
         ("E24", "sigma_triage"),
     ]:
         assert "fact_triples" in gated[case_id], f"{case_id} 没消费这条线"
-        assert gated[case_id]["fact_triples"] == {"pack": pack}, (case_id, gated[case_id]["fact_triples"])
+        params = gated[case_id]["fact_triples"]
+        assert params.get("pack") == pack, (case_id, params)
+        # 锚点只挂在有 golden 数值映射的题上；写了 anchor 但 golden 里没这个键 ⇒ 谓词判红
+        anchor = params.get("anchor")
+        if anchor:
+            assert isinstance((suite.get("golden") or {}).get(anchor), dict), (case_id, anchor)
+        else:
+            assert case_id in {"E14", "E16"}, f"{case_id} 应当带锚点：sigma 题的 golden 里有 fact_values"
     # 没带场景包的题不许被顺手拉进来（零售单表题没有"账本发现"这个概念）
     assert "fact_triples" not in gated["E01"], "E01 是零售单表题，这条线对它无意义"
+
+
+# ---------------------------------------------------------------- 腿 2 / 腿 3：账本 == 复算 == 独立锚点
+
+
+def _triage_run(tmp_path):
+    sources = [TRIAGE / "auth.csv", TRIAGE / "assets.csv", TRIAGE / "edr.csv"]
+    result = run_analysis(TRIAGE_QUESTION, [str(p) for p in sources], outputs_root=tmp_path, pack="sigma_triage")
+    return _evidence(Path(result["outputs_dir"]))
+
+
+def test_recompute_triples_are_persisted_even_when_verification_passes(tmp_path):
+    """复算侧的三元组必须在 **PASS** 时也落盘：出事才留证据等于平时没法核对。"""
+    evidence = _triage_run(tmp_path)
+    rows = [row for row in evidence["evaluation"]["results"].values() if row]
+    with_findings = [row for row in rows if ((row.get("summary") or {}).get("findings"))]
+    assert with_findings, "这份产物里没有带发现的任务，断言会是空的"
+    for row in with_findings:
+        recompute = (row.get("verdict") or {}).get("recompute") or []
+        assert recompute, f"复算侧三元组没落盘：{row.get('verdict')}"
+        assert all({"subject", "metric", "value"} <= set(item) for item in recompute), recompute
+    ledger = sum(len((row.get("summary") or {}).get("findings") or []) for row in with_findings)
+    stored = sum(len((row.get("verdict") or {}).get("recompute") or []) for row in with_findings)
+    assert stored == ledger, f"账本 {ledger} 条，复算侧只存了 {stored} 条"
+
+
+def _find_ledger(evidence: dict[str, Any], rule: str, subject: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """按 (规则, 主体) 点名账本里的那一行。
+
+    不用"第一个带发现的任务"：`evaluation.json` 里 `results` 的键序跟着线程完成顺序走，
+    内容确定但顺序不确定——拿顺序当身份，用例就会今天绿明天红（2026-10-06 变异复测的
+    对照位点 F0 就是这么抓出来的）。
+    """
+    for task_id, row in evidence["evaluation"]["results"].items():
+        for item in ((row or {}).get("summary") or {}).get("findings") or []:
+            if str(item.get("rule") or item.get("rule_id") or "") == rule and str(item.get("subject")) == subject:
+                return str(task_id), row, item
+    raise AssertionError(f"账本里找不到 {rule} {subject}")
+
+
+def _swear_report_row(evidence: dict[str, Any], subject: str, old: int, new: int, rule: str) -> None:
+    """把事实层里那一行的数值改掉，并且只改那一行（行内必须同时含主体、规则标签与旧值）。"""
+    line = next(
+        text
+        for text in evidence["report"].splitlines()
+        if text.strip().startswith("|") and subject in text and f"| {old} |" in text and f"（{rule}）" in text
+    )
+    evidence["report"] = evidence["report"].replace(line, line.replace(f"| {old} |", f"| {new} |", 1), 1)
+
+
+def test_ledger_changed_but_report_follows_it_is_caught_by_the_recompute_leg(tmp_path):
+    """账本被改、报告照抄改后的账本 ⇒ 腿 1 全绿，腿 2 必须红。
+
+    这正是"只有报告==账本"那条线的能力边界：账本自己被人动过，而报告老实印出来，
+    两格都对得上，只有拿复算侧比才露出来。
+    """
+    evidence = _triage_run(tmp_path)
+    anchor = "sigma_attack_fact_values"
+    evidence["golden"] = {anchor: _derive_anchor()}
+    _task_id, _row, item = _find_ledger(evidence, "T3", "10.0.0.7")
+    old = int(item["value"])
+    assert old == 7, f"题面假设 T3/10.0.0.7 = 7，实测 {old}：数据变了，锚点也得跟着重算"
+    item["value"] = old + 3
+    _swear_report_row(evidence, "10.0.0.7", old, old + 3, "T3")
+    ok, detail = _predicate(evidence, "sigma_triage", anchor=anchor)
+    assert not ok, detail
+    assert "账本 != 复算" in detail and "10.0.0.7" in detail, detail
+
+
+def test_a_verifier_copying_the_producer_is_caught_by_the_external_anchor(tmp_path):
+    """**这条是"校验器照抄生产实现"的变异用例**：腿 1、腿 2 都会绿，只有外部锚点能拦。
+
+    做法是把复算侧改成账本的副本（producer 与 verifier 同源），同时把账本的一个数值改错。
+    此时两腿等值完全成立——它与"全都对"长得一模一样；拿系统之外独立重算的数值一比才红。
+    这也是为什么这条线不能只有"报告 == 账本 == 复算"三方就自称够了。
+    """
+    evidence = _triage_run(tmp_path)
+    anchor = "sigma_attack_fact_values"
+    evidence["golden"] = {anchor: _derive_anchor()}
+    task_id, row, item = _find_ledger(evidence, "T3", "10.0.0.7")
+    old = int(item["value"])
+    item["value"] = old + 3  # 生产侧错了
+    _swear_report_row(evidence, "10.0.0.7", old, old + 3, "T3")
+    # 校验器照抄：把该任务的复算侧整个换成账本的副本
+    row["verdict"]["recompute"] = [
+        {
+            "subject": str(finding.get("subject")),
+            "metric": str(finding.get("metric")),
+            "value": str(finding.get("value")),
+        }
+        for finding in (row.get("summary") or {}).get("findings") or []
+    ]
+    # 先坐实"两条腿拦不住"，才说明锚点不是摆设
+    ok_two_legs, detail_two_legs = _predicate(evidence, "sigma_triage")
+    assert ok_two_legs, f"两腿就拦住了？那这条用例证明不了锚点的必要：{detail_two_legs}"
+    ok, detail = _predicate(evidence, "sigma_triage", anchor=anchor)
+    assert not ok and "锚点" in detail and "10.0.0.7" in detail, detail
+    assert f"{old + 3}" in detail and f"独立重算={old}" in detail, detail
+
+
+def test_declaring_an_anchor_that_does_not_exist_is_red_not_skipped(tmp_path):
+    """写了 anchor 而 golden 里没这个键 ⇒ 判红。静默跳过就是把"没比"说成"比过了"。"""
+    evidence = _triage_run(tmp_path)
+    evidence["golden"] = {}
+    ok, detail = _predicate(evidence, "sigma_triage", anchor="sigma_nope_fact_values")
+    assert not ok and "在 golden 里不存在" in detail, detail
+
+
+def test_findings_without_a_finding_level_check_cannot_claim_three_way(tmp_path):
+    """只有 aggregate 背书时不许自称"三方"：那条路给不出逐主体的复算值。"""
+    evidence = _triage_run(tmp_path)
+    for row in evidence["evaluation"]["results"].values():
+        verdict = row.get("verdict") or {}
+        if verdict.get("checks"):
+            verdict["checks"] = ["aggregate_match_check:PASS"]
+    ok, detail = _predicate(evidence, "sigma_triage")
+    assert not ok and "只比了两方" in detail, detail
+
+
+def _derive_anchor() -> dict[str, Any]:
+    """独立锚点的测试副本：直接读原始 CSV 数（stdlib csv），不借系统任何一段代码。
+
+    与 `scripts/run_eval.py` 里 pandas 那条路径**互为对照**——两边都对得上，
+    才说得上"锚点这个数不是抄系统输出的"。
+    """
+    import csv
+    from collections import defaultdict
+
+    values: dict[str, dict[str, int]] = {"T1": {}, "T3": {}, "T4": {}}
+    auth = list(csv.DictReader((TRIAGE / "auth.csv").open(encoding="utf-8-sig")))
+    assets = list(csv.DictReader((TRIAGE / "assets.csv").open(encoding="utf-8-sig")))
+    edr = list(csv.DictReader((TRIAGE / "edr.csv").open(encoding="utf-8-sig")))
+    failed = [line for line in auth if line.get("auth_result") == "failed"]
+    bursts: dict[str, int] = defaultdict(int)
+    for line in failed:
+        bursts[f"{line['src_ip']}->{line['account']}"] += 1
+    per_host: dict[str, int] = defaultdict(int)
+    for line in failed:
+        per_host[line["src_ip"]] += 1
+    production = {row["主机"] for row in assets if row.get("是否生产") == "Y"}
+    high = {row["主机"] for row in edr if row.get("严重级") == "high"}
+    for subject, count in bursts.items():
+        if count >= 8:
+            values["T1"][subject] = count
+    for host, count in per_host.items():
+        if host in production and count >= 3:
+            values["T3"][host] = count
+        if host in high and count >= 2:
+            values["T4"][host] = count
+    return values

@@ -577,6 +577,9 @@ class Orchestrator:
                     "status": verdict["status"],
                     "verification": verdict.get("verification"),
                     "redos": redo - 1,
+                    # 复算侧的三元组跟着结论落盘：没有它，"报告 == 账本"能证，
+                    # "账本 == 独立复算"就只在出事那一刻存在于 message 字符串里。
+                    "recompute": verdict.get("recompute") or [],
                     "checks": [
                         f"{check.get('rule')}:{check.get('level')}"
                         for check in verdict.get("checks", [])

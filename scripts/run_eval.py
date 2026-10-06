@@ -135,10 +135,13 @@ def _triage_goldens(data_dir: Path) -> dict[str, Any]:
         failed = auth[auth["auth_result"] == "failed"]
 
         burst = []
+        burst_values: dict[str, int] = {}
         for (src_ip, account), group in failed.groupby(["src_ip", "account"]):
             span = (group["time"].max() - group["time"].min()).total_seconds() / 60.0
             if len(group) >= 8 and span <= 5:
-                burst.append(f"{src_ip}->{account}")
+                subject = f"{src_ip}->{account}"
+                burst.append(subject)
+                burst_values[subject] = int(len(group))
         production = set(assets.loc[assets["是否生产"] == "Y", "主机"])
         high = set(edr.loc[edr["严重级"] == "high", "主机"])
         by_host = failed.groupby("src_ip").size()
@@ -150,6 +153,15 @@ def _triage_goldens(data_dir: Path) -> dict[str, Any]:
             "T4": correlated,
             "total": len(burst) + len(weighted) + len(correlated),
             "max_host_failures": int(by_host.max()) if len(by_host) else 0,
+            # 逐主体的数值：三元组那条线的**外部锚点**。为什么非要有它——若校验器被改成
+            # 照抄生产实现（producer 与 verifier 同源），"账本 == 复算"永远成立，两条腿
+            # 一起绿；只有拿系统之外独立算出来的数去比，同源性造假才会露出来。
+            # 出处仍是这里的 pandas 重算（与 verify_code 的 stdlib 路径异构）。
+            "fact_values": {
+                "T1": burst_values,
+                "T3": {host: int(by_host[host]) for host in weighted},
+                "T4": {host: int(by_host[host]) for host in correlated},
+            },
         }
 
     attack, clean, injected = hits("triage"), hits("triage_clean"), hits("triage_injected")
@@ -166,6 +178,9 @@ def _triage_goldens(data_dir: Path) -> dict[str, Any]:
         "sigma_clean_total": clean["total"],
         # 零命中不是"数据本来就安静"：最大失败次数恰好等于阈值减一，是被构造出来的贴边
         "sigma_clean_max_host_failures": clean["max_host_failures"],
+        # 三元组那条线的锚点（逐主体的独立重算数值）；与 sigma_attack_* 同一批 pandas 重算
+        "sigma_attack_fact_values": attack["fact_values"],
+        "sigma_injected_fact_values": injected["fact_values"],
         **_intel_goldens(data_dir),
     }
 
@@ -339,6 +354,9 @@ def run_case(case: dict[str, Any], suite: dict[str, Any], mode: str, root: Path)
 
     graded = runs[-1]  # 断言打在最后一轮（多轮题考的是续轮行为）
     evidence = load_evidence(graded["outputs_dir"])
+    # 锚点随证据一起交给评分器：三元组那条线要拿"系统之外独立重算的数值"比一遍，
+    # 而 golden 已经由 `check_golden` 逼着与数据文件同步（漂移就在上面那一步中止）。
+    evidence["golden"] = suite.get("golden") or {}
     result = evaluate_case(case, evidence, mode)
 
     # 一条不写在题里的下限：以 success/partial 收口的运行，不许同时承认语义评审没跑完（#13）。

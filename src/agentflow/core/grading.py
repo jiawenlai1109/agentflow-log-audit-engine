@@ -478,36 +478,143 @@ def _p_join_preflight(evidence, params, mode):
     return not problems, "；".join(problems) or f"预检判定一致（放行 {len(passed)} / 拒绝 {len(rejected)}）"
 
 
-def _verified_findings(evidence: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    """只收"已被独立复算背书"的发现，并返回被跳过的任务号。
+def _verified_findings(evidence: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    """只收"已被独立复算背书"的发现，并返回被跳过的任务号与逐任务的复算侧三元组。
 
-    三元组这条线比的是"报告说的 == 账本记的"。账本自己有没有被复算过是上一道工序
-    （`verdict.verification`）的事——把没背书的东西当成本条线的依据，等于让一条没复核的
-    数字去给另一条数字作证，那就成了自证。跳过哪些任务必须说得出名字：
+    三元组这条线比的是"报告说的 == 账本记的 == 独立复算的"。账本自己有没有被复算过是
+    上一道工序（`verdict.verification`）的事——把没背书的东西当成本条线的依据，等于让一条
+    没复核的数字去给另一条数字作证，那就成了自证。跳过哪些任务必须说得出名字：
     否则"这条线其实什么都没核对"和"全部对上"长得一模一样。
+
+    第三个返回值把**复算侧**按任务带出来，因为"账本 == 复算值"必须逐任务比：跨任务混在一起
+    比，会把 10.0.0.7 的复算值拿去对上另一台主机的账本行——正是要抓的那种张冠李戴。
     """
     kept: list[dict[str, Any]] = []
     skipped: list[str] = []
+    endorsed: list[dict[str, Any]] = []
     for task_id, result in sorted(_results(evidence).items(), key=lambda kv: int(str(kv[0]))):
         findings = ((result or {}).get("summary") or {}).get("findings") or []
         if not findings:
             continue
-        if (result or {}).get("verdict", {}).get("verification") != "ok":
+        verdict = (result or {}).get("verdict") or {}
+        if verdict.get("verification") != "ok":
             skipped.append(str(task_id))
             continue
-        kept.extend(finding for finding in findings if isinstance(finding, dict))
-    return kept, skipped
+        dicts = [finding for finding in findings if isinstance(finding, dict)]
+        kept.extend(dicts)
+        endorsed.append(
+            {
+                "task_id": str(task_id),
+                "ledger": dicts,
+                "recompute": verdict.get("recompute") or [],
+                # 只有 finding 级重算才给得出逐主体的三元组；aggregate 那条路重算的是一个标量，
+                # 那条腿本来就不存在——要如实说"少跑了一条腿"，不能当成对上了。
+                "finding_check": any("finding_match_check" in str(check) for check in verdict.get("checks") or []),
+            }
+        )
+    return kept, skipped, endorsed
+
+
+def _recompute_mismatch(ledger_items: list[dict[str, Any]], recompute_items: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """账本与复算侧逐格核对：缺行 / 多行 / 同一行数值不同。
+
+    两侧都过同一个 `finding_triple` 归一化（数值按报告里印出来的样子比，7.0 就是 7），
+    数值相等用本模块既有的 `_close`（绝对 1e-6 / 相对 1e-6），不另立一把尺。
+    返回 (破口, 核对不了的主体)：后者指账本里缺指标或缺数值的那些行——它们不构成一行
+    可核对的三元组，必须点名，不然"少比了几行"和"全部对上"又是一个长相。
+    """
+    from agentflow.core.report_lint import finding_triple
+
+    ledger: dict[tuple[str, str], str] = {}
+    uncheckable: list[str] = []
+    for item in ledger_items:
+        triple = finding_triple(item)
+        if triple is None:
+            uncheckable.append(str(item.get("subject") or "?"))
+            continue
+        ledger[(triple[0], triple[1])] = triple[2]
+
+    recomputed: dict[tuple[str, str], Any] = {}
+    for item in recompute_items:
+        if not isinstance(item, dict):
+            continue
+        subject, metric = str(item.get("subject") or "").strip(), str(item.get("metric") or "").strip()
+        if not subject or not metric or item.get("value") is None:
+            continue
+        recomputed[(subject, metric)] = item.get("value")
+
+    problems: list[str] = []
+    for key, value in sorted(ledger.items()):
+        if key not in recomputed:
+            problems.append(f"复算侧没有 {key[0]}（{key[1]}={value}）这一行")
+        elif not _close(recomputed[key], value, 0):
+            problems.append(f"{key[0]} 的 {key[1]}：账本={value} 复算={recomputed[key]}")
+    for key in sorted(set(recomputed) - set(ledger)):
+        problems.append(f"复算侧多出 {key[0]}（{key[1]}={recomputed[key]}）")
+    return problems, uncheckable
+
+
+def _anchor_mismatch(units: list[dict[str, Any]], values: dict[str, Any]) -> list[str]:
+    """把账本与复算侧同时跟**系统之外**独立算出来的数值比一遍。
+
+    这条腿存在的理由很具体：如果校验器被改成照抄生产实现（producer 与 verifier 同源），
+    "账本 == 复算"就永远成立，两条腿一起绿——那种绿是造假同源性，不是正确。
+    锚点由 `scripts/run_eval.py` 的 pandas 重算生成、写进 suite.yaml 的 golden，
+    再由 `check_golden` 逼着它与数据同步，全程不碰系统的执行器与校验器。
+    """
+    problems: list[str] = []
+    for unit in units:
+        rules = {str(item.get("rule") or item.get("rule_id") or "") for item in unit["ledger"]} - {""}
+        if not rules:
+            problems.append(f"任务 {unit['task_id']}：账本里的发现没有 rule/rule_id，锚点对不上号")
+            continue
+        for rule in sorted(rules):
+            expect = values.get(rule)
+            if not isinstance(expect, dict):
+                problems.append(f"锚点未覆盖规则 {rule}（任务 {unit['task_id']}），三方等值缺一只脚")
+                continue
+            ledger: dict[str, Any] = {}
+            recomputed: dict[str, Any] = {}
+            for item in unit["ledger"]:
+                if str(item.get("rule") or item.get("rule_id") or "") == rule:
+                    from agentflow.core.report_lint import finding_triple
+
+                    triple = finding_triple(item)
+                    if triple:
+                        ledger[triple[0]] = triple[2]
+            for item in unit["recompute"]:
+                if isinstance(item, dict) and str(item.get("subject") or ""):
+                    recomputed[str(item["subject"])] = item.get("value")
+            for subject, want in sorted(expect.items()):
+                for label, side in (("账本", ledger), ("复算", recomputed)):
+                    got = side.get(subject)
+                    if got is None:
+                        problems.append(f"{rule} {subject}：{label}里没有这一行，而独立重算={want}")
+                    elif not _close(got, want, 0):
+                        problems.append(f"{rule} {subject}：{label}={got} 独立重算={want}")
+            for side_label, side in (("账本", ledger), ("复算", recomputed)):
+                extra = sorted(set(side) - set(expect))
+                if extra:
+                    problems.append(f"{rule}：{side_label}里有 {len(extra)} 个主体不在独立重算内（{'、'.join(extra[:3])}）")
+    return problems
 
 
 def _p_fact_triples(evidence, params, mode):
-    """事实层三元组逐行等值（主体, 指标, 数值）——追溯率管不到的那批小整数由这条线管。
+    """事实层三方等值（主体, 指标, 数值）：报告 == 账本 == 独立复算。
 
-    为什么要有第二条线：数字可追溯率按大小决定核对哪些数，一百以下的整数被放过；
+    为什么要有这条线：数字可追溯率按大小决定核对哪些数，一百以下的整数被放过；
     分诊场景里最要紧的数（`生产域失败次数 = 7`、`命中统计 T1=1`）恰好全在那条线之外。
     而且那条线只问"这个数在不在账本里"，不问"这个数配的是不是这个主体"——把 A 主机的
     7 印成 B 主机的 9，两个数都在同一本账里，追溯率一分不掉。SOC 里张冠李戴最贵。
 
-    params = `{pack: <包名>}`：档名从包读，不在 suite 里重抄（与 `_p_report_layers` 同一理由）。
+    两条腿分工不同，都必须在场：
+    - 腿 1（报告 == 账本）：`lint_fact_triples` 逐行逐格比，抓"印出去的和算出来的不一样"；
+    - 腿 2（账本 == 复算值）：抓"账本自己被改过而报告照抄"——只有腿 1 时，把校验器改成
+      照抄生产实现（producer 与 verifier 同源）这条线照样绿。复算侧的值来自规则包的
+      `verify_code`（纯 Python，与 pandas 参考实现异构），由 Inspector 落盘进 verdict.recompute。
+
+    params = `{pack: <包名>}`；可选 `anchor: <golden 键名>`——三方等值之外再挂一条
+    "与系统之外独立重算的数值比"的腿。档名与锚点都从包/golden 读，不在 suite 里重抄。
     """
     from agentflow.core.pack import load_pack
     from agentflow.core.report_lint import declared_layers, lint_fact_triples
@@ -517,13 +624,59 @@ def _p_fact_triples(evidence, params, mode):
     layers = declared_layers(pack)
     if not layers:
         return False, f"场景包 {pack_name} 未声明 report_layers，无承诺可核对"
-    findings, skipped = _verified_findings(evidence)
+    findings, skipped, endorsed = _verified_findings(evidence)
     issues = lint_fact_triples(evidence["report"], findings, layers)
     if issues:
-        return False, "三元组破口 " + "；".join(issue["message"] for issue in issues[:3])
+        return False, "三元组破口（报告 != 账本）" + "；".join(issue["message"] for issue in issues[:3])
+
+    problems: list[str] = []
+    legs = 0
+    for unit in endorsed:
+        if not unit["finding_check"]:
+            continue
+        legs += 1
+        if unit["ledger"] and not unit["recompute"]:
+            problems.append(
+                f"任务 {unit['task_id']}：账本记了 {len(unit['ledger'])} 条发现，复算侧三元组却是空的"
+                "——落盘链断了，这条线现在只能证明'报告 == 账本'"
+            )
+            continue
+        mismatch, uncheckable = _recompute_mismatch(unit["ledger"], unit["recompute"])
+        problems.extend(f"任务 {unit['task_id']}：{text}" for text in mismatch[:3])
+        if uncheckable:
+            problems.append(
+                f"任务 {unit['task_id']}：账本里 {len(uncheckable)} 条发现缺指标或数值"
+                f"（{'、'.join(uncheckable[:3])}），三方等值核对不了这一行"
+            )
+    if problems:
+        return False, "三元组破口（账本 != 复算）" + "；".join(problems[:3])
     if skipped:
         return False, f"任务 {'、'.join(skipped)} 有发现但未通过独立复算，这条线拒绝为其背书"
-    return True, f"账本 {len(findings)} 条发现与事实层逐行等值（全部经独立复算背书）"
+    if findings and not legs:
+        return (
+            False,
+            f"账本有 {len(findings)} 条发现，却没有一条经过 finding 级独立复算"
+            "（只有 aggregate 背书）——三方等值实际只比了两方，不许自称三方",
+        )
+
+    anchor = str((params or {}).get("anchor") or "")
+    anchored = ""
+    if anchor:
+        values = (evidence.get("golden") or {}).get(anchor)
+        if not isinstance(values, dict):
+            return False, f"锚点 {anchor} 在 golden 里不存在或形状不对——声明了锚点却无比照对象，这条线不认通过"
+        anchor_problems = _anchor_mismatch([unit for unit in endorsed if unit["finding_check"]], values)
+        if anchor_problems:
+            return False, "三元组破口（与独立重算的锚点不符）" + "；".join(anchor_problems[:3])
+        # 锚点覆盖不到的规则要显式数出来：只比了两条规则却写"三方全对"，那是把漏比说成通过
+        covered = {
+            str(item.get("rule") or item.get("rule_id") or "")
+            for unit in endorsed
+            for item in unit["ledger"]
+            if str(item.get("rule") or item.get("rule_id") or "") in values
+        }
+        anchored = f"，锚点覆盖 {len(covered)} 条规则"
+    return True, f"三方等值：{len(findings)} 条发现 报告 == 账本 == 复算（{legs} 个任务有复算侧{anchored}）"
 
 
 def _p_report_layers(evidence, params, mode):
