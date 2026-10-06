@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import json
+import urllib.error
 from typing import Any
 
 import pytest
@@ -92,15 +93,81 @@ def test_null_content_becomes_a_diagnosable_error(monkeypatch):
     with pytest.raises(LLMError) as raised:
         llm.complete("你是数据工程师", [{"role": "user", "content": "算一下"}], max_tokens=8)
     text = str(raised.value)
-    assert "content 不是文本" in text and "finish_reason=length" in text, text
+    assert "没有可用正文" in text and "content=null" in text, text
+    assert "finish_reason=length" in text, text
     # 原因要说中要害：有 reasoning 在场就是预算被思考吃满，并给出可行动的下一步
     assert "reasoning_content 16 字" in text and "thinking=disabled" in text, text
 
 
 def test_empty_content_is_still_empty_text_not_an_error(monkeypatch):
-    """空串是"模型什么都没说"，null 是"没有正文这个字段"——两者不许混成一个错误。"""
+    """空串 + stop + 无 reasoning ⇒ 模型真的什么都没说，交回下游按内容判定。
+
+    这条与下面那条空白正文的用例是一对：区别不在字面值（都是空），而在
+    `finish_length + reasoning` 这个签名在不在场。
+    """
     install(monkeypatch, _text_payload(""))
     assert _llm().complete("你是评审", [{"role": "user", "content": "看这份报告"}]) == ""
+
+
+def _blank_eaten_payload(reasoning: str = "先想一步" * 4) -> dict[str, Any]:
+    """2026-10-06 在 InkStone 上实测到的 Agents-A1 默认档形状：白卷 + 思考吃满预算。"""
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "", "reasoning_content": reasoning},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 44, "completion_tokens": 300},
+    }
+
+
+def test_blank_content_with_eaten_budget_is_not_a_success(monkeypatch):
+    """缺陷 #42：content='' 配 finish_reason=length + reasoning 在场，就是 #41 换了个字面值。
+
+    放行它的后果是 fail-open——Executor 拿到空代码、Inspector 拿到空 JSON，
+    报出来的错与真因毫无关系，而留痕与提额重试一次都不会触发。
+    """
+    install(monkeypatch, _blank_eaten_payload())
+    with pytest.raises(LLMError) as raised:
+        _llm().complete("你是数据工程师", [{"role": "user", "content": "算一下"}], max_tokens=300)
+    text = str(raised.value)
+    assert "content=blank" in text and "finish_reason=length" in text, text
+    assert "thinking=disabled" in text, "提示要说给出路，不能只说坏了"
+
+
+def test_blank_eaten_budget_is_retry_eligible(monkeypatch):
+    """空白白卷与 null 白卷走同一条救法：签名对就提额重试一次。"""
+    sent = install_sequence(monkeypatch, [_blank_eaten_payload(), _text_payload("print(1)")])
+    llm = _llm(thinking_budget_retry=True)
+    from agentflow.core.budget import BudgetCounter
+
+    llm.budget = BudgetCounter(limit=30)
+    assert llm.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=300) == "print(1)"
+    assert [call["max_tokens"] for call in sent] == [300, 600], sent
+    assert llm.budget.empty_content[0]["content_kind"] == "blank", llm.budget.empty_content
+
+
+def test_blank_content_shape_lands_in_the_artifacts(monkeypatch, tmp_path):
+    """真实调用点上也要成立：白卷必须落成 llm_error 降级并把 content_kind 记进产物。
+
+    只测 `complete()` 抛不抛不够——#42 的漏法正是"空串往下漏"，一路到 JSON 解析才炸。
+    """
+    from pathlib import Path
+
+    install(monkeypatch, _blank_eaten_payload())
+    result = run_analysis(
+        question="统计各账号的登录失败次数，列出风险最高的账号",
+        sources=str(Path(__file__).resolve().parents[1] / "demo" / "data" / "login_auth.csv"),
+        mode="real",
+        llm=_llm(),
+        outputs_root=tmp_path / "outputs",
+    )
+    assert result["status"] == "degraded", result["status"]
+    evaluation = json.loads((Path(result["outputs_dir"]) / "evaluation.json").read_text(encoding="utf-8"))
+    assert evaluation["degraded_reason"] == "llm_error", evaluation["degraded_reason"]
+    assert evaluation["llm_empty_content"], "白卷没落进 evaluation.json"
+    assert evaluation["llm_empty_content"][0]["content_kind"] == "blank"
 
 
 def test_missing_choices_keeps_the_structural_error(monkeypatch):
@@ -199,6 +266,7 @@ def test_budget_retry_recovers_with_a_larger_envelope(monkeypatch):
             "reasoning_chars": 16,
             "max_tokens": 200,
             "thinking": None,
+            "content_kind": "null",
             "recovered_with": 400,
         }
     ], llm.budget.empty_content
@@ -232,3 +300,74 @@ def test_clone_carries_every_budget_knob():
         3.0,
         4000,
     )
+
+
+# ------------------------------------------------------------------ 传输层形状：网关不给 JSON 的时候
+
+
+def install_raw(monkeypatch, body: str, status: int = 200) -> list[str]:
+    """回放一个**不是 JSON** 的 2xx 响应（配额页/登录页/网关错误页），记录被请求的次数。"""
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001 - 与被替换函数的形状一致
+        calls.append(str(request.full_url))
+        response = _Response(body.encode("utf-8"))
+        response.status = status  # type: ignore[attr-defined]
+        return response
+
+    monkeypatch.setattr("agentflow.core.llm.urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+def install_http_error(monkeypatch, code: int, body: str) -> list[str]:
+    """回放一个非 2xx（urlopen 抛 HTTPError）。"""
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout=None):  # noqa: ANN001
+        calls.append(str(request.full_url))
+        raise urllib.error.HTTPError(request.full_url, code, "gateway says no", None, io.BytesIO(body.encode()))
+
+    monkeypatch.setattr("agentflow.core.llm.urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+def test_non_json_200_body_becomes_a_diagnosable_error(monkeypatch):
+    """200 + HTML：判成写得出原因的 LLMError，而不是让 JSONDecodeError 打穿整条 run。
+
+    执行器只 `except LLMError`（agents/executor.py），裸异常会把一次任务失败升级成
+    run_error，用户看到的归因从"网关给的是配额页"变成"未知错误"。
+    """
+    calls = install_raw(monkeypatch, "<html><body>quota exceeded, please recharge</body></html>")
+    with pytest.raises(LLMError) as raised:
+        _llm(max_retries=2).complete("你是评审", [{"role": "user", "content": "x"}])
+    text = str(raised.value)
+    assert "响应不是 JSON" in text and "配额页" in text, text
+    assert len(calls) == 1, f"拿到的还是那张页，退避重试只是白烧：{calls}"
+
+
+def test_non_json_body_never_echoes_the_key(monkeypatch):
+    """有的网关把请求头回显在错误页里：正文截断之前必须先抹掉凭据。"""
+    install_raw(monkeypatch, "<html>Bearer sk-super-secret-token-value seen in body</html>")
+    client = OpenAILLM(api_key="sk-super-secret-token-value", base_url="https://llm.test/v1")
+    with pytest.raises(LLMError) as raised:
+        client.complete("你是评审", [{"role": "user", "content": "x"}])
+    assert "sk-super-secret-token-value" not in str(raised.value), "错误文本里带着凭据原文"
+    assert "已抹掉的凭据" in str(raised.value), str(raised.value)
+
+
+def test_json_array_body_is_structural_not_attribute_error(monkeypatch):
+    """顶层是数组也是"结构异常"，不许在 `.get` 上炸成 AttributeError。"""
+    install_raw(monkeypatch, "[1, 2, 3]")
+    with pytest.raises(LLMError) as raised:
+        _llm().complete("你是评审", [{"role": "user", "content": "x"}])
+    assert "响应结构异常" in str(raised.value)
+
+
+def test_404_names_both_causes(monkeypatch):
+    """404 在这条线上只有两种来路，都得当场说出来：/v1 段，或该站只提供别的协议。"""
+    calls = install_http_error(monkeypatch, 404, "404 page not found")
+    with pytest.raises(LLMError) as raised:
+        _llm(max_retries=2).complete("你是评审", [{"role": "user", "content": "x"}])
+    text = str(raised.value)
+    assert "/chat/completions 不存在" in text and "/v1" in text and "Anthropic" in text, text
+    assert len(calls) == 1, f"404 换型号不会有用，重试只是白烧：{calls}"

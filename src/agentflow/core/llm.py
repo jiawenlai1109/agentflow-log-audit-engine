@@ -213,7 +213,7 @@ class OpenAILLM(BaseLLM):
             else "上游没给正文，也没记 reasoning（多半是网关/模型返回结构异常）"
         )
         raise EmptyContentError(
-            f"LLM 返回的 content 不是文本（调用方={empty['agent']}、"
+            f"LLM 没有可用正文（content={empty['content_kind']}、调用方={empty['agent']}、"
             f"finish_reason={empty['finish_reason']}、"
             f"reasoning_content {empty['reasoning_chars']} 字）：{hint}",
             detail=empty,
@@ -234,7 +234,8 @@ class OpenAILLM(BaseLLM):
         while True:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                    code = getattr(resp, "status", 200)
+                    raw = resp.read().decode("utf-8", "ignore")
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", "ignore")[:500]
@@ -242,6 +243,15 @@ class OpenAILLM(BaseLLM):
                     time.sleep(self._backoff(attempt, exc.headers.get("Retry-After")))
                     attempt += 1
                     continue
+                if exc.code == 404:
+                    # 404 在这条线上只有两种来路，都值得当场说出来：要么 base_url 的
+                    # /v1 段多/少了，要么这个站只提供 Anthropic 的 /v1/messages——
+                    # 引擎说的是 OpenAI Chat，换型号不会有用，换协议才会。
+                    raise LLMError(
+                        f"LLM HTTP 404（{self.base_url}/chat/completions 不存在）："
+                        f"检查 OPENAI_BASE_URL 是否该带 /v1；若该站只提供 Anthropic "
+                        f"(/v1/messages) 或 OpenAI Responses，本引擎暂不接。原始正文：{body}"
+                    ) from exc
                 raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt < self.max_retries:
@@ -249,6 +259,19 @@ class OpenAILLM(BaseLLM):
                     attempt += 1
                     continue
                 raise LLMError(f"LLM 网络错误或超时: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # 200 + 非 JSON：网关自己的配额页/登录页/错误页。重试十次拿到的还是那张页，
+            # 所以不进入退避；正文要截断并把凭据抹掉——有的网关会把请求头回显在错误页里。
+            leak = self.api_key or ""
+            excerpt = raw.replace(leak, "<已抹掉的凭据>")[:120] if leak else raw[:120]
+            raise LLMError(
+                f"LLM 响应不是 JSON（HTTP {code}，正文前 120 字：{excerpt!r}）："
+                "多半是网关返回了配额页/登录页/网关错误页，而不是模型输出"
+            ) from exc
+        if not isinstance(data, dict):
+            raise LLMError(f"LLM 响应结构异常（顶层不是对象）: {str(data)[:200]}")
         usage = data.get("usage") or {}
         if usage and self.budget is not None:
             agent = getattr(self.agent_local, "agent", "unknown")
@@ -266,16 +289,25 @@ class OpenAILLM(BaseLLM):
             raise LLMError(f"LLM 响应结构异常: {str(data)[:300]}")
         message = choices[0].get("message") or {}
         content = message.get("content")
-        if isinstance(content, str):
-            # 空串与 null 分两类：空串是"模型说了句没有内容的話"，交回下游按内容判定
-            return content, {}
         reasoning = message.get("reasoning_content") or ""
+        finish = choices[0].get("finish_reason")
+        if isinstance(content, str) and content.strip():
+            return content, {}
+        # 空白正文有两种来源，只按字段值一刀切会把它们混成一类（2026-10-06 实测）：
+        # Agents-A1 默认档交回 content='' + finish_reason=length + reasoning 1019 字，
+        # 那就是 #41 那个形状换了个字面值——思考把预算吃光，正文没写。这种必须判成
+        # 没正文，否则空串一路漏到下游：Executor 拿到空代码、Inspector 拿到空 JSON，
+        # 报出来的错跟真因毫无关系（缺陷 #42 的 fail-open）。
+        # 而 content='' + stop + 没有 reasoning 仍是"模型什么都没说"，交回下游按内容判定。
+        if isinstance(content, str) and not (finish == "length" and reasoning):
+            return content, {}
         return None, {
             "agent": getattr(self.agent_local, "agent", None) or "unknown",
-            "finish_reason": choices[0].get("finish_reason"),
+            "finish_reason": finish,
             "reasoning_chars": len(reasoning),
             "max_tokens": max_tokens,
             "thinking": self.thinking,
+            "content_kind": "null" if content is None else "blank",
         }
 
     def _retry_target(self, max_tokens: int, empty: dict[str, Any]) -> int:
