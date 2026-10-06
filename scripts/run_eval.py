@@ -606,13 +606,25 @@ def preflight_credentials(mode: str) -> tuple[str, list[str]]:
     base_url = os.getenv("OPENAI_BASE_URL") or ""
     model = os.getenv("LLM_MODEL") or ""
     try:
-        from agentflow.core.llm import OpenAILLM
+        from agentflow.core.llm import EmptyContentError, OpenAILLM
 
+        # 8 个 token 的 ping 在思考档模型上必然交白卷（reasoning 把预算吃光）——那不是
+        # 凭据问题。给一个能落正文的小额预算，同时把"白卷"单独归到能力那条腿上。
         OpenAILLM(
             api_key=os.getenv("OPENAI_API_KEY"),
             base_url=base_url or None,
             model=model or None,
-        ).complete(system="ping", messages=[{"role": "user", "content": "回复 ok"}], max_tokens=8)
+        ).complete(system="ping", messages=[{"role": "user", "content": "回复 ok"}], max_tokens=64)
+    except EmptyContentError as exc:
+        # 连上了、鉴权过了、响应能解析——只是这次没拿到正文。凭据预检**放行**，
+        # 但要把这句话原样打在开头：它正是 G2 预检表要回答的那个问题。
+        detail = getattr(exc, "detail", {}) or {}
+        return "", [
+            f"凭据预检：连通与鉴权通过，但正文为空（content={detail.get('content_kind')}、"
+            f"finish_reason={detail.get('finish_reason')}、reasoning {detail.get('reasoning_chars')} 字）"
+            f"——这是型号/档位的能力形状，不是凭据问题；跑 real 前先看 "
+            f"scripts/preflight_llm.py 的结论，必要时配 llm.thinking=disabled"
+        ]
     except Exception as exc:  # noqa: BLE001 - 预检失败即中止，不烧一整批
         return f"凭据预检失败，未跑批：{type(exc).__name__}: {str(exc)[:200]}", []
 

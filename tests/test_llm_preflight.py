@@ -255,3 +255,28 @@ def test_run_eval_real_mode_consults_the_capability_cache(tmp_path, monkeypatch)
 
     # mock 模式一个字节都不该碰这套东西
     assert run_eval.preflight_credentials("mock") == ("", [])
+
+
+def test_blank_ping_is_not_reported_as_a_credential_failure(tmp_path, monkeypatch):
+    """2026-10-06 实测翻过的车：ping 用 8 个 token，思考档把预算全花在 reasoning 上
+    ⇒ 交白卷 ⇒ 被报成"凭据预检失败"，整批 real 根本没开始跑。
+
+    凭据预检只管"连不连得上、有没有权限"；白卷是**能力形状**，必须放行并把原因原样
+    打在开头，否则这条闸门会把好端端的端点判死。
+    """
+    run_eval = _load_run_eval()
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://a.test/v1")
+    monkeypatch.setenv("LLM_MODEL", "thinker")
+    monkeypatch.setattr(run_eval, "PROJECT_ROOT", tmp_path)  # 没有预检缓存 ⇒ 只出提示
+
+    def blank(self, *args, **kwargs):
+        raise EmptyContentError(
+            "白卷",
+            detail={"content_kind": "null", "finish_reason": "length", "reasoning_chars": 38, "agent": "unknown"},
+        )
+
+    monkeypatch.setattr("agentflow.core.llm.OpenAILLM.complete", blank)
+    abort, notices = run_eval.preflight_credentials("real")
+    assert abort == "", f"白卷被当成凭据失败拦下了：{abort}"
+    assert any("能力形状" in line and "reasoning 38 字" in line for line in notices), notices
