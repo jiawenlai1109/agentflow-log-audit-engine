@@ -56,9 +56,30 @@ python -m venv .venv
 
 接线只发四个字段（`model` / `messages` / `temperature` / `max_tokens`），所以任何 OpenAI 兼容端点都接得上；Anthropic 原生 `/v1/messages` 形状不同，要走兼容网关。思考档有三件事要知道：
 
-1. **预算被吃满时正文是 `null`，不是空串**。客户端不装不知道——`content` 非字符串就判成 `LLMError`（带 `finish_reason` 与 reasoning 字数），落到既有的 `LLM_ERROR` 错误路由，不会再把 `None` 漏到下游炸成 `AttributeError`。每一次空正文都留在 `evaluation.json.llm_empty_content` 与 transcript 的 `llm_empty_content` 事件里，**只记形状不记正文**。
+1. **正文缺席有两种字面值，判据看签名不看字面值**。`content` 非字符串，**或**"空串 + `finish_reason=length` + reasoning 在场"，都判成没有可用正文并落成可诊断的 `LLMError`（形状细节带 `content_kind: null | blank`），走既有的 `LLM_ERROR` 错误路由，不会再把 `None` 或空串漏到下游炸成 `AttributeError`。每一次空正文都留在 `evaluation.json.llm_empty_content` 与 transcript 的 `llm_empty_content` 事件里，**只记形状不记正文**。
+   实测背书（2026-10-06，InkStone）：`Agents-A1` 默认档交回 `content=''`、`finish_reason=length`、reasoning 1019 字、`reasoning_tokens=300`＝整个 `max_tokens`——那是思考预算被吃满的同一个形状换了个字面值，而在此之前它被当成"答成功了"（缺陷 #42：空串一路漏到下游，Executor 拿到空代码、Inspector 拿到空 JSON，报出来的错与真因毫无关系）。反过来，`content=''` + `stop` + 无 reasoning 仍按"模型什么都没说"原样交回，两类不许混成一个错误。
 2. **按角色决定开不开思考**：`config/agents.yaml` 的 `llm.thinking: disabled`（或按角色 `agents.executor.thinking`）。留空 = 连 `thinking` 字段都不发，请求体与改造前逐字节相同——上游认不认这个字段各网关不同，**配置写了不等于思考真关了**，用第 3 条判断。
-3. **救回来还是报错**：`llm.thinking_budget_retry: true` 时，只有"reasoning 在场 + `finish_reason=length`"这个签名才会把 `max_tokens` 按 `thinking_budget_factor`（默认 2）提一次，封顶 `max_tokens_cap`（默认 8000），并把 `recovered_with` 记进留痕。默认关：多打一次真实调用就是要多花一次钱。
+3. **救回来还是报错**：`llm.thinking_budget_retry: true` 时，只有"reasoning 在场 + `finish_reason=length`"这个签名才会把 `max_tokens` 按 `thinking_budget_factor`（默认 2）提一次，封顶 `max_tokens_cap`（默认 8000），并把 `recovered_with` 记进留痕。默认关：多打一次真实调用就是要多花一次钱。空串白卷与 `null` 白卷走同一条救法。
+4. **网关返的不是 JSON 时不再打穿整条 run**：2xx + 非 JSON（配额页 / 登录页 / Cloudflare 页）判成 `LLMError`，附 HTTP 状态与**抹掉凭据后**的前 120 字；顶层不是对象（JSON 数组）同样判成结构异常。404 直接把两种来路说出来：`OPENAI_BASE_URL` 该带 `/v1` 没带，或该站只提供 Anthropic `/v1/messages` / OpenAI Responses 协议（本引擎暂不接）。这几类**都不退避重试**——重试一张配额页只是白烧一次调用。
+
+### 实测型号兼容性（2026-10-06，同一个 key、同一句 prompt）
+
+平台是 Intern InkStone，`GET /v1/models` 列 10 个型号，全部支持 OpenAI Chat（另外两种协议引擎不接）。每型号两次极小调用（默认档 / `thinking=disabled`），判据不是"HTTP 200"而是引擎真正需要的三件事：有没有可用正文、正文能不能直接 `json.loads`、每轮几秒。
+
+| 型号 | 默认档 | `thinking=disabled` | 结论 |
+|---|---|---|---|
+| `deepseek-v4-flash-vision` | 纯 JSON 2.3s | 纯 JSON 1.0s | 开箱能用（当前配置） |
+| `deepseek-v4-flash-0731` | 纯 JSON 1.9s | 纯 JSON 0.8s | 开箱能用 |
+| `deepseek-v4-pro-0813` | 纯 JSON 1.1s | 纯 JSON 3.6s | 开箱能用 |
+| `kimi-k2.6` | 纯 JSON 1.7s | 纯 JSON 0.6s | 开箱能用 |
+| `minimax-m3` | 纯 JSON 0.8s | 纯 JSON 0.5s | 开箱能用 |
+| `qwen3.8-27b` | 纯 JSON 0.7s | 纯 JSON 0.5s | 开箱能用 |
+| `Atria-Dawn-Preview` | 纯 JSON 5.0s | 纯 JSON 2.7s | 开箱能用 |
+| `Agents-A1` | **空串白卷**（#42 形状）3.7s | 纯 JSON 0.5s | 必须配 `thinking: disabled` |
+| `intern-s2` | 87.0s 后无正文（`length`） | 纯 JSON 1.1s | 必须配 `thinking: disabled` |
+| `glm-5.3` | 纯 JSON 15.3s | **646 字散文，破 JSON 契约** | 别关思考；15.3s/轮 × real 实测 9 轮 ≈ 138s，慢要按型号算 |
+
+读数来自一次性探针；这批探针会被固化成 `scripts/preflight_llm.py`（G2 待办），届时 real 模式开跑前应当先过预检，而不是跑到第 7 轮才发现网关在交白卷。
 
 用同一网关跑 real 批次时注意归因边界：一个网关名背后可能路由到多个上游（实测同一句 prompt 两次 `prompt_tokens` 报 96 与 17），所以 real 数字要跨批次对比，得先固定 endpoint/模型名并记录返回的 `model` 串，否则分不清是系统退化了还是上游换了。mock 门禁不受影响（零网络、确定性），CI 只跑 mock。
 
@@ -210,7 +231,7 @@ evals/          # 冻结评测集 suite.yaml（27 题）+ 基线 baseline.json
 scripts/        # CLI 入口、demo 数据生成（零售/登录日志/SOC 三源/外部情报库）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
 .github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
 demo/data/      # 固定验收数据集（含 triage/ 三源与 soc_intel.sqlite）
-tests/          # 497 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档/skill/MCP/门禁容差/授权自检/LLM 响应形状/三元组等值）
+tests/          # 504 个自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档/skill/MCP/门禁容差/授权自检/LLM 响应形状/三元组等值）
 outputs/        # 运行产物（不入 git）
 ```
 
@@ -221,8 +242,8 @@ outputs/        # 运行产物（不入 git）
 ## 测试与质量
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q     # 497 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 504 passed
 .\.venv\Scripts\python.exe scripts\run_eval.py   # 27/27 pass，gate 断言 192 全绿（gap 12 条按设计全红）
 ```
 
-测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）→ 289（+18 报告分档闸门、+3 评分器与量具用例）→ 366（+77 M4 能力面：prompts 32 / skill 25 / MCP 20）→ 371（+5 配置路径不再静默退默认，含变异复测用例）→ 411（+40 场景包经 Web 跑通：包名授权面、批准的可授予名单、缺列派发前预检）→ 412（+1 评测 runner 在 stdout 重定向时不再把全绿运行报成崩溃）→ 418（+6 评审器掉线不再伪装成内容结论，含"测接线"的用例）→ 424（+6 降级路径两条：错误分类可行动、报告正文不再带环境布局）→ 431（+7 守卫异常只作废自己、Bundle 缓存按顺序发布）→ 447（+16 脚本输出编码按族加下限）→ 450（+3 CI 首跑两条红的回归：摘要行不被截断吃掉、只剩栈帧时不端 `File "…"` 给用户）→ 462（+12 聚合容差的方向与「判红 / 只记录」两栏分工，含一条测接线的 AST 用例）→ 472（+10 表级授权的每跑自检：引擎自己拿未声明的表试一次，谓词 `table_denied` + runner 下限，含一条测接线的用例）→ 479（+7 LLM 响应形状：`content=null` 判成可诊断的 LLM 错误、`thinking` 档位按角色透传）→ 484（+5 空正文留痕与"预算被思考吃满"的提额重试，含封顶与签名判据）→ 497（+13 事实层三元组等值：`lint_fact_triples` 这把尺 8 例 + 谓词接线 5 例，E14/E16/E21/E23/E24 五题消费）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。
+测试基线演进：18 → 31 → 39 → 48 → 54 → 66 → 94（+28 鉴权与数据隔离用例）→ 152（+58 评分器用例）→ 158（+6 配置接线用例）→ 161（+3 M0 复检收口）→ 179（+17 Bundle 与异构入包）→ 201（+22 join 派发前预检，其中 3 例端到端）→ 214（+13 表级授权与 join 重放校验）→ 234（+20 Bundle 多文件上传，含分片/异步/越权）→ 242（+5 追溯率谓词与数字池、+3 路径形态归一）→ 248（+6 包内列别名贯通跨表 join）→ 268（+20 SOC 多源分诊场景包，期望值全部从原始 CSV 独立重算）→ 289（+18 报告分档闸门、+3 评分器与量具用例）→ 366（+77 M4 能力面：prompts 32 / skill 25 / MCP 20）→ 371（+5 配置路径不再静默退默认，含变异复测用例）→ 411（+40 场景包经 Web 跑通：包名授权面、批准的可授予名单、缺列派发前预检）→ 412（+1 评测 runner 在 stdout 重定向时不再把全绿运行报成崩溃）→ 418（+6 评审器掉线不再伪装成内容结论，含"测接线"的用例）→ 424（+6 降级路径两条：错误分类可行动、报告正文不再带环境布局）→ 431（+7 守卫异常只作废自己、Bundle 缓存按顺序发布）→ 447（+16 脚本输出编码按族加下限）→ 450（+3 CI 首跑两条红的回归：摘要行不被截断吃掉、只剩栈帧时不端 `File "…"` 给用户）→ 462（+12 聚合容差的方向与「判红 / 只记录」两栏分工，含一条测接线的 AST 用例）→ 472（+10 表级授权的每跑自检：引擎自己拿未声明的表试一次，谓词 `table_denied` + runner 下限，含一条测接线的用例）→ 479（+7 LLM 响应形状：`content=null` 判成可诊断的 LLM 错误、`thinking` 档位按角色透传）→ 484（+5 空正文留痕与"预算被思考吃满"的提额重试，含封顶与签名判据）→ 497（+13 事实层三元组等值：`lint_fact_triples` 这把尺 8 例 + 谓词接线 5 例，E14/E16/E21/E23/E24 五题消费）→ 504（+7 网关交白卷按签名判定而非按字面值，加三处传输层兜底：非 JSON 判可诊断、顶层非对象判结构异常、404 说两种来路；含一条"错误正文不许回显凭据"的用例）；real 模式经五批迭代收敛（2/2 success + 独立校验 8/8 + 评审 2/2 PASS），逐批数字与缺陷修复记录见评估记录.md，M1 变异测试四条结论与 M0 复检见工作日志 2026-09-28。
