@@ -94,6 +94,8 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
             thinking_budget_retry=llm.thinking_budget_retry,
             thinking_budget_factor=llm.thinking_budget_factor,
             max_tokens_cap=llm.max_tokens_cap,
+            # 降级链跟着克隆走：漏掉它等于"按角色换了个更稳的模型，顺手把兜底弄没了"
+            fallback_models=llm.fallback_models,
         )
         clone.budget = llm.budget
         return clone
@@ -213,6 +215,7 @@ def run_analysis(
                 thinking_budget_retry=llm_cfg.get("thinking_budget_retry") or False,
                 thinking_budget_factor=llm_cfg.get("thinking_budget_factor") or 2.0,
                 max_tokens_cap=llm_cfg.get("max_tokens_cap") or 8000,
+                fallback_models=llm_cfg.get("fallback_models") or [],
             )
         )
 

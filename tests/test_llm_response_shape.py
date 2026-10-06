@@ -262,6 +262,8 @@ def test_budget_retry_recovers_with_a_larger_envelope(monkeypatch):
     assert llm.budget.empty_content == [
         {
             "agent": "unknown",
+            # 型号进形状细节：降级链启用后，"哪个型号在吃满预算"就是唯一要说清的事
+            "model": llm.model,
             "finish_reason": "length",
             "reasoning_chars": 16,
             "max_tokens": 200,

@@ -3,10 +3,18 @@ llm:
   base_url: ""                # 留空则用 OPENAI_BASE_URL（默认 https://api.openai.com/v1）
   temperature: 0.2
   # thinking: disabled        # 思考档位（enabled / disabled / 留空=不发这个字段）。
-  #                             真实模式踩过：思考档把 max_tokens 花在 reasoning 上时，
-  #                             content 返回 null，客户端从此处起判 LLMError 而不是让 None 往下漏。
+  #                             真实模式踩过：思考档把 max_tokens 花在 reasoning 上时正文为空——
+  #                             字面值实测有两种（null 与 空串），所以判据按签名走：
+  #                             "reasoning 在场 + finish_reason=length" 才算交白卷（#41/#42）。
   #                             留空是为了不改变默认请求体——上游认不认 thinking 需要实测，
   #                             "配置写了"不等于"思考关了"。
+  # fallback_models: []       # 型号降级链，默认空=完全不启用。只在三种失败下换下一个型号：
+  #                             白卷签名对 / 传输层错误或超时 / 5xx+429 重试用尽。
+  #                             401、403、404、非 JSON 响应（网关配额页）、结构异常、预算耗尽
+  #                             ——一律不换：换个型号一个字都不会变，降级只会多烧一次钱并把真因洗白。
+  #                             开着它要注意两件事：① 每次降级都落 evaluation.json 的 llm_fallbacks
+  #                             与 transcript 的 llm_fallback 事件，实际服务过的型号集合记在 models_used；
+  #                             ② 真实 HTTP 次数会多于 llm_calls（逻辑调用数），看 llm_http_attempts。
 
 execution:
   max_concurrency: 3

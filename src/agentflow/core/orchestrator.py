@@ -901,6 +901,14 @@ class Orchestrator:
             # 空正文（思考档吃满预算）的形状记录：谁在什么预算档上没拿到正文。
             # 只记形状不记正文——正文本来就没有，而形状是 real 批次归因唯一剩下的东西。
             "llm_empty_content": list(getattr(ctx.budget, "empty_content", []) or []),
+            # 型号降级链：每一次换型号都留因（从哪来、到哪去、为什么、第几次）。
+            # `models_used` 是"这次实际服务过的型号集合"——跨批次比 real 数字之前，
+            # 先要用它排除"其实是换了型号才变好的"，否则 I3 归因就是空话。
+            "llm_fallbacks": list(getattr(ctx.budget, "fallbacks", []) or []),
+            "models_used": list(getattr(ctx.budget, "models_used", []) or []),
+            # 真实 HTTP 请求次数：`llm_calls` 记的是逻辑调用（Agent 层计 1）。
+            # 降级与提额重试只动前者——两个数一分开，"这次到底打了多少次上游"才看得见。
+            "llm_http_attempts": int(getattr(ctx.budget, "http_attempts", 0) or 0),
             # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
             "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
             # 多源报告头部会逐张表报行数（"auth.csv 282 行、assets.csv 24 行…"）。
@@ -941,6 +949,9 @@ class Orchestrator:
         for empty in evaluation.get("llm_empty_content") or []:
             if ctx.transcript is not None:
                 ctx.transcript.write({"event": "llm_empty_content", **empty})
+        for fallback in evaluation.get("llm_fallbacks") or []:
+            if ctx.transcript is not None:
+                ctx.transcript.write({"event": "llm_fallback", **fallback})
 
     def _write_degraded_report(
         self, ctx: RunContext, failure_info: dict[str, Any]

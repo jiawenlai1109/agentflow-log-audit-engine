@@ -20,6 +20,19 @@ class LLMError(RuntimeError):
     """LLM 调用失败（网络 / 鉴权 / 响应结构异常 / 预算耗尽）。"""
 
 
+class LLMHTTPError(LLMError):
+    """网关回了非 2xx。带 `code` 是因为"该不该换型号"必须按状态码判，不能靠读错误文案
+    ——文案改一个字，降级判据就静默失效，那正是本项目最不该再犯的那类错。"""
+
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class LLMTransportError(LLMError):
+    """连不上 / 超时 / 连接被断。换个型号可能真的有用（上游不同），这与鉴权失败性质相反。"""
+
+
 class EmptyContentError(LLMError):
     """正文为空（`content` 不是字符串）的专用错误，带一份可比的结构化细节。
 
@@ -152,6 +165,7 @@ class OpenAILLM(BaseLLM):
         thinking_budget_retry: bool = False,
         thinking_budget_factor: float = 2.0,
         max_tokens_cap: int = 8000,
+        fallback_models: list[str] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -176,6 +190,10 @@ class OpenAILLM(BaseLLM):
         self.thinking_budget_retry = bool(thinking_budget_retry)
         self.thinking_budget_factor = float(thinking_budget_factor)
         self.max_tokens_cap = int(max_tokens_cap)
+        # 降级候选：**默认空 = 完全不启用**（多打一次真实调用就是要多花一次钱，
+        # 而且换个型号产出的代码质量不同，会把"这次变绿"归因到模型身上）。
+        # 一律 `.get` 读、不进 DEFAULT_CONFIG——加键会改 `config` 归因指纹。
+        self.fallback_models = [str(model) for model in (fallback_models or []) if str(model).strip()]
 
     def complete(
         self,
@@ -184,8 +202,56 @@ class OpenAILLM(BaseLLM):
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> str:
+        """按型号链尝试：主型号失败且**失败类型可降级**时，才换下一个候选型号。
+
+        三条纪律：
+        1. **换型号不吞失败**——每一次降级都记一条事件（从哪个型号、到哪个型号、为什么），
+           落在本次 run 的预算对象上，`evaluation.json` 与 transcript 都取得到；
+        2. **能换的只有三种**：思考吃满预算的白卷签名、传输层错误/超时、5xx/429 重试用尽。
+           401/403（没权限）、404（没这个端点）、非 JSON 响应（网关自己那张页）、结构异常、
+           预算耗尽——换一个型号一个字都不会变，重试只是多烧一次钱；
+        3. **不改共享客户端的状态**——本进程的 `llm` 是跨线程共享的（并发 3），
+           把型号写回 `self.model` 会让 A 线程的降级串进 B 线程的请求体。型号只作为参数往下传。
+        """
+        chain = self._model_chain()
+        for index, model in enumerate(chain):
+            try:
+                return self._complete_once(model, system, messages, temperature, max_tokens)
+            except (EmptyContentError, LLMHTTPError, LLMTransportError) as exc:
+                nxt = chain[index + 1] if index + 1 < len(chain) else None
+                if nxt is None or not self._fallback_eligible(exc):
+                    raise
+                self._note_fallback(model, nxt, exc, tried=chain[: index + 1])
+        raise LLMError(f"型号链全部失败（{chain}）")  # 理论上到不了：最后一枚在循环内 raise
+
+    def _model_chain(self) -> list[str]:
+        """主型号在前，候选按配置顺序，去重且不去掉主型号。"""
+        chain = [self.model]
+        for model in self.fallback_models:
+            if model and model not in chain:
+                chain.append(model)
+        return chain
+
+    def _fallback_eligible(self, exc: Exception) -> bool:
+        """该不该换型号——按错误类型判，不按文案判（文案会变，判据不能跟着变）。"""
+        if isinstance(exc, EmptyContentError):
+            detail = exc.detail or {}
+            # 与提额重试同一个签名：reasoning 在场 + finish_reason=length
+            return bool(detail.get("reasoning_chars")) and detail.get("finish_reason") == "length"
+        if isinstance(exc, LLMHTTPError):
+            return exc.code in self.RETRYABLE_CODES
+        return isinstance(exc, LLMTransportError)
+
+    def _complete_once(
+        self,
+        model: str,
+        system: str,
+        messages: list[dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [{"role": "system", "content": system}, *messages],
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -193,17 +259,19 @@ class OpenAILLM(BaseLLM):
         if self.thinking:
             payload["thinking"] = {"type": self.thinking}
         data = self._request(payload)
-        text, empty = self._text_of(data, max_tokens=max_tokens)
+        text, empty = self._text_of(data, max_tokens=max_tokens, model=model)
         if text is not None:
+            self._note_model(model)
             return text
         # 只有"reasoning 在场 + finish_reason=length"才是预算被思考吃满的签名，
         # 值得再花一次真实调用去提额重试；结构异常重试十次也一样坏。
         retry_at = self._retry_target(max_tokens, empty)
         if retry_at:
             data = self._request({**payload, "max_tokens": retry_at})
-            text, second = self._text_of(data, max_tokens=retry_at)
+            text, second = self._text_of(data, max_tokens=retry_at, model=model)
             if text is not None:
                 self._note({**empty, "recovered_with": retry_at})
+                self._note_model(model)
                 return text
             empty = second
         self._note(empty)
@@ -213,14 +281,17 @@ class OpenAILLM(BaseLLM):
             else "上游没给正文，也没记 reasoning（多半是网关/模型返回结构异常）"
         )
         raise EmptyContentError(
-            f"LLM 没有可用正文（content={empty['content_kind']}、调用方={empty['agent']}、"
-            f"finish_reason={empty['finish_reason']}、"
+            f"LLM 没有可用正文（content={empty['content_kind']}、型号={model}、"
+            f"调用方={empty['agent']}、finish_reason={empty['finish_reason']}、"
             f"reasoning_content {empty['reasoning_chars']} 字）：{hint}",
             detail=empty,
         )
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """发一次 chat/completions，含传输层退避重试与 usage 记账。"""
+        if self.budget is not None:
+            # 每次进入都记一次真实请求（退避重试的每一次也算）：成本口径不许只看到"逻辑调用"
+            self.budget.note_http_attempt()
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -247,18 +318,19 @@ class OpenAILLM(BaseLLM):
                     # 404 在这条线上只有两种来路，都值得当场说出来：要么 base_url 的
                     # /v1 段多/少了，要么这个站只提供 Anthropic 的 /v1/messages——
                     # 引擎说的是 OpenAI Chat，换型号不会有用，换协议才会。
-                    raise LLMError(
+                    raise LLMHTTPError(
                         f"LLM HTTP 404（{self.base_url}/chat/completions 不存在）："
                         f"检查 OPENAI_BASE_URL 是否该带 /v1；若该站只提供 Anthropic "
-                        f"(/v1/messages) 或 OpenAI Responses，本引擎暂不接。原始正文：{body}"
+                        f"(/v1/messages) 或 OpenAI Responses，本引擎暂不接。原始正文：{body}",
+                        code=404,
                     ) from exc
-                raise LLMError(f"LLM HTTP {exc.code}: {body}") from exc
+                raise LLMHTTPError(f"LLM HTTP {exc.code}: {body}", code=exc.code) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt < self.max_retries:
                     time.sleep(self._backoff(attempt, None))
                     attempt += 1
                     continue
-                raise LLMError(f"LLM 网络错误或超时: {exc}") from exc
+                raise LLMTransportError(f"LLM 网络错误或超时: {exc}") from exc
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -280,7 +352,9 @@ class OpenAILLM(BaseLLM):
             )
         return data
 
-    def _text_of(self, data: dict[str, Any], *, max_tokens: int) -> tuple[str | None, dict[str, Any]]:
+    def _text_of(
+        self, data: dict[str, Any], *, max_tokens: int, model: str | None = None
+    ) -> tuple[str | None, dict[str, Any]]:
         """取正文；取不到时返回 `(None, 形状细节)`——细节里没有正文，也没有凭据。"""
         choices = data.get("choices")
         if not choices:
@@ -301,6 +375,7 @@ class OpenAILLM(BaseLLM):
             return content, {}
         return None, {
             "agent": getattr(self.agent_local, "agent", None) or "unknown",
+            "model": model or self.model,
             "finish_reason": finish,
             "reasoning_chars": len(reasoning),
             "max_tokens": max_tokens,
@@ -321,6 +396,33 @@ class OpenAILLM(BaseLLM):
         """空正文的形状进本次 run 的预算对象——`evaluation.json` 与 transcript 都从那里取。"""
         if self.budget is not None:
             self.budget.note_empty_content(empty)
+
+    def _note_model(self, model: str) -> None:
+        """记下"这次真的服务过"的型号：跨批次比较时，先排除换了型号这个变量。"""
+        if self.budget is not None:
+            self.budget.note_model_used(model)
+
+    def _note_fallback(self, from_model: str, to_model: str, exc: Exception, tried: list[str]) -> None:
+        """降级必留因：从哪个型号、到哪个型号、为什么、第几次。不记正文也不记凭据。"""
+        if self.budget is None:
+            return
+        detail: dict[str, Any] = {
+            "from_model": from_model,
+            "to_model": to_model,
+            "reason_class": type(exc).__name__,
+            "tried": list(tried),
+            "agent": getattr(self.agent_local, "agent", None) or "unknown",
+        }
+        if isinstance(exc, LLMHTTPError):
+            detail["http_status"] = exc.code
+        if isinstance(exc, EmptyContentError):
+            shape = exc.detail or {}
+            detail["finish_reason"] = shape.get("finish_reason")
+            detail["content_kind"] = shape.get("content_kind")
+            detail["reasoning_chars"] = shape.get("reasoning_chars")
+        # 错误文本可能带网关正文：截短并抹掉凭据后再留痕
+        detail["message"] = self._mask(str(exc))[:160]
+        self.budget.note_fallback(detail)
 
     def _mask(self, text: str) -> str:
         """把凭据从任何要外印的网关正文里抹掉：错误文本会进 transcript、预检缓存与报告。
