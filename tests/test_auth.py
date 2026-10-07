@@ -90,8 +90,7 @@ def run_dir(tmp_path, monkeypatch):
         '{"run_id": "%s", "status": "success", "question": "q", "llm_calls": 3}' % VALID_RUN,
         encoding="utf-8",
     )
-    monkeypatch.setattr("app.routers.media.OUTPUTS_ROOT", tmp_path)
-    monkeypatch.setattr("app.routers.reports.OUTPUTS_ROOT", tmp_path)
+    monkeypatch.setenv("OUTPUTS_ROOT", str(tmp_path))
     return tmp_path
 
 
@@ -329,21 +328,48 @@ def test_every_owned_table_query_is_user_scoped():
 
     之前这些语句靠"调用方先做一次归属查询"兜住，将来谁删掉守卫就静默打开 IDOR。
     把不变量写进 SQL，才写进代码顺序里。
+
+    队列是一族**故意跨用户**的语句（共享队列的意义就是任何 worker 都能认领任何人的 job），
+    它要豁免，但豁免必须是有形状的四条：
+      ① 语句字面量自己以 `/*queue-internal*/` 开头；
+      ② 只住在 `app/queueing.py` 这一个文件里；
+      ③ 条数封上限，多一条要单独决策；
+      ④ 归属仍在别处判：读数据源时用行里的 user_id 重校验（runner.resolve_sources），
+         面向用户的每条读路径自带谓词（_owned_job / SSE / reports）。
+
+    读代码用 AST，不用"正则 + 相邻三行"：后者会被语句自己的形状骗过。第一版豁免就是这么
+    失效的——把标记拼到 SQL 字面量开头之后，`"(SELECT|UPDATE|…)` 那条正则**一条都匹配不到**，
+    10 条跨用户语句从"需要豁免"变成"不存在"，守卫当场全绿而一条也没看见。
     """
+    import ast
     import re
 
     owned = ("datasets", "jobs", "sessions")
-    offenders = []
+    marker = "/*queue-internal*/"
+    queue_sql_home = "queueing.py"
+    queue_sql_max = 12  # 2026-10-07 实测 12 条；涨一条要先写清"归属在哪儿判"，才准动这个数
+    statement_start = re.compile(r"\s*(?:/\*[^*]*\*/\s*)?(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+    offenders: list[str] = []
+    queue_internal: list[str] = []
     for py in sorted((PROJECT_ROOT / "app").rglob("*.py")):
-        lines = py.read_text(encoding="utf-8").splitlines()
-        text = "\n".join(lines)
-        for match in re.finditer(r'"((?:SELECT|INSERT|UPDATE|DELETE)[^"]*)"', text, re.S | re.I):
-            statement = match.group(1)
-            if not any(re.search(rf"\b{table}\b", statement) for table in owned):
+        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+            elif isinstance(node, ast.JoinedStr):  # f-string：把字面量段拼起来才是完整语句
+                text = "".join(part.value for part in node.values if isinstance(part, ast.Constant) and isinstance(part.value, str))
+            else:
                 continue
-            # Python 相邻字符串字面量会拼成同一条语句，所以下两行也属于它
-            start_line = text[: match.start()].count("\n")
-            window = " ".join(lines[start_line : start_line + 3])
-            if "user_id" not in window:
-                offenders.append(f"{py.name}: {' '.join(statement.split())[:70]}")
+            if not statement_start.match(text):
+                continue
+            if not any(re.search(rf"\b{table}\b", text) for table in owned):
+                continue
+            if "user_id" in text:
+                continue
+            if text.lstrip().startswith(marker) and py.name == queue_sql_home:
+                queue_internal.append(" ".join(text.split())[:70])
+                continue
+            offenders.append(f"{py.name}: {' '.join(text.split())[:70]}")
     assert not offenders, "这些语句没有把归属写进 SQL：\n" + "\n".join(offenders)
+    assert len(queue_internal) <= queue_sql_max, (
+        f"跨用户的队列 SQL 从上限 {queue_sql_max} 涨到 {len(queue_internal)} 条：\n" + "\n".join(queue_internal)
+    )

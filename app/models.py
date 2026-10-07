@@ -123,6 +123,10 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text)
+    # 被认领过几次：租约过期收回时 +1，到上限判失败（见 app/queueing.py 第 2 条口径）
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # "要跑什么"以引用形式落库（bundle:<id> / dataset:<id>）——闭包只能被一个进程认领
+    spec: Mapped[str | None] = mapped_column(Text)
     # 谁在跑它：多 worker 水平扩之后，"这个 job 归哪个 worker"必须查得回来，
     # 否则 worker 死了没人能把它认领回来（P2 的租约字段）
     worker: Mapped[str | None] = mapped_column(String(64))

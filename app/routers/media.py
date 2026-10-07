@@ -11,7 +11,7 @@ import re
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app.config import MEDIA_EXTENSIONS, OUTPUTS_ROOT
+from app import config
 from app.deps import ensure_run_access, get_media_principal, guard_within
 
 router = APIRouter(tags=["media"])
@@ -25,7 +25,7 @@ def read_media(run_id: str, rel_path: str, request: Request) -> FileResponse:
         raise HTTPException(status_code=404, detail="资源不存在")
     user = get_media_principal(request, run_id)
     ensure_run_access(run_id, user)
-    target = guard_within(OUTPUTS_ROOT / run_id, rel_path)
-    if target.suffix.lower() not in MEDIA_EXTENSIONS or not target.is_file():
+    target = guard_within(config.outputs_root() / run_id, rel_path)
+    if target.suffix.lower() not in config.MEDIA_EXTENSIONS or not target.is_file():
         raise HTTPException(status_code=404, detail="资源不存在")
     return FileResponse(target)

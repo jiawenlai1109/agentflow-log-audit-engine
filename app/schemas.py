@@ -74,8 +74,9 @@ class JobOut(BaseModel):
     # 跑的是哪个领域场景。历史页与审计要能一眼分开"普通分析"与"分诊"——
     # 只看问题文本分不出来，而分歧恰恰发生在"同一个问题、不同场景口径"的时候
     pack: str | None = None
-    # 队列深度（workers/running/queued）：前端要能显示"排在第几位"，而不是让用户在
+    # 队列深度（workers/running/queued/stale_pending）：前端要能显示"排在第几位"，而不是让用户在
     # "点了没反应"与"卡死了"之间猜。100 并发下这条从体验问题变成必要的运维信息。
+    # `stale_pending` 单列：那是"没人能认领也没人负责"的行，混进 queued 就是给运维一个不动的数。
     queue: dict[str, int] | None = None
 
 

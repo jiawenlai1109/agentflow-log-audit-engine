@@ -44,11 +44,17 @@ def _make_user(username: str, password: str) -> int:
 
 @pytest.fixture()
 def bundles_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.routers.bundles.BUNDLES_DIR", tmp_path / "bundles")
-    monkeypatch.setattr("app.routers.jobs.OUTPUTS_ROOT", tmp_path / "outputs")
-    # 报告接口也读 OUTPUTS_ROOT：三个消费方一起指到 tmp，否则跑完的 run 会在项目目录里找
-    monkeypatch.setattr("app.routers.reports.OUTPUTS_ROOT", tmp_path / "outputs")
-    return tmp_path / "bundles"
+    """路径的唯一权威是环境变量（`app/config.py` 的 `*_DIR` / `OUTPUTS_ROOT`）。
+
+    原来这里逐个 monkeypatch 各模块 import 时的属性副本，漏一个副本就把 run 写进仓库
+    真 `outputs/`（P2 实测：测试目录里冒出 7 个 run，报告接口反过来 404）。
+    用环境变量指路径与 `scripts/worker.py` 用的是同一套配置，测试通过才等于部署能用。
+    """
+    monkeypatch.setenv("BUNDLES_DIR", str(tmp_path / "appdata" / "bundles"))
+    monkeypatch.setenv("OUTPUTS_ROOT", str(tmp_path / "outputs"))
+    from app import config
+
+    return config.bundles_dir()
 
 
 @pytest.fixture()
@@ -199,7 +205,7 @@ def test_unsupported_extension_and_empty_file_have_reasons(bundles_dir, owner):
 
 
 def test_oversize_file_is_dropped_not_half_stored(bundles_dir, owner, monkeypatch):
-    monkeypatch.setattr("app.routers.bundles.MAX_UPLOAD_MB", 0)  # 上界压到 0MB：任何文件都超限
+    monkeypatch.setattr("app.config.MAX_UPLOAD_MB", 0)  # 上界压到 0MB：任何文件都超限
     with TestClient(app) as client:
         _login(client, "b_owner", "b-owner-pw-1")
         body = _upload(client, [("big.csv", SALES_CSV.encode("utf-8"), "text/csv")]).json()
@@ -313,7 +319,7 @@ def _wait_job(client: TestClient, job_id: str, timeout: float = 60.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in ("pending", "running"):
+        if job["status"] not in ("pending", "queued", "running"):
             return job
         time.sleep(0.4)
     raise TimeoutError(f"job {job_id} 未完成")

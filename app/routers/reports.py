@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.config import OUTPUTS_ROOT
+from app import config
 from app.db import query
 from app.deps import ensure_run_access, get_current_user, guard_within
 from app.schemas import EvaluationSummary
@@ -41,7 +41,7 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
         run_id = str(row["run_id"])
         if not RUN_ID_PATTERN.match(run_id):
             continue
-        evaluation_file = OUTPUTS_ROOT / run_id / "evaluation.json"
+        evaluation_file = config.outputs_root() / run_id / "evaluation.json"
         try:
             evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -107,7 +107,7 @@ def list_runs(user: dict = Depends(get_current_user)) -> list[dict]:
 def get_report(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run_id = _valid_run_id(run_id)
     ensure_run_access(run_id, user)
-    report_path = guard_within(OUTPUTS_ROOT / run_id, "report.md")
+    report_path = guard_within(config.outputs_root() / run_id, "report.md")
     if not report_path.exists():
         raise HTTPException(status_code=404, detail="报告不存在")
     content = report_path.read_text(encoding="utf-8")

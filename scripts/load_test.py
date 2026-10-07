@@ -40,6 +40,11 @@ sys.path.insert(0, str(ROOT / "src"))
 import httpx  # noqa: E402  # 驱动就用电机客户端：同一份请求形状，不自己造第二套协议
 
 from agentflow.core.streams import harden_streams  # noqa: E402
+from app.queueing import TERMINAL as TERMINAL_STATUSES  # noqa: E402
+
+# "还没跑完"的判据必须与队列用的是**同一份**名单：原来这里硬编码了三处、漏了 cancelled，
+# 于是被取消的 job 在读数里永远是"在跑"。改一处队列口径而尺子跟着坏，比坏在代码里难查。
+NON_TERMINAL_WHERE = "status NOT IN (" + ", ".join(f"'{state}'" for state in TERMINAL_STATUSES) + ")" 
 
 CSV = ROOT / "demo" / "data" / "login_auth.csv"
 QUESTION = "对2026-09-05的登录日志做安全审计，列出失败次数最高的账号"
@@ -116,6 +121,25 @@ def spawn_server(port: int, data_dir: Path, log_path: Path) -> subprocess.Popen:
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port),
          "--log-level", "info"],
+        cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
+    )
+    return process, log
+
+
+def spawn_worker(data_dir: Path, log_path: Path) -> tuple[subprocess.Popen, object]:
+    """起一个独立 worker 进程（`scripts/worker.py`）。
+
+    它与 Web 进程共用同一套环境变量：路径与库的权威是环境变量，所以"两个进程对同一份
+    数据说话"这件事只有在这一层测才算测到（单元层里它们本来就是同一个进程）。
+    """
+    env = dict(os.environ)
+    env["APP_DATA_DIR"] = str(data_dir)
+    env["OUTPUTS_ROOT"] = str(data_dir / "outputs")
+    env["APP_SECRET"] = "load-test-secret-not-a-real-one"
+    env["PYTHONIOENCODING"] = "utf-8"
+    log = log_path.open("w", encoding="utf-8", errors="replace")
+    process = subprocess.Popen(
+        [sys.executable, str(ROOT / "scripts" / "worker.py")],
         cwd=str(ROOT), env=env, stdout=log, stderr=subprocess.STDOUT,
     )
     return process, log
@@ -286,10 +310,7 @@ async def concurrency_probe(db_path: Path, holder: dict[str, int], stop: asyncio
     while not stop.is_set():
         try:
             conn = sqlite3.connect(db_path, timeout=5)
-            live = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status NOT IN "
-                "('success','partial','degraded','failed','error')"
-            ).fetchone()[0]
+            live = conn.execute(f"SELECT COUNT(*) FROM jobs WHERE {NON_TERMINAL_WHERE}").fetchone()[0]
             conn.close()
         except sqlite3.OperationalError:
             # 读侧撞锁也要计数：它和"服务端 locked 行数"是两个来源，都要留
@@ -298,21 +319,55 @@ async def concurrency_probe(db_path: Path, holder: dict[str, int], stop: asyncio
         except Exception:  # noqa: BLE001
             live = 0
         holder["max_live_jobs"] = max(holder.get("max_live_jobs", 0), int(live))
+        holder["samples"] = holder.get("samples", 0) + 1
+        # 杀过之后同一条曲线要继续盯：`63 个在杀的那一刻还没跑完` 与 `最后一个是 0` 之间
+        # 得有过程，否则"排空了"只是"等到轮询都结束了才看一眼"。
+        if holder.get("killed_at_s"):
+            holder["max_live_after_kill"] = max(holder.get("max_live_after_kill", 0), int(live))
+            holder["last_live_after_kill"] = int(live)
+        try:  # 谁在跑：distinct worker 数 > 1 就是"多进程消费"的证据，比数线程诚实
+            probe = sqlite3.connect(db_path, timeout=5)
+            seen = {row[0] for row in probe.execute("SELECT DISTINCT worker FROM jobs WHERE worker IS NOT NULL")}
+            running = probe.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0]
+            probe.close()
+            # **累加**而不是覆盖：`worker` 在 job 跑完时被清空，最后一次采样恰好在全线结束后
+            # 跑到，快照就成了空集——第一次的读数就是这么把"两进程消费"报成"0 岔"的。
+            names = holder.setdefault("claimer_names", set())
+            names.update(seen)
+            holder["claimers"] = sorted(names)
+            holder["max_running_rows"] = max(holder.get("max_running_rows", 0), int(running))
+        except Exception as error:  # noqa: BLE001 - 采样失败不许静默：静默的读数会被当成"没有多进程"
+            holder["claimer_probe_errors"] = holder.get("claimer_probe_errors", 0) + 1
+            holder["claimer_probe_first_error"] = f"{type(error).__name__}: {error}"[:120]
         await asyncio.sleep(0.2)
+
+
+def wait_for_drain(db_path: Path, wait_s: float) -> dict[str, Any]:
+    """杀进程之后不重启任何人，看队列能不能自己排空。
+
+    判据是"期间没有任何人帮它重启"：只有在这种条件下 drained 才叫崩溃恢复，
+    而不是"我们把服务又拉起来了"。
+    """
+    started = time.monotonic()
+    while time.monotonic() - started < wait_s:
+        if non_terminal(db_path) == 0:
+            return {"drained_without_help": True, "seconds": round(time.monotonic() - started, 1)}
+        time.sleep(1.0)
+    return {"drained_without_help": False, "seconds": round(time.monotonic() - started, 1),
+            "still_non_terminal": non_terminal(db_path)}
 
 
 def non_terminal(db_path: Path) -> int:
     conn = sqlite3.connect(db_path, timeout=10)
     try:
         return int(conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status NOT IN "
-            "('success','partial','degraded','failed','error')"
+            f"SELECT COUNT(*) FROM jobs WHERE {NON_TERMINAL_WHERE}"
         ).fetchone()[0])
     finally:
         conn.close()
 
 
-async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None):
+async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None, victim=None):
     metrics: dict[str, list[float]] = {"login": [], "upload": [], "submit": [], "e2e": []}
     counters = {
         "login_failed": 0, "upload_failed": 0, "submit_failed": 0, "jobs_failed": 0,
@@ -342,13 +397,21 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
                 await one_user(client, base, name, rounds, metrics, counters, jobs_out, sse_case)
 
         async def killer_task() -> None:
-            """中途杀进程：测的是持久性，不是速度——快的系统也可以永远丢结果。"""
+            """中途杀进程：测的是持久性，不是速度——快的系统也可以永远丢结果。
+
+            `victim` 可以是某个 worker 进程：那样测的就是"Web 还活着、执行的人死了"，
+            这正是 P0 那条读数（28 个 job 永远停在非终态）的形态。
+            计数必须在**杀之前一刻**取：等到整轮 gather 结束再取，那时用户都走完了，
+            非终态必然是 0——"恢复了"就变成一句平凡真，而不是证据。
+            """
             if kill_after_s is None:
                 return
             await asyncio.sleep(kill_after_s)
             holder["killed_at_s"] = 1
-            if server is not None and server.poll() is None:
-                server.kill()
+            holder["non_terminal_at_kill"] = non_terminal(Path(os.environ["LOAD_DB"]))
+            target = victim if victim is not None else server
+            if target is not None and target.poll() is None:
+                target.kill()
 
         await asyncio.gather(
             *(guarded(name) for name in users),
@@ -371,6 +434,16 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
         "submit_ms": shape("submit", [v * 1000 for v in metrics["submit"]]),
         "e2e_s": shape("e2e", metrics["e2e"]),
         "max_live_jobs": holder.get("max_live_jobs", 0),
+        "non_terminal_at_kill": holder.get("non_terminal_at_kill"),
+        "max_live_after_kill": holder.get("max_live_after_kill", 0),
+        "last_live_after_kill": holder.get("last_live_after_kill"),
+        "claimers": holder.get("claimers", []),
+        "claimer_probe": {
+            "samples": holder.get("samples", 0),
+            "errors": holder.get("claimer_probe_errors", 0),
+            "first_error": holder.get("claimer_probe_first_error", ""),
+            "max_running_rows": holder.get("max_running_rows", 0),
+        },
         "probe_locked_reads": holder.get("locked_reads", 0),
         "sse": stream,
         "counters": counters,
@@ -385,39 +458,39 @@ def harvest_locks(log_path: Path) -> int:
     return text.count("database is locked")
 
 
-def kill_and_check(base: str, process: subprocess.Popen, db_path: Path, jobs: list[dict[str, Any]]) -> dict[str, Any]:
-    """持久性测法：进程在作业中途被杀，重启后那些 job 是什么下场。
+def recovery_reading(
+    victim_label: str,
+    db_path: Path,
+    *,
+    wait_s: float,
+    may_restart_server: bool,
+    at_kill: int | None = None,
+) -> dict[str, Any]:
+    """崩溃恢复的读数：**先不帮它**，看队列能不能自己排空。
 
-    这一条与速度无关——快的系统也可以永远丢结果。
+    杀掉 worker 时不许重启任何人——那才是"执行的人死了而平台还在受理"的真实形态；
+    杀掉 Web 进程时允许再拉一次服务，那时读的是"重启后有没有人接手"。
+    两种情形分开报，不许合成一句"恢复了"。
+
+    `at_kill` 必须是**杀那一刻**的计数（由 killer_task 传进来）；在这里现取只会得到 0，
+    因为用户轮询都跑完了才走到这个函数——那条平凡真的读数我第一次就差点这么存档。
     """
-    pending_before = 0
-    try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        pending_before = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status NOT IN "
-            "('success','partial','degraded','failed','error')"
-        ).fetchone()[0]
-        conn.close()
-    except Exception:  # noqa: BLE001
-        pass
-    process.kill()
-    time.sleep(1.5)
-    restarted, restart_log = spawn_server(int(os.environ["LOAD_PORT"]), Path(os.environ["APP_DATA_DIR"]), restart_log_path(db_path))
-    wait_ready(base, restarted, timeout_s=40)
-    try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        still = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status NOT IN "
-            "('success','partial','degraded','failed','error')"
-        ).fetchone()[0]
-        conn.close()
-    finally:
-        restarted.kill()
-    return {
-        "pending_when_killed": pending_before,
-        "still_pending_after_restart": still,
-        "durable": pending_before > 0 and still == 0,
+    reading: dict[str, Any] = {
+        "killed": victim_label,
+        "lease_seconds": int(os.getenv("JOB_LEASE_SECONDS", "90")),
+        "max_attempts": int(os.getenv("JOB_MAX_ATTEMPTS", "3")),
+        "non_terminal_when_killed": at_kill if at_kill is not None else non_terminal(db_path),
     }
+    reading["counted_at"] = "kill moment" if at_kill is not None else "end of run（读数无意义）"
+    reading.update(wait_for_drain(db_path, wait_s))
+    if not reading.get("drained_without_help") and may_restart_server:
+        port = int(os.environ["LOAD_PORT"])
+        restarted, restart_log = spawn_server(port, Path(os.environ["APP_DATA_DIR"]), restart_log_path(db_path))
+        wait_ready(f"http://127.0.0.1:{port}", restarted, timeout_s=40)
+        reading["after_server_restart"] = wait_for_drain(db_path, wait_s)
+        restarted.kill()
+        restart_log.close()
+    return reading
 
 
 def restart_log_path(db_path: Path) -> Path:
@@ -429,7 +502,12 @@ def main() -> int:
     parser.add_argument("--users", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=0, help="同时发起的用户数，默认=users")
-    parser.add_argument("--kill-after", type=float, default=None, help="跑到第 N 秒时杀掉服务进程")
+    parser.add_argument("--kill-after", type=float, default=None, help="跑到第 N 秒时杀掉一个进程")
+    parser.add_argument("--kill-target", choices=("server", "worker"), default="server",
+                        help="杀掉谁：server=受理层，worker=执行层（P2 的崩溃恢复测的是后者）")
+    parser.add_argument("--extra-workers", type=int, default=0, help="另起几个独立 worker 进程（scripts/worker.py）")
+    parser.add_argument("--lease-seconds", type=int, default=30, help="租约时长；测试里压短，否则要等满 90s")
+    parser.add_argument("--recover-wait", type=float, default=120.0, help="杀完之后最多等多久看队列自己排空")
     parser.add_argument("--report", default=str(ROOT / ".appdata" / f"load_{int(time.time())}.json"))
     args = parser.parse_args()
     # Windows 上 stdout 被重定向时按本地码页编码，打印 `⇒`/`✘` 这类字符会在跑完之后炸栈
@@ -446,6 +524,9 @@ def main() -> int:
     os.environ["OUTPUTS_ROOT"] = str(data_dir / "outputs")
     os.environ["LOAD_DB"] = str(db_path)
     os.environ["LOAD_PORT"] = str(port)
+    # 租约与认领上限走环境变量：子进程（uvicorn 与 scripts/worker.py）读的就是同一份口径，
+    # 这里压到 30s 是为了让"崩溃→收回→重认领"在一次压测里可读，而不是等满默认 90s。
+    os.environ["JOB_LEASE_SECONDS"] = str(args.lease_seconds)
     log_path = data_dir / "server.log"
 
     print(f"负载尺子 ｜ 用户 {args.users} ｜ 每人 {args.rounds} 次 ｜ 端口 {port} ｜ 数据目录 {data_dir}")
@@ -456,34 +537,65 @@ def main() -> int:
     init_db()
     names, hash_ms = seed_users(db_path, args.users)
     process, log = spawn_server(port, data_dir, log_path)
+    workers: list[tuple[subprocess.Popen, object]] = []
     base = f"http://127.0.0.1:{port}"
     try:
         wait_ready(base, process)
+        for index in range(args.extra_workers):
+            workers.append(spawn_worker(data_dir, data_dir / f"worker_{index}.log"))
+        if args.kill_after and args.kill_target == "worker" and not workers:
+            raise SystemExit("--kill-target worker 要配 --extra-workers >= 1")
+        if workers:
+            time.sleep(1.0)  # 等 worker 把起跑日志打出来，别让启动竞态混进"谁认领的"
+        victim = process
+        if args.kill_after and args.kill_target == "worker":
+            victim = workers[0][0]
         result = asyncio.run(
-            drive(names, base, args.rounds, args.concurrency or args.users, process, args.kill_after)
+            drive(names, base, args.rounds, args.concurrency or args.users, process, args.kill_after, victim)
         )
+        result["processes"] = {
+            "server": process.pid,
+            "workers": [item[0].pid for item in workers],
+            "worker_concurrency_per_process": int(os.getenv("WORKER_CONCURRENCY", "2")),
+        }
+        result["claimers_seen"] = result.get("claimers", [])
         if args.kill_after:
-            # 进程已经不在了：这些非终态的 job 永远不会有人去写完它——
-            # 作业状态活在内存线程池里，落库的只有 pending。这就是持久性的读数。
-            result["durability"] = {
-                "killed_after_s": args.kill_after,
-                "jobs_left_non_terminal": non_terminal(db_path),
-                "server_alive": process.poll() is None,
+            # 先不帮它：只有"期间没人重启"这条成立，排空才叫崩溃恢复。
+            result["durability"] = recovery_reading(
+                args.kill_target,
+                db_path,
+                wait_s=args.recover_wait,
+                may_restart_server=args.kill_target == "server",
+                at_kill=result.get("non_terminal_at_kill"),
+            )
+            result["durability"]["killed_after_s"] = args.kill_after
+            result["durability"]["reclaim_curve"] = {
+                "at_kill": result.get("non_terminal_at_kill"),
+                "max_after_kill": result.get("max_live_after_kill"),
+                "last_sample_after_kill": result.get("last_live_after_kill"),
+                "claimer_processes_seen": result.get("claimers_seen", []),
+                "jobs_failed": result["counters"].get("jobs_failed"),
             }
         result["password_hash_ms"] = hash_ms
         log.flush()
         result["server_locked_lines"] = harvest_locks(log_path)
-        if False:
-            log.close()
-            result["durability"] = kill_and_check(base, process, db_path, result["jobs"])
-            process = None
+        for index, item in enumerate(workers):
+            item[1].flush()
+            result[f"worker_{index}_locked_lines"] = harvest_locks(data_dir / f"worker_{index}.log")
     finally:
+        for item in workers:
+            item[0].kill()
         if process and process.poll() is None:
             process.kill()
         try:
             log.close()
         except Exception:  # noqa: BLE001
             pass
+        for item in workers:
+            try:
+                item[1].close()
+            except Exception:  # noqa: BLE001
+                pass
 
     report = Path(args.report)
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -493,6 +605,8 @@ def main() -> int:
         print(f"  {key:<12} p50={result[key]['p50']:>9} p95={result[key]['p95']:>9} "
               f"p99={result[key]['p99']:>9} max={result[key]['max']:>9} n={result[key]['n']}")
     print(f"  同时在跑 job 峰值 = {result['max_live_jobs']}")
+    print(f"  看到过的认领者 = {len(result.get('claimers_seen', []))} 岔："
+          f"{'（多进程消费）' if len(result.get('claimers_seen', [])) > 1 else '（只有受理进程）'}")
     print(f"  服务端 'database is locked' 行数 = {result['server_locked_lines']}")
     print(f"  口令哈希一次 = {result['password_hash_ms']}ms")
     print(f"  事件流：{json.dumps(result['sse'], ensure_ascii=False)}")

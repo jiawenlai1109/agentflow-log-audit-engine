@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from app.config import ALLOWED_EXTENSIONS, DATASETS_DIR, MAX_UPLOAD_MB
+from app import config
 from app.db import execute, query
 from app.deps import get_current_user
 from app.schemas import DatasetOut
@@ -22,14 +22,16 @@ def upload_dataset(
     file: UploadFile = File(...), user: dict = Depends(get_current_user)
 ) -> dict:
     suffix = Path(file.filename or "data.csv").suffix.lower()
-    if suffix not in ALLOWED_EXTENSIONS:
+    if suffix not in config.ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="仅支持 CSV 文件")
-    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    path = DATASETS_DIR / f"{uuid.uuid4().hex[:8]}_{Path(file.filename).name}"
+    datasets_dir = config.datasets_dir()
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+    path = datasets_dir / f"{uuid.uuid4().hex[:8]}_{Path(file.filename).name}"
     path.write_bytes(file.file.read())
-    if path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
+    if path.stat().st_size > limit:
         path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"文件超过 {MAX_UPLOAD_MB}MB 限制")
+        raise HTTPException(status_code=400, detail=f"文件超过 {config.MAX_UPLOAD_MB}MB 限制")
     try:
         profile = profile_table(path)
     except Exception as exc:  # noqa: BLE001

@@ -22,12 +22,33 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(value).expanduser().resolve() if value else default
 
 
-OUTPUTS_ROOT = _env_path("OUTPUTS_ROOT", PROJECT_ROOT / "outputs")
-APP_DATA_DIR = _env_path("APP_DATA_DIR", PROJECT_ROOT / ".appdata")
-DB_PATH = APP_DATA_DIR / "app.db"
-DATASETS_DIR = APP_DATA_DIR / "datasets"
-BUNDLES_DIR = APP_DATA_DIR / "bundles"
-SESSIONS_ROOT = OUTPUTS_ROOT / "sessions"
+# 路径**只在调用时读**，不在 import 时算成模块常量。理由不是风格：
+# 一个 job 现在可能被另一个进程认领（scripts/worker.py），那个进程只能靠环境变量知道
+# 数据在哪；而 import 时定值的常量会被每个模块各复制一份，于是"改一处、另外几处还在读
+# 老路径"。测试就是这么把 run 产物写进仓库真 outputs/ 的（见 工作日志 2026-10-07）。
+def outputs_root() -> Path:
+    return _env_path("OUTPUTS_ROOT", PROJECT_ROOT / "outputs")
+
+
+def app_data_dir() -> Path:
+    return _env_path("APP_DATA_DIR", PROJECT_ROOT / ".appdata")
+
+
+def db_path() -> Path:
+    return _env_path("DB_PATH", app_data_dir() / "app.db")
+
+
+def datasets_dir() -> Path:
+    return _env_path("DATASETS_DIR", app_data_dir() / "datasets")
+
+
+def bundles_dir() -> Path:
+    return _env_path("BUNDLES_DIR", app_data_dir() / "bundles")
+
+
+def sessions_root() -> Path:
+    return _env_path("SESSIONS_ROOT", outputs_root() / "sessions")
+
 
 MAX_UPLOAD_MB = 50
 ALLOWED_EXTENSIONS = {".csv"}

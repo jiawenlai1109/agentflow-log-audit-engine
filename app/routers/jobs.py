@@ -12,9 +12,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app.config import OUTPUTS_ROOT
-from app import eventlog
-from app.db import execute, query_one
+from app import config, eventlog, queueing
+from app.runner import Dispatcher
+from app.db import query_one
 from app.deps import get_current_user
 from app.jobs import JobManager
 from app.routers.bundles import load_bundle_for_analysis
@@ -26,16 +26,19 @@ from agentflow.core.pack import (
     missing_required,
     pack_names,
 )
-from agentflow.pipeline import as_bundle, run_analysis
+from agentflow.pipeline import as_bundle
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 manager = JobManager(sink=eventlog.append_event)
-# worker 数以前写死 2：P0 实测 100 个 job 进来峰值有 93 个非终态（约 91 个在排队）。
-# 分析的时间绝大多数花在等 LLM 上游，2 个线程是自己掐自己的吞吐。现在默认 8、
-# 由 `WORKER_CONCURRENCY` 说话；真正的上游并发（8 × 每 run 内 3 路 = 24 路）由 P4 的
-# 全局闸门管——这里不把"线程多"伪装成"上游扛得住"。
+# 建对象与启动分开：import 时起线程会让测试与 `--help` 都偷偷开跑线程。
+# 启动点在 app/main.py 的 lifespan——进程活着才当认领者，退出时收。
+dispatcher = Dispatcher(manager)
+# worker 数的判据住在 `queueing.default_worker_concurrency()`：默认仍是 2，因为 P0 实测
+# 在**同一个进程里**把它调到 8 会把登录 p95 从 8977.9ms 推到 14378.3ms——受理层和执行层
+# 抢同一份 CPU。分成独立进程（scripts/worker.py）之后这个数才是"每个 worker 各自的数"，
+# 那时往上加才不伤登录。真正的上游并发由 P4 的全局闸门管，这里不把"线程多"伪装成"上游扛得住"。
 
-PHASE_PROGRESS = {"explore": 10, "plan": 20, "execute": 60, "report": 85, "review": 95}
+# 阶段→进度的映射住在 app/runner.py（执行那侧），路由不再自己算一份
 _JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question, pack"
 
 
@@ -50,7 +53,7 @@ def _owned_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     )
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    job["queue"] = manager.depth()
+    job["queue"] = queueing.stats()
     return job
 
 
@@ -124,7 +127,7 @@ def preflight_pack_data(pack_obj: Any, sources: Any) -> None:
     if not hasattr(sources, "tables"):
         # 单文件也归一化成 Bundle 再比列：与运行时要走的 `as_bundle` 同一条路径、同一个指纹，
         # 所以这里建的缓存就是待会儿那次运行要用的那份，不多写一份数据
-        sources = as_bundle(sources, OUTPUTS_ROOT)
+        sources = as_bundle(sources, config.outputs_root())
     missing = missing_required(pack_obj, available_columns(pack_obj, sources))
     if missing:
         raise HTTPException(
@@ -145,6 +148,9 @@ def submit_analysis(
     pack: str | None = None,
     mcp_approvals: dict[str, bool] | None = None,
     run_origin: dict[str, Any] | None = None,
+    # 数据源的**引用**（bundle:<id> / dataset:<id）。绝对路径不进 jobs 表：
+    # 那既是可外泄的位置信息（#15），也会在换机/换进程时变成一句跑不通的谎。
+    source_ref: str = "",
 ) -> str:
     """sources 可以是文件路径，也可以是 Bundle——pipeline 里 `as_bundle` 会归一化。
 
@@ -152,67 +158,33 @@ def submit_analysis(
     只记问题文本的话，历史页上"登录审计"和"多源分诊"长得一模一样，出了分歧无从回溯。
     """
     job_id = f"job_{uuid.uuid4().hex[:12]}"
-    execute(
-        "INSERT INTO jobs (job_id, user_id, question, mode, session_id, pack, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-        (job_id, user_id, question, mode, session_id, pack),
+
+    # 提交 = 入队，而且是一行写完就已是可认领状态（参数以**引用**形式进 spec：
+    # bundle:<id> / dataset:<id>，绝对路径不进 jobs 表——那既可外泄位置（#15），
+    # 也会在换机/换进程时变成一句跑不通的谎）。
+    # 执行体不再是闭包：只有这样才能被另一个进程认领（P0 读数：杀进程后 28 个 job
+    # 永远停在非终态，因为"要跑什么"只活在提交它的那个进程的内存里）。
+    spec = {
+        "question": question,
+        "mode": mode,
+        "session_id": session_id,
+        "pack": pack,
+        "mcp_approvals": mcp_approvals or {},
+        "run_origin": run_origin or {},
+        "source_ref": source_ref,
+    }
+    queueing.accept(
+        job_id=job_id,
+        user_id=user_id,
+        question=question,
+        mode=mode,
+        session_id=session_id,
+        pack=pack,
+        spec=spec,
     )
-
-    def worker() -> None:
-        def on_event(event: dict[str, Any]) -> None:
-            manager.publish(job_id, event)
-            if event.get("type") == "phase":
-                progress = PHASE_PROGRESS.get(event.get("phase"), 50)
-                execute(
-                    "UPDATE jobs SET status='running', progress=? WHERE job_id=? AND user_id=?",
-                    (progress, job_id, user_id),
-                )
-            if event.get("type") == "done":
-                execute(
-                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 "
-                    "WHERE job_id=? AND user_id=?",
-                    (
-                        event.get("status"),
-                        event.get("run_id"),
-                        datetime.now().isoformat(),
-                        job_id,
-                        user_id,
-                    ),
-                )
-
-        try:
-            result = run_analysis(
-                question=question,
-                sources=sources,
-                mode=mode,
-                outputs_root=OUTPUTS_ROOT,
-                session_id=session_id,
-                on_event=on_event,
-                pack=pack,
-                mcp_approvals=mcp_approvals,
-                run_origin=run_origin,
-            )
-            if result.get("status") != "success":
-                execute(
-                    "UPDATE jobs SET status=?, run_id=?, finished_at=?, progress=100 "
-                    "WHERE job_id=? AND user_id=?",
-                    (
-                        result.get("status"),
-                        result.get("run_id"),
-                        datetime.now().isoformat(),
-                        job_id,
-                        user_id,
-                    ),
-                )
-        except Exception as exc:  # noqa: BLE001
-            execute(
-                "UPDATE jobs SET status='failed', error=?, finished_at=? "
-                "WHERE job_id=? AND user_id=?",
-                (str(exc)[:500], datetime.now().isoformat(), job_id, user_id),
-            )
-            manager.publish(job_id, {"type": "error", "error": str(exc)[:500]})
-
-    manager.submit(job_id, worker)
+    # Web 进程自己也是认领者（默认形态）。独立 worker 进程起来后这只是多一个消费者，
+    # 不是第二条执行路径——认领是原子的，一个 job 只会被一个认领者拿到。
+    dispatcher.start()
     return job_id
 
 
@@ -223,10 +195,10 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
     pack_obj = validate_pack(payload)
     approvals = validate_approvals(payload)
     dataset_columns: list[str] | None = None
-    dataset_columns: list[str] | None = None
     if payload.bundle_id:
         # 归属、状态、目录包含、快照可读——四步都在 bundles 模块里做一次（同一个 BUNDLES_DIR）
         sources = load_bundle_for_analysis(payload.bundle_id, user)
+        source_ref = f"bundle:{payload.bundle_id}"
     else:
         dataset = query_one(
             "SELECT * FROM datasets WHERE id = ? AND user_id = ?",
@@ -235,6 +207,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
         if not dataset:
             raise HTTPException(status_code=404, detail="数据集不存在")
         sources = dataset["path"]
+        source_ref = f"dataset:{payload.dataset_id}"
     preflight_pack_data(pack_obj, sources)
     if payload.session_id and not query_one(
         "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
@@ -258,6 +231,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
             "pack": payload.pack,
             "approvals_requested": dict(payload.mcp_approvals),
         },
+        source_ref=source_ref,
     )
     return _owned_job(job_id, user)
 
@@ -267,7 +241,7 @@ def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
     return _owned_job(job_id, user)
 
 
-TERMINAL_STATUSES = {"success", "partial", "degraded", "failed", "error", "cancelled"}
+TERMINAL_STATUSES = set(queueing.TERMINAL)  # 名单只有一份（queueing.TERMINAL），这里不另立
 # 终态判定要的是库里的状态，不是"我这个进程知不知道"——worker 拆出去之后，写状态的人
 # 与推流的人不是同一个进程。
 
@@ -290,8 +264,9 @@ async def job_events(job_id: str, request: Request, user: dict = Depends(get_cur
     start = _last_event_id(request)
 
     async def event_stream():
-        # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者
-        yield _sse({"type": "queue", **manager.depth()})
+        # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者。
+        # 数从库里读（queueing.stats）而不是读本进程簿记——job 可能被另一个进程的 worker 认领。
+        yield _sse({"type": "queue", **queueing.stats()})
         cursor = start
         while True:
             rows = eventlog.read_after(job_id, cursor)

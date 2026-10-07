@@ -21,12 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
-from app.config import (
-    BUNDLES_DIR,
-    MAX_BUNDLE_FILES,
-    MAX_UPLOAD_MB,
-    BUNDLE_ALLOWED_EXTENSIONS,
-)
+from app import config
 from app.db import execute, query, query_one
 from app.deps import get_current_user
 from app.upload_guard import scan_formula_cells, sniff_rejection, zip_bomb_rejection
@@ -74,14 +69,14 @@ def create_bundle(
     specs = _chunk_specs(uploads)
     if not files and not specs:
         raise HTTPException(status_code=400, detail="没有收到任何文件")
-    if len(files) + len(specs) > MAX_BUNDLE_FILES:
-        raise HTTPException(status_code=400, detail=f"一次最多上传 {MAX_BUNDLE_FILES} 个文件")
+    if len(files) + len(specs) > config.MAX_BUNDLE_FILES:
+        raise HTTPException(status_code=400, detail=f"一次最多上传 {config.MAX_BUNDLE_FILES} 个文件")
 
     bundle_id = f"bu_{uuid.uuid4().hex[:12]}"
     display_name = name or bundle_id
-    staging = BUNDLES_DIR / bundle_id / "uploads"
+    staging = config.bundles_dir() / bundle_id / "uploads"
     staging.mkdir(parents=True, exist_ok=True)
-    root = BUNDLES_DIR / bundle_id / "bundle"
+    root = config.bundles_dir() / bundle_id / "bundle"
 
     # 分片先重组：这一步只会产生 4xx（缺片/越权/改名），要在落 bundles 行之前做完，
     # 否则一次失败的重构会留下永远停在 parsing 的孤行
@@ -96,7 +91,7 @@ def create_bundle(
     records: list[dict[str, Any]] = []
     for index, upload in enumerate(files):
         target = staging / f"{index:03d}_{_safe_name(upload.filename)}"
-        written, oversize = _write_limited(upload, target, MAX_UPLOAD_MB * 1024 * 1024)
+        written, oversize = _write_limited(upload, target, config.MAX_UPLOAD_MB * 1024 * 1024)
         record = _guard_file(upload.filename or target.name, target, written, oversize)
         records.append(record)
         if record["kind"] == "pending":
@@ -134,12 +129,12 @@ def _guard_file(
         "risk": {},
     }
     if oversize:
-        record["reason"] = f"超过 {MAX_UPLOAD_MB}MB 上界（已丢弃，不在盘上留半份文件）"
+        record["reason"] = f"超过 {config.MAX_UPLOAD_MB}MB 上界（已丢弃，不在盘上留半份文件）"
         return record
     if written == 0:
         record["reason"] = "空文件（0 字节）"
         return record
-    if suffix not in BUNDLE_ALLOWED_EXTENSIONS:
+    if suffix not in config.BUNDLE_ALLOWED_EXTENSIONS:
         record["reason"] = f"不支持的文件类型 {suffix or '(无扩展名)'}"
         stored.unlink(missing_ok=True)
         record["stored_path"] = ""
@@ -230,7 +225,7 @@ def upload_chunk(
         raise HTTPException(status_code=400, detail="upload_id 只允许字母数字与 -_，长度 8~64")
     if index >= total:
         raise HTTPException(status_code=400, detail=f"分片序号 {index} 超出总分片数 {total}")
-    directory = BUNDLES_DIR / CHUNKS_DIR_NAME / upload_id
+    directory = config.bundles_dir() / CHUNKS_DIR_NAME / upload_id
     manifest_path = directory / "manifest.json"
     manifest = _read_manifest(manifest_path)
     if manifest is not None:
@@ -252,9 +247,9 @@ def upload_chunk(
             "parts": {},
         }
     part = directory / f"{index:04d}.part"
-    written, oversize = _write_limited(file, part, MAX_UPLOAD_MB * 1024 * 1024)
+    written, oversize = _write_limited(file, part, config.MAX_UPLOAD_MB * 1024 * 1024)
     if oversize:
-        raise HTTPException(status_code=413, detail=f"单片超过 {MAX_UPLOAD_MB}MB 上界")
+        raise HTTPException(status_code=413, detail=f"单片超过 {config.MAX_UPLOAD_MB}MB 上界")
     manifest["parts"][str(index)] = written
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return {
@@ -300,7 +295,7 @@ def _chunk_specs(uploads: str | None) -> list[dict[str, Any]]:
 def _assemble(staging: Path, spec: dict[str, Any], user_id: int) -> tuple[Path, int, bool]:
     """把分片按序拼成带原扩展名的文件；缺片直接拒，不"用已有的部分"凑一个假完整文件。"""
     upload_id = spec["upload_id"]
-    directory = BUNDLES_DIR / CHUNKS_DIR_NAME / upload_id
+    directory = config.bundles_dir() / CHUNKS_DIR_NAME / upload_id
     manifest = _read_manifest(directory / "manifest.json")
     if manifest is None:
         raise HTTPException(status_code=404, detail=f"upload_id {upload_id} 没有登记过分片")
@@ -318,7 +313,7 @@ def _assemble(staging: Path, spec: dict[str, Any], user_id: int) -> tuple[Path, 
             status_code=400, detail=f"分片不完整，缺少序号 {missing}（共 {manifest['total']} 片）"
         )
     target = staging / f"asm_{_safe_name(manifest['filename'])}"
-    limit = MAX_UPLOAD_MB * 1024 * 1024
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
     total_bytes = 0
     with target.open("wb") as handle:
         for index in range(int(manifest["total"])):
@@ -492,7 +487,7 @@ def list_bundles(user: dict = Depends(get_current_user)) -> list[dict]:
 def load_bundle_for_analysis(bundle_id: str, user: dict[str, Any]) -> Bundle:
     """给 jobs 路由用：归属校验 + 状态校验 + 目录包含校验 + 载入快照，四步一处完成。
 
-    放在本模块而不是 jobs.py，是因为它必须与本文件的写入用**同一个** `BUNDLES_DIR`——
+    放在本模块而不是 jobs.py，是因为它必须与本文件的写入用**同一个** `config.bundles_dir()`——
     两处各自 import 的话，改一处配置就会让"自己写的快照"被判成越界文件。
     """
     row = _owned_bundle_row(bundle_id, user)
@@ -501,7 +496,7 @@ def load_bundle_for_analysis(bundle_id: str, user: dict[str, Any]) -> Bundle:
             status_code=409, detail=f"Bundle 不可分析：{row['error'] or row['status']}"
         )
     root = Path(row["root"]).resolve()
-    if not _within(BUNDLES_DIR, root) or not (root / "manifest.json").exists():
+    if not _within(config.bundles_dir(), root) or not (root / "manifest.json").exists():
         raise HTTPException(status_code=410, detail="Bundle 文件已不在服务目录内，请重新上传")
     try:
         return Bundle.load(root)
@@ -549,8 +544,8 @@ def preview_table(
 @router.delete("/{bundle_id}")
 def delete_bundle(bundle_id: str, user: dict = Depends(get_current_user)) -> dict:
     row = _owned_bundle_row(bundle_id, user)
-    directory = BUNDLES_DIR / bundle_id
-    if directory.exists() and _within(BUNDLES_DIR, directory):
+    directory = config.bundles_dir() / bundle_id
+    if directory.exists() and _within(config.bundles_dir(), directory):
         shutil.rmtree(directory, ignore_errors=True)
     for table in ("bundle_tables", "bundle_files", "bundles"):
         execute(f"DELETE FROM {table} WHERE bundle_id = ? AND user_id = ?", (bundle_id, user["id"]))

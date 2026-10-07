@@ -26,7 +26,7 @@ from pathlib import Path
 from sqlalchemy import event, pool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
-from app.config import DB_PATH
+from app import config
 
 _ENGINES: dict[str, AsyncEngine] = {}
 _FACTORIES: dict[str, async_sessionmaker[AsyncSession]] = {}
@@ -37,8 +37,9 @@ def database_url() -> str:
     raw = (os.getenv("DATABASE_URL") or "").strip()
     if raw:
         return raw
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite+aiosqlite:///{DB_PATH.as_posix()}"
+    path = config.db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+aiosqlite:///{path.as_posix()}"
 
 
 def is_sqlite() -> bool:

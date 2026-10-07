@@ -27,7 +27,9 @@ def _wait_job(client: TestClient, job_id: str, timeout: float = 60.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in ("pending", "running"):
+        # 队列化之后中间态是 queued/running：等待者要把它们都当"还没结束"，
+        # 否则一到 queued 就以为终态到了（这条就是那次踩坑的样子）
+        if job["status"] not in ("pending", "queued", "running"):
             return job
         time.sleep(0.5)
     raise TimeoutError(f"job {job_id} 超时未完成")

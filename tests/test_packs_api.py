@@ -44,10 +44,13 @@ def _make_user(username: str, password: str) -> int:
 
 @pytest.fixture()
 def workspace(tmp_path, monkeypatch):
-    """产物与包目录都指到 tmp：本地 outputs/ 与 .appdata/ 会跨运行残留。"""
-    monkeypatch.setattr("app.routers.bundles.BUNDLES_DIR", tmp_path / "bundles")
-    monkeypatch.setattr("app.routers.jobs.OUTPUTS_ROOT", tmp_path / "outputs")
-    monkeypatch.setattr("app.routers.reports.OUTPUTS_ROOT", tmp_path / "outputs")
+    """产物与包目录都指到 tmp：本地 outputs/ 与 .appdata/ 会跨运行残留。
+
+    指路径只走环境变量（`app/config.py` 唯一的权威）：受理层、执行层与报告接口读到
+    的必须是同一个目录，否则"跑完了但报告读不到"这种红就是自己造的。
+    """
+    monkeypatch.setenv("BUNDLES_DIR", str(tmp_path / "appdata" / "bundles"))
+    monkeypatch.setenv("OUTPUTS_ROOT", str(tmp_path / "outputs"))
     return tmp_path
 
 
@@ -104,7 +107,7 @@ def _wait_job(client: TestClient, job_id: str, timeout: float = 90.0) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
         job = client.get(f"/api/jobs/{job_id}").json()
-        if job["status"] not in ("pending", "running"):
+        if job["status"] not in ("pending", "queued", "running"):
             return job
         time.sleep(0.4)
     raise AssertionError(f"任务 {job_id} 超时未结束")
@@ -136,13 +139,16 @@ def test_broken_pack_directory_is_reported_not_hidden(workspace, owner, tmp_path
     """坏包从列表里蒸发 = 用户只看到"没这个场景"，而真因在磁盘上少了一行 yaml。"""
     from agentflow.core import pack as pack_module
 
-    broken_dir = tmp_path / "broken_pack"
-    broken_dir.mkdir()
+    # packs 根用单独一个目录，不用 tmp_path 本身：那个目录里现在住着 outputs/ 与 appdata/
+    # （lifespan 按环境变量建它们），拿它当根就等于把"运行产物目录"报成坏包。
+    root = tmp_path / "packs_root"
+    broken_dir = root / "broken_pack"
+    broken_dir.mkdir(parents=True)
     (broken_dir / "rules.yaml").write_text(
         "pack:\n  name: broken_pack\nrules:\n  - id: X1\n", encoding="utf-8"
     )
     real = pack_module.PACKS_DIR
-    monkeypatch.setattr(pack_module, "PACKS_DIR", tmp_path)
+    monkeypatch.setattr(pack_module, "PACKS_DIR", root)
     try:
         with TestClient(app) as client:
             _login(client, "p_owner", "p-owner-pw-1")
@@ -252,7 +258,7 @@ def test_old_database_gets_the_pack_column(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
-    monkeypatch.setattr(db_module, "DB_PATH", legacy)
+    monkeypatch.setenv("DB_PATH", str(legacy))
     db_module.init_db()
 
     conn = sqlite3.connect(legacy)
@@ -466,7 +472,7 @@ def test_grantable_list_can_open_the_approval_and_the_actor_is_traced(
 
     config = _config_with_grantable(workspace, ["mcp:soc_intel:write_note"])
     monkeypatch.setattr("app.routers.jobs.load_mcp_config", lambda: config)
-    monkeypatch.setattr("app.routers.jobs.run_analysis", stub_run_analysis)
+    monkeypatch.setattr("app.runner.run_analysis", stub_run_analysis)
     with TestClient(app) as client:
         _login(client, "p_owner", "p-owner-pw-1")
         dataset_id = _seed_dataset(client, LOGIN_CSV)

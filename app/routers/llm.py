@@ -23,7 +23,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
-from app.config import APP_DATA_DIR
+from app import config as app_config
 from app.deps import get_current_user
 from agentflow.core.config import load_config
 from agentflow.core.llm_preflight import (
@@ -41,7 +41,7 @@ router = APIRouter(prefix="/api/llm", tags=["llm"])
 def _cache_path(config: dict[str, Any]) -> Path:
     """缓存位置与命令行默认同一个：`llm.preflight_cache` 可覆盖，否则 `.appdata/`。"""
     configured = (config.get("llm", {}) or {}).get("preflight_cache")
-    return Path(configured) if configured else APP_DATA_DIR / "llm_preflight.json"
+    return Path(configured) if configured else app_config.app_data_dir() / "llm_preflight.json"
 
 
 def _effective(config: dict[str, Any]) -> tuple[str, str]:

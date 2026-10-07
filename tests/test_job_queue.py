@@ -102,17 +102,27 @@ def test_queue_depth_reaches_the_api_shape():
     from app.routers.jobs import _owned_job, manager
     from app.security import hash_password
 
+    execute("DELETE FROM users WHERE username = ?", ("queue-shape-user",))
     uid = execute(
         "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')",
         ("queue-shape-user", hash_password("pw")),
     )
-    execute(
-        "INSERT INTO jobs (job_id, user_id, question, mode, status) VALUES (?, ?, ?, ?, 'pending')",
-        ("job_queue_shape", uid, "测试队列可见性", "mock"),
+    execute("DELETE FROM jobs WHERE job_id = ?", ("job_queue_shape",))
+    from app import queueing
+
+    queueing.accept(
+        job_id="job_queue_shape",
+        user_id=uid,
+        question="测试队列可见性",
+        mode="mock",
+        session_id=None,
+        pack=None,
+        spec={"question": "测试队列可见性", "source_ref": ""},
     )
     row = _owned_job("job_queue_shape", {"id": uid})
-    assert row["queue"] == manager.depth(), row
-    assert {"workers", "running", "queued"} <= set(row["queue"]), row["queue"]
+    # 深度从库里读，不从本进程的簿记读：多进程部署下后者只看得见自己那几个
+    assert row["queue"] == queueing.stats(), row
+    assert {"workers", "running", "queued", "stale_pending"} == set(row["queue"]), row["queue"]
     # 别人的 job 一律 404：加了 queue 字段不能顺手把归属过滤放宽
     with pytest.raises(Exception) as raised:
         _owned_job("job_queue_shape", {"id": 999_999})

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.config import SESSIONS_ROOT
+from app import config
 from app.db import execute, query, query_one
 from app.deps import get_current_user
 from app.routers.jobs import submit_analysis
@@ -65,7 +65,7 @@ def list_sessions(user: dict = Depends(get_current_user)) -> list[dict]:
     )
     result = []
     for row in rows:
-        session = SessionContext(row["session_id"], SESSIONS_ROOT / row["session_id"])
+        session = SessionContext(row["session_id"], config.sessions_root() / row["session_id"])
         result.append(
             {
                 "session_id": row["session_id"],
@@ -81,7 +81,7 @@ def session_messages(
     session_id: str, user: dict = Depends(get_current_user)
 ) -> list[dict]:
     _owned_session(session_id, user)
-    session = SessionContext(session_id, SESSIONS_ROOT / session_id)
+    session = SessionContext(session_id, config.sessions_root() / session_id)
     return [
         {
             "turn": turn.get("turn"),
@@ -105,7 +105,16 @@ def post_message(
     dataset_path = session["dataset_path"]
     if not dataset_path or not Path(dataset_path).exists():
         raise HTTPException(status_code=400, detail="会话未绑定数据集或数据集已删除")
-    job_id = submit_analysis(question, dataset_path, payload.mode, session_id, user["id"])
+    # 会话这条线只有路径可用（sessions.dataset_path 本来就存的是路径）。存成 `path:` 引用
+    # 不算新开一个泄漏面——这一列今天已经在库里了；新写的分析入口一律用 bundle:/dataset: id。
+    job_id = submit_analysis(
+        question,
+        dataset_path,
+        payload.mode,
+        session_id,
+        user["id"],
+        source_ref=f"path:{dataset_path}",
+    )
     execute(
         "UPDATE sessions SET updated_at = datetime('now','localtime') "
         "WHERE session_id = ? AND user_id = ?",
@@ -122,7 +131,7 @@ def post_message(
 def delete_session(session_id: str, user: dict = Depends(get_current_user)) -> dict:
     _owned_session(session_id, user)
     execute("DELETE FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user["id"]))
-    session_dir = SESSIONS_ROOT / session_id
+    session_dir = config.sessions_root() / session_id
     if session_dir.exists():
         shutil.rmtree(session_dir)
     return {"ok": True}

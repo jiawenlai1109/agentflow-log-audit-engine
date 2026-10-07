@@ -11,19 +11,30 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import APP_DATA_DIR, BUNDLES_DIR, DATASETS_DIR, OUTPUTS_ROOT, SESSIONS_ROOT
+from app import config
 from app.db import init_db
 from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions
+from app.runner import reclaim_at_boot
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    BUNDLES_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
-    SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+    for directory in (
+        config.app_data_dir(),
+        config.datasets_dir(),
+        config.bundles_dir(),
+        config.outputs_root(),
+        config.sessions_root(),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
     init_db()
-    yield
+    # 上次进程被杀时留下的"running"要收回来（P0 读数：28 个 job 永远停在非终态）。
+    # 先收再开认领循环，否则新起的认领者看不到那批僵尸行要等的更久。
+    reclaim_at_boot()
+    jobs.dispatcher.start()
+    try:
+        yield
+    finally:
+        jobs.dispatcher.stop()
 
 
 app = FastAPI(

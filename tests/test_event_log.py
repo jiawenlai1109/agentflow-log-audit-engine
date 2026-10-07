@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import eventlog
-from app.config import DB_PATH
+from app import config as app_config
 from app.db import execute, init_db, query_one
 from app.jobs import JobManager
 from app.main import app
@@ -79,7 +79,7 @@ def test_seq_is_monotonic_and_read_after_does_not_replay():
 
 def test_unique_seq_is_enforced_in_the_database():
     """并发"先读后写"迟早撞车；唯一约束让它报错而不是悄悄覆盖——所以这条要能在库上查出来。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(app_config.db_path()))
     names = {row[1] for row in conn.execute("PRAGMA index_list(job_events)")}
     conn.close()
     assert "uq_job_events_seq" in names, names

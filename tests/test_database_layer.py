@@ -11,13 +11,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from app.config import DB_PATH
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from app import config as app_config
 
 
 @pytest.fixture()
@@ -42,7 +44,7 @@ def test_dsn_defaults_to_the_local_sqlite_file(monkeypatch):
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert is_sqlite()
-    assert database_url().endswith(DB_PATH.name), database_url()
+    assert database_url().endswith(app_config.db_path().name), database_url()
 
 
 def test_migration_and_models_agree(temp_db: Path):
@@ -66,6 +68,40 @@ def test_migration_and_models_agree(temp_db: Path):
     assert expected - built == set(), f"模型里有、迁移建不出：{sorted(expected - built)}"
     assert built - expected - {"alembic_version"} == set(), (
         f"迁移建了模型没有的表（谁偷偷改了这一层？）：{sorted(built - expected)}"
+    )
+
+
+def test_migration_and_models_agree_column_by_column(temp_db: Path):
+    """表名对上还不够：**每张表的列名集合**也要对上。
+
+    只比表集合的守卫会被这种事放过：P2 给 `jobs` 加了 `spec` / `attempts`（队列的真相就存在
+    这两列里），运行时迁移 `app/db.py:_ADDED_COLUMNS` 有它们，而 alembic baseline 没有——
+    于是"用 init_db 建的库"和"用 alembic upgrade head 建的库"是两座不同的库，
+    而所有既有用例都是绿的。模型里写了≠库里存在，这条对迁移同样成立。
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    from app.models import Base
+
+    cfg = Config("alembic.ini")
+    cfg.set_main_option("script_location", "migrations")
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(str(temp_db))
+    diverged: dict[str, dict[str, list[str]]] = {}
+    for table, model in Base.metadata.tables.items():
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if not rows:
+            continue
+        built_columns = {row[1] for row in rows}
+        model_columns = {column.name for column in model.columns}
+        missing = sorted(model_columns - built_columns)
+        extra = sorted(built_columns - model_columns)
+        if missing or extra:
+            diverged[table] = {"迁移建不出": missing, "迁移多出来": extra}
+    assert not diverged, "迁移与模型的列集合不一致（按表列出来）：\n" + json.dumps(
+        diverged, ensure_ascii=False, indent=2
     )
 
 
@@ -187,3 +223,44 @@ def test_load_harness_reports_shapes(monkeypatch):
     assert readings["p95"] == 50.0, readings
     assert "mean" in readings, "平均值要一起印，但只能和分位数放在一起看，不然会被挑着说"
     assert shape("empty", [])["n"] == 0, "空样本要能报 0，不许炸也不许报个假的 0 分位"
+
+
+def test_paths_resolve_at_call_time_from_one_authority(tmp_path, monkeypatch):
+    """路径的唯一权威是环境变量，而且是**调用时**读。
+
+    这条判据是 P2 踩出来的：各模块 `from app.config import OUTPUTS_ROOT` 会拿走一份值副本，
+    测试只改得动其中几份 ⇒ 受理层与报告接口读 tmp，执行层把 run 写进仓库真 `outputs/`
+    （实测 22:35 一次跑测多出 7 个 run 目录），反过来报告 404。
+    """
+    first, second = tmp_path / "one", tmp_path / "two"
+    monkeypatch.setenv("APP_DATA_DIR", str(first))
+    monkeypatch.setenv("OUTPUTS_ROOT", str(first / "outputs"))
+    from app import db as db_module
+
+    db_module.init_db()
+    db_module.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')", ("u_a", "x"))
+    assert db_module.query_one("SELECT id FROM users WHERE username='u_a'") is not None
+
+    # 换 DSN 必须真的换库：新库是自己长出来的空 schema，老库里的人不跟着过来
+    monkeypatch.setenv("APP_DATA_DIR", str(second))
+    assert app_config.db_path() == second / "app.db"
+    assert not (second / "app.db").exists(), "改了环境变量而连接还指着老库，才会在这里就把它建出来"
+    db_module.init_db()
+    assert (second / "app.db").exists()
+    assert db_module.query_one("SELECT id FROM users WHERE username='u_a'") is None
+
+
+def test_app_layer_never_copies_a_config_value(tmp_path):
+    """`from app.config import X` 在 app/ 里一律禁止——它造的是副本，不是引用。
+
+    守卫读 AST 而不是正则源码：同一批语句里，读法被语句自己的形状骗过一次
+    （见 test_auth.py 里那条队列豁免的注释）。
+    """
+    import ast
+
+    offenders = []
+    for py in sorted((PROJECT_ROOT / "app").rglob("*.py")):
+        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module == "app.config":
+                offenders.append(f"{py.name}: {[alias.name for alias in node.names]}")
+    assert not offenders, "这些模块把配置抄成了自己的常量，改一处不动另外几处：\n" + "\n".join(offenders)

@@ -26,14 +26,12 @@ SCRATCH = Path(tempfile.mkdtemp(prefix="packs_e2e_"))
 os.environ["APP_SECRET"] = "e2e-secret-not-for-production"
 os.environ["ADMIN_PASSWORD"] = "e2e-probe-pw"
 
-import app.config as config  # noqa: E402
+# 用环境变量指路径，不再往 app.config 上贴属性副本：P2 之后认领 job 的是另一个进程，
+# 它只认环境变量。这里设的 env 就是子进程与探针共用的那一份权威。
+os.environ["APP_DATA_DIR"] = str(SCRATCH / ".appdata")
+os.environ["OUTPUTS_ROOT"] = str(SCRATCH / "outputs")
 
-config.APP_DATA_DIR = SCRATCH / ".appdata"
-config.DB_PATH = config.APP_DATA_DIR / "app.db"
-config.DATASETS_DIR = config.APP_DATA_DIR / "datasets"
-config.BUNDLES_DIR = config.APP_DATA_DIR / "bundles"
-config.SESSIONS_ROOT = SCRATCH / "outputs" / "sessions"
-config.OUTPUTS_ROOT = SCRATCH / "outputs"
+import app.config as config  # noqa: E402
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
@@ -137,7 +135,7 @@ def main() -> int:
         checks.append(("命中主体在报告里", "203.0.113.7->admin" in report, ""))
         checks.append(("外部库独有的 4242 不在报告里", "4242" not in report, ""))
 
-    run_dir = config.OUTPUTS_ROOT / finished["run_id"]
+    run_dir = config.outputs_root() / finished["run_id"]
     evaluation = json.loads((run_dir / "evaluation.json").read_text(encoding="utf-8"))
     checks.append(("事实层记下了包与规则", evaluation["pack"]["rule_ids"] == ["T1", "T3", "T4"], str(evaluation["pack"])))
     events = [json.loads(line) for line in (run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -152,7 +150,7 @@ def main() -> int:
     failed = [label for label, ok, _n in checks if not ok]
     print("=" * 74)
     print(f"产物目录：{run_dir}")
-    print(f"临时库：{config.DB_PATH}")
+    print(f"临时库：{config.db_path()}")
     print(f"结论：{len(checks) - len(failed)}/{len(checks)} 通过" + (f"，失败：{failed}" if failed else ""))
     return 1 if failed else 0
 
