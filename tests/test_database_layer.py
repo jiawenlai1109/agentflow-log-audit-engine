@@ -250,6 +250,122 @@ def test_paths_resolve_at_call_time_from_one_authority(tmp_path, monkeypatch):
     assert db_module.query_one("SELECT id FROM users WHERE username='u_a'") is None
 
 
+def test_runtime_schema_matches_the_models(tmp_path, monkeypatch):
+    """`init_db()` 建出来的库，列集合必须等于模型元数据——**这是运行时真正用的那一套 schema**。
+
+    为什么单独一条：路由现在走的是 `app/db.py` 的裸 sqlite3（`init_db` + SCHEMA），而不是
+    alembic。上一条守卫比的是"迁移 vs 模型"，于是运行时那份可以缺东西而没人看见——实测就是：
+    `organizations/memberships/org_quotas` 三张表与六张归属表的 `org_id` 列**只存在于模型与迁移里**，
+    运行时的库里根本没有，而 P3 的隔离谓词正要靠它们。
+    """
+    from app.db import init_db
+    from app.models import Base
+
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "runtime"))
+    init_db()
+
+    conn = sqlite3.connect(str(tmp_path / "runtime" / "app.db"))
+    built_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    missing_tables = sorted(set(Base.metadata.tables) - built_tables)
+    assert not missing_tables, f"模型与迁移里有、运行库里没有：{missing_tables}"
+
+    diverged: dict[str, list[str]] = {}
+    for table, model in Base.metadata.tables.items():
+        if table not in built_tables:
+            continue
+        built_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        gap = sorted({column.name for column in model.columns} - built_columns)
+        if gap:
+            diverged[table] = gap
+    assert not diverged, "运行库缺列（P3 的谓词会在第一条查询上撞崩）：\n" + json.dumps(diverged, ensure_ascii=False)
+
+
+def test_no_owned_row_defaults_to_the_admin_account(tmp_path, monkeypatch):
+    """归属列不许有"忘了写就把这行判给某人"的默认值。
+
+    `user_id INTEGER NOT NULL DEFAULT 1` 在旧 SCHEMA 里有六处：任何一条漏写 user_id 的
+    INSERT 都会静默把资源判给 id=1（种子 admin），而读路径的归属谓词看起来完全正常——
+    这是 IDOR 的种子，不是风格问题。新库要求：user_id **没有默认值**（漏写当场报错），
+    org_id 的默认只能是 0（未归属，协作读默认拒绝），不许是 1。
+    """
+    from app.db import init_db
+
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "defaults"))
+    init_db()
+    conn = sqlite3.connect(str(tmp_path / "defaults" / "app.db"))
+    offenders = []
+    for table in ("datasets", "jobs", "sessions", "bundles", "bundle_files", "bundle_tables"):
+        for row in conn.execute(f"PRAGMA table_info({table})"):
+            name, default = row[1], row[4]
+            if name == "user_id" and default is not None:
+                offenders.append(f"{table}.user_id 默认 {default}")
+            if name == "org_id" and str(default) not in {"0", "None"}:
+                offenders.append(f"{table}.org_id 默认 {default}")
+    assert not offenders, "这些默认值会把没声明归属的行判给别人：\n" + "\n".join(offenders)
+
+
+def test_org_indexes_exist_on_both_schema_paths(tmp_path, monkeypatch):
+    """`org_id` 的索引要在**两条路径**上都真的建出来：新建库与老库升级。
+
+    这条是被自己的变异逼出来的：把 org 索引从 SCHEMA 挪到 `_AFTER_MIGRATION_SQL`（因为老库里
+    org_id 是补列补出来的，索引建在补列之前会 `no such column`）之后，"删掉那一次执行"这个
+    变异**全绿**——因为没有任何一条用例查过索引在不在。模型里写了≠库里存在，这条对索引同样成立。
+    """
+    expected = {
+        "idx_datasets_org",
+        "idx_jobs_org",
+        "idx_sessions_org",
+        "idx_bundles_org",
+        "idx_memberships_user",
+    }
+
+    def index_names(db: Path) -> set[str]:
+        conn = sqlite3.connect(str(db))
+        try:
+            return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        finally:
+            conn.close()
+
+    # ① 新库
+    fresh = tmp_path / "fresh"
+    monkeypatch.setenv("APP_DATA_DIR", str(fresh))
+    from app.db import init_db
+
+    init_db()
+    missing = expected - index_names(fresh / "app.db")
+    assert not missing, f"新建库里没有这些 org 索引：{sorted(missing)}"
+
+    # ② 老库：表结构是 P2 之前的形状（没有 org_id，也没有这些索引），init_db 要把它升上来
+    legacy = tmp_path / "legacy" / "app.db"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "CREATE TABLE datasets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL DEFAULT 1,"
+        " filename TEXT NOT NULL, path TEXT NOT NULL, size INTEGER, row_count INTEGER, columns TEXT,"
+        " created_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT UNIQUE NOT NULL,"
+        " user_id INTEGER NOT NULL DEFAULT 1, question TEXT NOT NULL, mode TEXT NOT NULL,"
+        " session_id TEXT, run_id TEXT, status TEXT NOT NULL, progress INTEGER NOT NULL, error TEXT,"
+        " created_at TEXT, finished_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path / "legacy"))
+    init_db()
+    built = index_names(legacy)
+    assert not expected - built, f"老库升级后缺这些索引：{sorted(expected - built)}"
+    conn = sqlite3.connect(legacy)
+    try:
+        for table in ("datasets", "jobs"):
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            assert "org_id" in columns, f"{table} 没被补上 org_id：老库上的 P3 谓词会直接崩"
+    finally:
+        conn.close()
+
+
 def test_app_layer_never_copies_a_config_value(tmp_path):
     """`from app.config import X` 在 app/ 里一律禁止——它造的是副本，不是引用。
 

@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS datasets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     filename TEXT NOT NULL,
     path TEXT NOT NULL,
     size INTEGER NOT NULL DEFAULT 0,
@@ -34,7 +35,8 @@ CREATE TABLE IF NOT EXISTS datasets (
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT UNIQUE NOT NULL,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     question TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'mock',
     session_id TEXT,
@@ -49,7 +51,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT UNIQUE NOT NULL,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     title TEXT,
     dataset_path TEXT,
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
@@ -61,7 +64,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS bundles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bundle_id TEXT UNIQUE NOT NULL,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     name TEXT NOT NULL,
     root TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'ready',
@@ -74,7 +78,8 @@ CREATE TABLE IF NOT EXISTS bundles (
 CREATE TABLE IF NOT EXISTS bundle_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bundle_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     filename TEXT NOT NULL,
     stored_path TEXT NOT NULL DEFAULT '',
     size INTEGER NOT NULL DEFAULT 0,
@@ -89,7 +94,8 @@ CREATE TABLE IF NOT EXISTS bundle_files (
 CREATE TABLE IF NOT EXISTS bundle_tables (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     bundle_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL DEFAULT 1,
+    user_id INTEGER NOT NULL,  -- 没有默认值：漏写就报错，而不是静默把行判给某个账号
+    org_id INTEGER NOT NULL DEFAULT 0,  -- 0 = 未归属企业，协作读默认拒绝
     table_ref TEXT NOT NULL,
     source_file TEXT NOT NULL,
     path TEXT NOT NULL,
@@ -106,6 +112,33 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundles_user ON bundles (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundle_files_bundle ON bundle_files (bundle_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundle_tables_bundle ON bundle_tables (bundle_id, table_ref);
+-- 企业三表（P3 的地基）。两张 schema 必须同源：这一份 init_db 用的 SCHEMA 与
+-- app/models.py + alembic 的那一份一旦分叉，就会出现"迁移说有这张表，运行时库里没有"，
+-- 而每条既有用例都还是绿的（列名对不上没人看）。守卫见
+-- tests/test_database_layer.py::test_runtime_schema_matches_the_models。
+CREATE TABLE IF NOT EXISTS organizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+CREATE TABLE IF NOT EXISTS memberships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    org_id INTEGER NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT DEFAULT (datetime('now', 'localtime')),
+    UNIQUE (user_id, org_id)
+);
+CREATE TABLE IF NOT EXISTS org_quotas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL UNIQUE,
+    limit_concurrent_jobs INTEGER,
+    limit_jobs_per_day INTEGER,
+    limit_llm_calls_per_day INTEGER,
+    limit_upload_bytes INTEGER,
+    updated_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
 -- 事件落库（P2 前置）：作业"发生过什么"不能只活在某个进程的内存里。
 -- seq 由 INSERT 自己算（见 app/eventlog.py），唯一约束让并发写撞车时报错而不是悄悄覆盖。
 CREATE TABLE IF NOT EXISTS job_events (
@@ -117,18 +150,25 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at TEXT DEFAULT (datetime('now', 'localtime'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_job_events_seq ON job_events (job_id, seq);
+-- org_id 的索引不在这里建，见 _AFTER_MIGRATION_SQL（原因写在那一段）。
 """
 
 # 本地已有库的增量列（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，先查 PRAGMA）
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "users": {"role": "TEXT NOT NULL DEFAULT 'user'"},
-    # Bundle 子表带 user_id：归属谓词要能写进每一条子表查询，而不是靠"先查父行"
-    "bundle_files": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
-    "bundle_tables": {"user_id": "INTEGER NOT NULL DEFAULT 1"},
+    # Bundle 子表带 user_id：归属谓词要能写进每一条子表查询，而不是靠"先查父行"。
+    # 老库补列时 SQLite 要求 NOT NULL 的新列带默认值——取 0（未归属），不取 1：
+    # 默认 1 等于把"没人声明归属"的行判给 admin。
+    "bundle_files": {"user_id": "INTEGER NOT NULL DEFAULT 0", "org_id": "INTEGER NOT NULL DEFAULT 0"},
+    "bundle_tables": {"user_id": "INTEGER NOT NULL DEFAULT 0", "org_id": "INTEGER NOT NULL DEFAULT 0"},
+    "datasets": {"org_id": "INTEGER NOT NULL DEFAULT 0"},
+    "sessions": {"org_id": "INTEGER NOT NULL DEFAULT 0"},
+    "bundles": {"org_id": "INTEGER NOT NULL DEFAULT 0"},
     # 场景包：本地已有库要能补上这一列，否则老库上跑新代码会在 INSERT 处直接崩
     # spec = "这个 job 到底要跑什么"（存数据源引用，不存绝对路径）；attempts = 被认领过几次，
     # 崩溃恢复靠它封顶，否则一个稳定崩溃的 job 会把队列变成永动机。
     "jobs": {
+        "org_id": "INTEGER NOT NULL DEFAULT 0",
         "pack": "TEXT",
         "spec": "TEXT",
         "attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -138,6 +178,17 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "trace_id": "TEXT",
     },
 }
+
+
+# 补列之后才能建的索引：`executescript(SCHEMA)` 跑在 `_ensure_columns` 之前，而 org_id 在老库里
+# 恰恰是靠 `_ensure_columns` 补出来的。把这两件事的顺序写死在这里，而不是指望读者记得。
+_AFTER_MIGRATION_SQL = """
+CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships (user_id, org_id);
+CREATE INDEX IF NOT EXISTS idx_datasets_org ON datasets (org_id, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_org ON jobs (org_id, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_org ON sessions (org_id, id);
+CREATE INDEX IF NOT EXISTS idx_bundles_org ON bundles (org_id, id);
+"""
 
 
 def get_conn() -> sqlite3.Connection:
@@ -161,6 +212,7 @@ def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         _ensure_columns(conn)
+        conn.executescript(_AFTER_MIGRATION_SQL)
         _seed_admin(conn)
 
 
