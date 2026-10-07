@@ -106,6 +106,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundles_user ON bundles (user_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundle_files_bundle ON bundle_files (bundle_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundle_tables_bundle ON bundle_tables (bundle_id, table_ref);
+-- 事件落库（P2 前置）：作业"发生过什么"不能只活在某个进程的内存里。
+-- seq 由 INSERT 自己算（见 app/eventlog.py），唯一约束让并发写撞车时报错而不是悄悄覆盖。
+CREATE TABLE IF NOT EXISTS job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now', 'localtime'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_job_events_seq ON job_events (job_id, seq);
 """
 
 # 本地已有库的增量列（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，先查 PRAGMA）

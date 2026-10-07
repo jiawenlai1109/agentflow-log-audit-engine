@@ -9,10 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import OUTPUTS_ROOT
+from app import eventlog
 from app.db import execute, query_one
 from app.deps import get_current_user
 from app.jobs import JobManager
@@ -28,7 +29,7 @@ from agentflow.core.pack import (
 from agentflow.pipeline import as_bundle, run_analysis
 
 router = APIRouter(prefix="/api", tags=["jobs"])
-manager = JobManager()
+manager = JobManager(sink=eventlog.append_event)
 # worker 数以前写死 2：P0 实测 100 个 job 进来峰值有 93 个非终态（约 91 个在排队）。
 # 分析的时间绝大多数花在等 LLM 上游，2 个线程是自己掐自己的吞吐。现在默认 8、
 # 由 `WORKER_CONCURRENCY` 说话；真正的上游并发（8 × 每 run 内 3 路 = 24 路）由 P4 的
@@ -266,25 +267,55 @@ def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
     return _owned_job(job_id, user)
 
 
+TERMINAL_STATUSES = {"success", "partial", "degraded", "failed", "error", "cancelled"}
+# 终态判定要的是库里的状态，不是"我这个进程知不知道"——worker 拆出去之后，写状态的人
+# 与推流的人不是同一个进程。
+
+
+def _sse(event: dict, seq: int | None = None) -> str:
+    """一帧 SSE。集中成一个函数是因为 `id:` 这一行的有无就是续读协议本身。"""
+    body = "id: " + str(seq) + "\n" if seq is not None else ""
+    return body + "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+
+def _last_event_id(request: Request) -> int:
+    """浏览器重连会自动带回 `Last-Event-ID`。解析不了退回 0（从头读），不猜。"""
+    raw = (request.headers.get("last-event-id") or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) >= 0 else 0
+
+
 @router.get("/jobs/{job_id}/events")
-async def job_events(job_id: str, user: dict = Depends(get_current_user)) -> StreamingResponse:
+async def job_events(job_id: str, request: Request, user: dict = Depends(get_current_user)) -> StreamingResponse:
     _owned_job(job_id, user)
+    start = _last_event_id(request)
 
     async def event_stream():
-        # 第一帧先报队列深度：用户在"点了没反应"和"排在第几"之间看到的必须是后者
-        yield f"data: {json.dumps({'type': 'queue', **manager.depth()}, ensure_ascii=False)}\n\n"
-        index = 0
+        # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者
+        yield _sse({"type": "queue", **manager.depth()})
+        cursor = start
         while True:
-            events, total, expired = manager.snapshot(job_id, index)
-            if expired:
-                # 事件缓冲已被回收（长跑进程只保留最近 N 个已完成 job）。静默返回空会被
-                # 前端读成"这次运行没有过程"——那是把"没数据"说成"没问题"，与 #49 同族。
-                yield f"data: {json.dumps({'type': 'events_expired', 'job_id': job_id}, ensure_ascii=False)}\n\n"
-                break
-            for event in events:
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                index += 1
-            if manager.is_done(job_id) and index >= total:
+            rows = eventlog.read_after(job_id, cursor)
+            if not rows and not eventlog.has_events(job_id):
+                # 事件没落库（sink 写失败过）⇒ 退化成过程内缓冲，与改造前等价。
+                # 降级可以，静默不行：明着发一条 events_not_persisted。
+                yield _sse({"type": "events_not_persisted", "job_id": job_id})
+                events, _total, expired = manager.snapshot(job_id, 0)
+                for event in events:
+                    yield _sse(event)
+                if expired or manager.is_done(job_id):
+                    break
+                await asyncio.sleep(0.5)
+                continue
+            for seq, event in rows:
+                cursor = seq
+                yield _sse(event, seq)
+            row = query_one(
+                "SELECT status FROM jobs WHERE job_id = ? AND user_id = ?",
+                (job_id, user["id"]),
+            )
+            state = (row or {}).get("status")
+            if state in TERMINAL_STATUSES:
+                yield _sse({"type": "job_status", "status": state})
                 break
             await asyncio.sleep(0.5)
 

@@ -50,7 +50,12 @@ class JobManager:
         *,
         keep_done: int | None = None,
         events_per_job: int | None = None,
+        sink: Callable[[str, dict[str, Any]], Any] | None = None,
     ) -> None:
+        # sink 是"事件顺便落库"的钩子（生产上是 app.eventlog.append_event）。放在这里而不是
+        # 每个调用点各写一遍：漏一处，那条流就还是只活在内存里。
+        self.sink = sink
+        self.sink_failures = 0
         self.max_workers = max_workers if max_workers is not None else default_worker_concurrency()
         self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self._lock = threading.Lock()
@@ -102,6 +107,12 @@ class JobManager:
     # ------------------------------------------------------------------ 事件
 
     def publish(self, job_id: str, event: dict[str, Any]) -> None:
+        if self.sink is not None:
+            try:
+                self.sink(job_id, event)
+            except Exception:  # noqa: BLE001 - 落库失败要降级可见，但不能打死运行
+                with self._lock:
+                    self.sink_failures += 1
         with self._lock:
             buffer = self._events.setdefault(job_id, [])
             if len(buffer) < self.events_per_job:

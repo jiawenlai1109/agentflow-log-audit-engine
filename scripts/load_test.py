@@ -218,39 +218,65 @@ async def one_user(
 
 
 async def read_stream(base: str, token: str, job_id: str) -> dict[str, Any]:
-    """事件流这一段不测吞吐，测的是三件会骗人的事：能不能续上、续上时重不重放、完成后还能不能读。"""
+    """事件流这一段不测吞吐，测三件会骗人的事：续得上吗、续上时重不重放、完成后还读得到吗。
+
+    游标必须是**服务端给的 `id:`**（浏览器就是这么记的），不是"data 行数"：
+    第一帧 `queue` 没有 id，用行数当游标会多要一位，于是永远"重复一条"——
+    这条红在尺子上，不在系统上（上一轮就是这么读的，读数已作废重测）。
+    """
     headers = {"Authorization": f"Bearer {token}"}
     first: list[str] = []
+    last_id = 0
     try:
         async with httpx.AsyncClient(timeout=30) as probe:
             async with probe.stream("GET", f"{base}/api/jobs/{job_id}/events", headers=headers) as response:
                 async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        first.append(line)
-                        if len(first) >= 3:
+                    if line.startswith("id: "):
+                        last_id = int(line[4:])
+                    elif line.startswith("data: "):
+                        first.append(line[6:])
+                        if len(first) >= 4:
                             break  # 故意断开：模拟用户切页面、网络掉线
     except Exception as exc:  # noqa: BLE001 - 流的坏形状就是要如实记下来
-        return {"phase1_events": len(first), "reconnect_error": type(exc).__name__}
+        return {"phase1_frames": len(first), "last_event_id": last_id, "reconnect_error": type(exc).__name__}
 
     replayed: list[str] = []
+    resumed_from = last_id
     async with httpx.AsyncClient(timeout=20) as again:
         try:
             async with again.stream(
-                "GET", f"{base}/api/jobs/{job_id}/events", headers={**headers, "Last-Event-ID": str(len(first))}
+                "GET",
+                f"{base}/api/jobs/{job_id}/events",
+                headers={**headers, "Last-Event-ID": str(resumed_from)},
             ) as response:
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
-                        replayed.append(line)
+                        replayed.append(line[6:])
                         if len(replayed) >= 8:
                             break
         except Exception:  # noqa: BLE001
             pass
-    duplicates = len(set(first) & set(replayed))
+    # 每次建流都会先发一条 `queue` 元帧（连接自己的深度，不属于历史）。
+    # 把它算进"重播"就是尺子在骗人：上一条读数就是这么留下的 1 条重复。
+    def _history(frames: list[str]) -> set[str]:
+        keep = set()
+        for raw in frames:
+            try:
+                if json.loads(raw).get("type") == "queue":
+                    continue
+            except Exception:  # noqa: BLE001 - 解析不了的照样算历史，别悄悄丢
+                pass
+            keep.add(raw)
+        return keep
+
+    duplicates = len(_history(first) & _history(replayed))
     return {
-        "phase1_events": len(first),
-        "phase2_events": len(replayed),
-        "duplicated_events": duplicates,
-        # 服务端认不认 Last-Event-ID：认了就不该有重复事件
+        "phase1_frames": len(first),
+        "last_event_id": last_id,
+        "resumed_from": resumed_from,
+        "phase2_frames": len(replayed),
+        "duplicated_frames": duplicates,
+        # 认 Last-Event-ID 的判据：续读不重播，且确实拿到了后面的帧
         "honors_last_event_id": duplicates == 0 and len(replayed) > 0,
     }
 
