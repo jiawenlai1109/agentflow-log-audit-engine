@@ -28,7 +28,11 @@ from agentflow.core.pack import (
 from agentflow.pipeline import as_bundle, run_analysis
 
 router = APIRouter(prefix="/api", tags=["jobs"])
-manager = JobManager(max_workers=2)
+manager = JobManager()
+# worker 数以前写死 2：P0 实测 100 个 job 进来峰值有 93 个非终态（约 91 个在排队）。
+# 分析的时间绝大多数花在等 LLM 上游，2 个线程是自己掐自己的吞吐。现在默认 8、
+# 由 `WORKER_CONCURRENCY` 说话；真正的上游并发（8 × 每 run 内 3 路 = 24 路）由 P4 的
+# 全局闸门管——这里不把"线程多"伪装成"上游扛得住"。
 
 PHASE_PROGRESS = {"explore": 10, "plan": 20, "execute": 60, "report": 85, "review": 95}
 _JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question, pack"
@@ -45,6 +49,7 @@ def _owned_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     )
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
+    job["queue"] = manager.depth()
     return job
 
 
@@ -266,9 +271,16 @@ async def job_events(job_id: str, user: dict = Depends(get_current_user)) -> Str
     _owned_job(job_id, user)
 
     async def event_stream():
+        # 第一帧先报队列深度：用户在"点了没反应"和"排在第几"之间看到的必须是后者
+        yield f"data: {json.dumps({'type': 'queue', **manager.depth()}, ensure_ascii=False)}\n\n"
         index = 0
         while True:
-            events, total = manager.snapshot(job_id, index)
+            events, total, expired = manager.snapshot(job_id, index)
+            if expired:
+                # 事件缓冲已被回收（长跑进程只保留最近 N 个已完成 job）。静默返回空会被
+                # 前端读成"这次运行没有过程"——那是把"没数据"说成"没问题"，与 #49 同族。
+                yield f"data: {json.dumps({'type': 'events_expired', 'job_id': job_id}, ensure_ascii=False)}\n\n"
+                break
             for event in events:
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 index += 1

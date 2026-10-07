@@ -144,63 +144,76 @@ async def one_user(
     jobs_out: list[dict[str, Any]],
     sse_case: dict[str, Any] | None,
 ) -> None:
-    started = time.perf_counter()
-    login = await client.post(f"{base}/api/auth/login", json={"username": username, "password": "load-test-pw"})
-    metrics["login"].append(time.perf_counter() - started)
-    if login.status_code != 200:
-        counters["login_failed"] += 1
-        return
-    # 每个用户带自己的 Authorization 逐次传，不改共享 client 的头：
-    # 共用一个 AsyncClient 又互相覆盖 header ⇒ 提交时带的是别人的 token，
-    # 归属过滤就会把"你读不到他的数据集"报成 404——那是量具在骗人（这轮就先这样红过一次）。
-    token = login.json()["token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    """一个用户的一轮：登录 → 上传 → 提交 → 轮询到终态。
 
-    started = time.perf_counter()
-    with CSV.open("rb") as fh:
-        upload = await client.post(
-            f"{base}/api/datasets", files={"file": (CSV.name, fh, "text/csv")}, headers=headers
-        )
-    metrics["upload"].append(time.perf_counter() - started)
-    if upload.status_code not in (200, 201):
-        counters["upload_failed"] += 1
-        return
-    dataset_id = upload.json()["id"]
-
-    for _ in range(rounds):
-      try:
+    每一步都计时（失败也计时才有意义），传输层异常按"死在哪一步"记账——
+    100 并发下服务端会 reset 连接，那是一条读数，不该让压测崩在栈上。
+    """
+    phase = "login"
+    try:
         started = time.perf_counter()
-        submit = await client.post(
-            f"{base}/api/analyze",
-            json={"question": QUESTION, "dataset_id": dataset_id, "mode": "mock", "pack": PACK},
-            headers=headers,
+        login = await client.post(
+            f"{base}/api/auth/login", json={"username": username, "password": "load-test-pw"}
         )
-        metrics["submit"].append(time.perf_counter() - started)
-        if submit.status_code != 200:
-            counters["submit_failed"] += 1
-            continue
-        job_id = submit.json()["job_id"]
+        metrics["login"].append(time.perf_counter() - started)
+        if login.status_code != 200:
+            counters["login_failed"] += 1
+            return
+        # 每个用户带自己的 Authorization 逐次传，不改共享 client 的头：共用一个 AsyncClient
+        # 又互相覆盖 header ⇒ 提交时带的是别人的 token，归属过滤会把"读不到他的数据集"
+        # 报成 404——那是量具在骗人（这一轮就先这样红过一次）。
+        token = login.json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
 
-        if sse_case is not None and sse_case.get("job_id") is None:
-            sse_case["job_id"] = job_id
-            sse_case["token"] = token  # 只有一个用户负责把事件流跑一遍，见 read_stream
+        phase = "upload"
+        started = time.perf_counter()
+        with CSV.open("rb") as fh:
+            upload = await client.post(
+                f"{base}/api/datasets", files={"file": (CSV.name, fh, "text/csv")}, headers=headers
+            )
+        metrics["upload"].append(time.perf_counter() - started)
+        if upload.status_code not in (200, 201):
+            counters["upload_failed"] += 1
+            return
+        dataset_id = upload.json()["id"]
 
-        waited = 0.0
-        status = "unknown"
-        while waited < 600:
-            poll = await client.get(f"{base}/api/jobs/{job_id}", headers=headers)
-            status = poll.json().get("status") or "unknown"
-            if status in ("success", "partial", "degraded", "failed", "error"):
-                break
-            await asyncio.sleep(0.2)
-            waited += 0.2
-        metrics["e2e"].append(waited if waited else 0.2)
-        if status in ("failed", "error"):
-            counters["jobs_failed"] += 1
-        jobs_out.append({"job_id": job_id, "status": status, "user": username})
-      except httpx.HTTPError:
-        # 服务进程已经不在了（--kill-after 就是故意杀的）：记一条传输失败，别让整个压测崩在栈上
+        for _ in range(rounds):
+            phase = "submit"
+            started = time.perf_counter()
+            submit = await client.post(
+                f"{base}/api/analyze",
+                json={"question": QUESTION, "dataset_id": dataset_id, "mode": "mock", "pack": PACK},
+                headers=headers,
+            )
+            metrics["submit"].append(time.perf_counter() - started)
+            if submit.status_code != 200:
+                counters["submit_failed"] += 1
+                continue
+            job_id = submit.json()["job_id"]
+            if sse_case is not None and sse_case.get("job_id") is None:
+                sse_case["job_id"] = job_id
+                sse_case["token"] = token  # 只有一个用户负责把事件流跑一遍，见 read_stream
+
+            phase = "poll"
+            waited = 0.0
+            status = "unknown"
+            while waited < 600:
+                poll = await client.get(f"{base}/api/jobs/{job_id}", headers=headers)
+                status = poll.json().get("status") or "unknown"
+                if status in ("success", "partial", "degraded", "failed", "error"):
+                    break
+                await asyncio.sleep(0.2)
+                waited += 0.2
+            metrics["e2e"].append(waited if waited else 0.2)
+            if status in ("failed", "error"):
+                counters["jobs_failed"] += 1
+            jobs_out.append({"job_id": job_id, "status": status, "user": username})
+    except httpx.HTTPError as exc:
         counters["transport_failed"] += 1
+        by_phase = counters.setdefault("transport_by_phase", {})
+        by_phase[phase] = by_phase.get(phase, 0) + 1
+        kinds = counters.setdefault("transport_kinds", {})
+        kinds[type(exc).__name__] = kinds.get(type(exc).__name__, 0) + 1
         return
 
 
