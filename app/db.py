@@ -121,8 +121,17 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
 
 def get_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # 三条 PRAGMA 是 100 并发下的第一道止血（P1 的最终形态是 Postgres，不是把 SQLite 调到极限）：
+    #   journal_mode=WAL —— 默认 rollback journal 下写者互斥，并发写会直接抛 `database is locked`；
+    #                       WAL 让读不挡写、写不挡读（同库多进程）。
+    #   busy_timeout     —— 撞锁时等而不是立刻报错；配合 timeout= 参数覆盖 sqlite3 默认的 5s。
+    #   synchronous=NORMAL —— WAL 下的常规档：断电不损库，只可能丢最后几个未 checkpoint 的事务，
+    #                       对"作业元数据 + 产物索引"是可接受的（产物本身在文件系统，另有原子写）。
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=float(os.getenv("DB_BUSY_TIMEOUT_S", "10")))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={int(os.getenv('DB_BUSY_TIMEOUT_MS', '10000'))}")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 

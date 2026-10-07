@@ -14,10 +14,18 @@ dependencies = [
     "pydantic>=2.6",
     "PyYAML>=6.0",
     "Jinja2>=3.1",
+    # P1 数据层：模型 + 迁移 + 异步引擎（DSN 由 DATABASE_URL 给，默认 SQLite）
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# 按部署形态装：换 Postgres 才要 asyncpg，起 Redis Stream 队列才要 redis。
+# 分开列是因为"装了但没人 import"的依赖，会在事故复盘时变成一条假的因果线索。
+postgres = ["asyncpg>=0.29"]
+queue = ["redis>=5.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

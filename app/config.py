@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from agentflow.core.config import load_dotenv
@@ -12,8 +13,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 没人加载 .env，APP_SECRET 会静默退化成每次启动随机（重启即踢掉所有已登录会话）。
 load_dotenv(PROJECT_ROOT / ".env")
 
-OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
-APP_DATA_DIR = PROJECT_ROOT / ".appdata"
+
+def _env_path(name: str, default: Path) -> Path:
+    """目录一律可被环境变量改指：① 压测与多实例不能写在开发机的真库上；
+    ② P2 把 worker 拆成独立进程后，两个进程要能对同一份数据说话。
+    没配就用仓库默认路径——不设环境变量时的行为与今天逐字节相同。"""
+    value = (os.getenv(name) or "").strip()
+    return Path(value).expanduser().resolve() if value else default
+
+
+OUTPUTS_ROOT = _env_path("OUTPUTS_ROOT", PROJECT_ROOT / "outputs")
+APP_DATA_DIR = _env_path("APP_DATA_DIR", PROJECT_ROOT / ".appdata")
 DB_PATH = APP_DATA_DIR / "app.db"
 DATASETS_DIR = APP_DATA_DIR / "datasets"
 BUNDLES_DIR = APP_DATA_DIR / "bundles"

@@ -9,3 +9,11 @@ fastapi>=0.115
 uvicorn>=0.30
 python-multipart>=0.0.9
 httpx>=0.27
+
+# 后端整改 P1（数据层底座）真正 import 的三个：模型/迁移/异步 SQLite 驱动。
+# asyncpg 与 redis 不列在这里——这一版代码还没用到它们（Postgres 切换在 P1 尾、
+# 队列在 P2），把没用到的依赖写进安装清单会让"装了它所以一定在用"这种误读成立。
+# 需要时：pip install "agentflow[postgres,queue]"（见 pyproject 的 optional-dependencies）。
+sqlalchemy[asyncio]>=2.0
+aiosqlite>=0.20
+alembic>=1.13
