@@ -26,10 +26,23 @@ import re
 from typing import Any, Iterable
 
 # 与 core/grading.py 的数字口径保持一致（两处各留一份是刻意的：运行侧不该依赖评分器，
-# 但任何一方改了口径都必须同步另一方，否则"绿"的含义在两侧不同）
-_META_NUMBER_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}:\d{2}:\d{2}\b")
-_DOTTED_QUAD_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+# 但两边必须同判据——2026-10-07 一起补 #46 的三条掩码时也是两处同改）。
+#
+# 为什么这里没有 `\b`：Python 的 `\w` 含汉字，"阻断10.0.0.15" 里 断 与 1 之间**不构成
+# 词边界**，于是 IP 没被挖掉、评分侧把 `0.15` 当成一个没人背书的数（real E23 实测
+# 追溯率被压到 0.5000）。中文报告里的数字旁边就是汉字，边界只能按"前后是不是数字/点"判。
+_META_NUMBER_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)|(?<!\d)\d{2}:\d{2}:\d{2}(?!\d)|(?<!\d)\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?"
+)
+_DOTTED_QUAD_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
+# 但任何一方改了口径都必须同步另一方，否则"绿"的含义在两侧不同。
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+# 千分位分隔符（缺陷 #46，2026-10-07 用 real 产物实测）：报告把账本里的 1234 写成 "1,234"
+# 时，上面那条会拆成 1 与 234 两个数 ⇒ "老实抄了数字"被判成造数。
+# 实测数字（同一份 report.md / evaluation.json，只换尺子）：E01 0.5385 → 0.9091（去千分位）
+# → 1.0000（再补上头两条 CJK 边界掩码）；E23 0.5000 → 1.0000（全靠 CJK 边界）。
+# 判据只认"逗号后面正好三个数字且不再跟数字"，不动 "1, 234"（列表）也不动 12345。
+_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 
 FACT = "fact"
 ACTION = "action"
@@ -72,6 +85,7 @@ def scan_numbers(text: str) -> set[float]:
     cleaned = _DOTTED_QUAD_RE.sub(" ", text or "")
     for token in _META_NUMBER_RE.findall(cleaned):
         cleaned = cleaned.replace(token, " ")
+    cleaned = _THOUSANDS_RE.sub("", cleaned)
     out: set[float] = set()
     for token in _NUMBER_RE.findall(cleaned):
         try:
@@ -157,7 +171,35 @@ def lint_report(
                     "message": f"推断层出现事实层没有的数字 {value:g}（模型不得造数）",
                 }
             )
+
+    # 缺陷 #49（2026-10-07 real E23 实测）：同一份报告自相矛盾——头部一边列
+    # "未能完成的规则：T3"，一边在命中统计里印 `T3=0`。SOC 值班读到 0 就是
+    # "这条规则查过了，没问题"，而真因是那条规则根本没跑成。**0 是一个结论**，
+    # 它必须由跑过的那道工序给出；没跑成就得说"没跑成"。
+    # 这一条不依赖包给了哪些规则号，判据只看报告自己说的话——生产侧改了措辞，
+    # 这里照样拦得住（producer 与 verifier 各走各的路）。
+    header = _header_text(parsed)
+    for rule in sorted(_declared_silent_rules(text, header)):
+        if re.search(rf"{re.escape(rule)}\s*=\s*0(?!\d)", header):
+            issues.append(
+                {
+                    "severity": "high",
+                    "section": "报告头",
+                    "message": (
+                        f"{rule} 被自己声明为「未出结论」，命中统计却印成 {rule}=0——"
+                        "「无风险」是从「没跑成」里编出来的数"
+                    ),
+                }
+            )
     return issues
+
+
+def _declared_silent_rules(text: str, header: str) -> set[str]:
+    """报告自己承认"没跑成"的规则号。措辞来自包模板，两处都认得：未完成 / 未出结论。"""
+    found: set[str] = set()
+    for block in re.findall(r"(?:未能完成的规则|未出结论的规则)[:：]([^\n（(]+)", f"{text}\n{header}"):
+        found.update(piece.strip() for piece in re.split(r"[、,，]", block) if piece.strip())
+    return found
 
 
 def _header_text(parsed: list[tuple[str, str]]) -> str:
@@ -224,6 +266,14 @@ def _as_cell(value: Any) -> str:
     return str(value).strip()
 
 
+# 整个格子就是一个千分位数（1,234 / 1,234,567）时按数值比；带单位或带逗号的文本格不动。
+_THOUSANDS_CELL_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})+$")
+
+
+def _plain_number(cell: str) -> str:
+    return cell.replace(",", "") if _THOUSANDS_CELL_RE.match(cell.strip()) else cell
+
+
 def finding_triple(finding: dict[str, Any]) -> tuple[str, str, str] | None:
     """一条发现的 (主体, 指标, 数值) 三元组；缺任何一格就不构成可核对的一行。"""
     subject = str(finding.get("subject") or "").strip()
@@ -273,7 +323,10 @@ def lint_fact_triples(
 
     matched: set[int] = set()
     for index, cells in enumerate(rows):
-        occupied = set(cells)
+        # 千分位归一（缺陷 #46）：账本里的 1234 被模板印成 "1,234" 时，整格相等会把
+        # 一行真发现判成"凭空多印的行"。只归一"整个格子就是一个千分位数"的情况，
+        # 主体/时间窗那些格子里的逗号一个都不碰。
+        occupied = {_plain_number(cell) for cell in cells}
         hit = next(
             (
                 position

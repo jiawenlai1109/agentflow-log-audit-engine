@@ -19,8 +19,20 @@ from typing import Any
 
 import pytest
 
-from agentflow.core.llm import LLMError, OpenAILLM
+from agentflow.core.llm import LLMError, OpenAILLM, clear_reasoning_signatures
 from agentflow.pipeline import _agent_llm, run_analysis
+
+
+@pytest.fixture(autouse=True)
+def _isolated_reasoning_signature():
+    """信封判据改看实测签名（挂账 #48）之后，签名是进程级的：不清就会串到下一个用例。
+
+    这条 fixture 本身就是被测对象的一部分——进程级状态没有隔离，测试顺序就能决定
+    请求体形状，那和"配置写了不等于思考真关了"是同一类不可复现。
+    """
+    clear_reasoning_signatures()
+    yield
+    clear_reasoning_signatures()
 
 
 class _Response(io.BytesIO):
@@ -268,6 +280,8 @@ def test_budget_retry_recovers_with_a_larger_envelope(monkeypatch):
             "reasoning_chars": 16,
             "max_tokens": 200,
             "thinking": None,
+            # 信封依据要能点名：这一条是"没配信封策略"，不是"配了没生效"（挂账 #48）
+            "envelope_basis": "policy_off",
             "content_kind": "null",
             "recovered_with": 400,
         }
@@ -389,50 +403,117 @@ def test_http_error_body_never_echoes_the_key(monkeypatch):
     assert "已抹掉的凭据" in str(raised.value), str(raised.value)
 
 
-# ---------------------------------------------------------------- 片1：思考档与信封必须成对
+# ------------------------------------------------- 片1 + 挂账 #48：信封与"实测在写草稿"成对
 
 
-def test_envelope_is_raised_for_thinking_models(monkeypatch):
-    """critic 的 800 装不下它的草稿（实测 reasoning 1452 字）⇒ 抬到下限 2000。"""
+def _reasoning_text_payload(text: str = "ok") -> dict[str, Any]:
+    """正文正常、但响应里带着 reasoning_content——"这个型号在想"的唯一实测证据。"""
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": text, "reasoning_content": "先想一步" * 40},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+    }
+
+
+def _teach_reasoning(monkeypatch, client: OpenAILLM) -> None:
+    """让客户端"见过草稿"：走真实学习路径（回放一次带 reasoning 的响应），不塞布尔。
+
+    判据本身也要被走一遍才算测过——直接设私有字段等于用被测对象的内部状态证明它自己的行为。
+    """
+    install(monkeypatch, _reasoning_text_payload())
+    client.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=10)
+
+
+def test_unobserved_model_keeps_the_role_envelope(monkeypatch):
+    """#48 的核心：`thinking` 留空不等于它在思考。没实测到草稿就不该预付 2× 上限。
+
+    片1 当时的判据写的是"没显式关"，于是在一个从不写 reasoning 的网关上照样把 executor
+    的信封从 2000 抬到 4000。多出来的那部分一个字节都不会被写出来，但它把"这次为什么贵了
+    一倍"变成了没人答得出的问题（2026-10-07 real 对照：completion token 2.5~2.9 倍）。
+    """
     sent = install(monkeypatch, _text_payload())
     _llm(envelope_multiplier=2.0, envelope_floor=2000).complete(
+        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert sent[-1]["max_tokens"] == 2000, "没观察到草稿却抬了信封"
+
+
+def test_observed_reasoning_raises_the_next_call(monkeypatch):
+    """见过一次草稿之后，同型号的下一个请求才配得上大信封。"""
+    client = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    _teach_reasoning(monkeypatch, client)
+    sent = install(monkeypatch, _text_payload())
+    client.complete("你是评审", [{"role": "user", "content": "x"}], max_tokens=800)
+    assert sent[-1]["max_tokens"] == 2000, sent[-1]
+
+
+def test_observed_reasoning_raises_for_larger_roles_too(monkeypatch):
+    """executor 的 2000 翻倍成 4000：实测它的草稿要写 3793~4837 字（2026-10-06 全量）。"""
+    client = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    _teach_reasoning(monkeypatch, client)
+    sent = install(monkeypatch, _text_payload())
+    client.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000)
+    assert sent[-1]["max_tokens"] == 4000, sent[-1]
+
+
+def test_the_signature_is_per_model_not_per_last_response(monkeypatch):
+    """按型号记：A 型号在想，不代表 B 型号在想（同批可能主型号与降级型号一起跑）。"""
+    eager = _llm(model="thinker", envelope_multiplier=2.0, envelope_floor=2000)
+    _teach_reasoning(monkeypatch, eager)
+    sent = install(monkeypatch, _text_payload())
+    _llm(model="plain", envelope_multiplier=2.0, envelope_floor=2000).complete(
+        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
+    )
+    assert sent[-1]["max_tokens"] == 2000, "别的型号见过草稿，不该让这个型号也吃 2×"
+
+
+def test_explicit_enabled_thinking_raises_without_waiting(monkeypatch):
+    """配置要点开 ⇒ 不等观察就抬：用户显式要了思考档，大信封就是它的配套。"""
+    sent = install(monkeypatch, _text_payload())
+    _llm(thinking="enabled", envelope_multiplier=2.0, envelope_floor=2000).complete(
         "你是评审", [{"role": "user", "content": "x"}], max_tokens=800
     )
     assert sent[-1]["max_tokens"] == 2000, sent[-1]
 
 
-def test_envelope_doubling_applies_to_larger_roles(monkeypatch):
-    """executor 的 2000 翻倍成 4000：实测它的草稿要写 3793~4837 字。"""
-    sent = install(monkeypatch, _text_payload())
-    _llm(envelope_multiplier=2.0, envelope_floor=2000).complete(
-        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
-    )
-    assert sent[-1]["max_tokens"] == 4000, sent[-1]
-
-
-def test_envelope_never_shrinks_and_never_crosses_the_cap(monkeypatch):
-    """只在变大的方向走，且不越过封顶：宁可回到角色原值，也不能把某个角色调到比自己还小。"""
-    sent = install(monkeypatch, _text_payload())
-    _llm(envelope_multiplier=2.0, envelope_floor=2000, max_tokens_cap=3000).complete(
-        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
-    )
-    assert sent[-1]["max_tokens"] == 3000, sent[-1]
-
-    sent2 = install(monkeypatch, _text_payload())
-    _llm(envelope_multiplier=0.5, envelope_floor=100).complete(
-        "你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000
-    )
-    assert sent2[-1]["max_tokens"] == 2000, "倍率配小了也不许把角色的信封削薄"
-
-
 def test_disabled_thinking_keeps_the_envelope_untouched(monkeypatch):
-    """关思考就没有草稿要挤 ⇒ 抬信封纯属多花钱。策略必须成对，不许两个旋钮各转各的。"""
+    """关思考就一个字节不改——哪怕这个型号刚刚才被观察到在想（显式配置优先于历史签名）。"""
+    seen = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    _teach_reasoning(monkeypatch, seen)
     sent = install(monkeypatch, _text_payload())
     _llm(thinking="disabled", envelope_multiplier=2.0, envelope_floor=2000).complete(
         "你是评审", [{"role": "user", "content": "x"}], max_tokens=800
     )
     assert sent[-1]["max_tokens"] == 800, sent[-1]
     assert sent[-1]["thinking"] == {"type": "disabled"}, sent[-1]
+
+
+def test_envelope_never_shrinks_and_never_crosses_the_cap(monkeypatch):
+    """只在变大的方向走，且不越过封顶：宁可回到角色原值，也不能把某个角色调到比自己还小。"""
+    client = _llm(envelope_multiplier=2.0, envelope_floor=2000, max_tokens_cap=3000)
+    _teach_reasoning(monkeypatch, client)
+    sent = install(monkeypatch, _text_payload())
+    client.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000)
+    assert sent[-1]["max_tokens"] == 3000, sent[-1]
+
+    quiet = _llm(model="plain2", envelope_multiplier=0.5, envelope_floor=100)
+    sent2 = install(monkeypatch, _text_payload())
+    quiet.complete("你是数据工程师", [{"role": "user", "content": "x"}], max_tokens=2000)
+    assert sent2[-1]["max_tokens"] == 2000, "倍率配小了也不许把角色的信封削薄"
+
+
+def test_observed_signature_is_recorded_per_run(monkeypatch):
+    """信封为什么抬了，得能在本次 run 的产物里回答——`llm_reasoning_models` 就是那一句。"""
+    from agentflow.core.budget import BudgetCounter
+
+    client = _llm(envelope_multiplier=2.0, envelope_floor=2000)
+    client.budget = BudgetCounter(limit=30)
+    _teach_reasoning(monkeypatch, client)
+    assert client.budget.reasoning_models == [client.model], client.budget.reasoning_models
 
 
 def test_pipeline_defaults_pair_the_thinking_tier_with_a_bigger_envelope(tmp_path, monkeypatch):

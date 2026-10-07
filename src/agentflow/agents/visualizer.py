@@ -45,6 +45,17 @@ class VisualizerAgent(BaseAgent):
             "请输出生成图表的纯 Python 代码。"
         )
         last_stderr = ""
+        try:
+            data_path = dataset_scope.primary_path(ctx, task)
+        except dataset_scope.DatasetScopeError as exc:
+            # C-14② 的拒绝是这个任务的，不是整条 run 的：图画不出来就如实说没画，
+            # 让图表异常把已经算完的结果打死是 #22 收过的那类越界。
+            figure = FigureResult(
+                task_id=task_id,
+                chart_type="none",
+                note=f"未画图：本任务声明的表解析不到（{str(exc)[:120]}）",
+            )
+            return self.reply(ctx, "orchestrator", "figure_result", figure.model_dump_json())
         for attempt in range(1, 3):
             try:
                 code = self.complete(
@@ -72,7 +83,7 @@ class VisualizerAgent(BaseAgent):
                 timeout=self._timeout(ctx),
                 env={
                     # 跨表任务的 DATA_PATH 必须是本任务声明的第一张表，否则会画到主表上去
-                    "DATA_PATH": dataset_scope.primary_path(ctx, task),
+                    "DATA_PATH": data_path,
                     "RESULT_PATH": result.get("intermediate_file") or "",
                     "CHART_PATH": str(chart_path),
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),

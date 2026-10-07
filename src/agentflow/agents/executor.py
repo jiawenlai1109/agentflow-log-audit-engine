@@ -79,6 +79,20 @@ class ExecutorAgent(BaseAgent):
                 )
                 break
             code = strip_code_fence(code)
+            try:
+                # 表解析放进 try：C-14② 的 DatasetScopeError 是**这个任务**的事，
+                # 让它从参数构造里逃出去就会打死整条 run——那正是 #22 收过的那类越界。
+                data_path = self._primary_path(ctx, task)
+            except dataset_scope.DatasetScopeError as exc:
+                result = TaskExecutionResult(
+                    task_id=task_id,
+                    status="failed",
+                    error=str(exc)[:400],
+                    error_class=ErrorClass.DATASET_SCOPE,
+                    attempts=attempt,
+                    suggestion="重新声明本任务要读的表（dataset_refs 必须是 Bundle 里存在的表 id）",
+                )
+                break
             outcome, contained = self._execute(
                 ctx,
                 task_id=task_id,
@@ -92,7 +106,7 @@ class ExecutorAgent(BaseAgent):
                 work_dir=work_dir,
                 timeout=timeout_seconds,
                 env={
-                    "DATA_PATH": self._primary_path(ctx, task),
+                    "DATA_PATH": data_path,
                     "ARTIFACTS_DIR": str(ctx.artifacts_dir),
                     **self._dataset_env(ctx, task),
                     **upstream["env"],
@@ -230,6 +244,16 @@ class ExecutorAgent(BaseAgent):
         """mock 模式规则任务：执行规则包自带参考实现（与 verify_code 异构，校验器另算）。"""
         task_id = int(task["task_id"])
         rule = ctx.pack.rule(str(rule_params.get("id", "")))
+        try:
+            data_path = self._primary_path(ctx, task)
+        except dataset_scope.DatasetScopeError as exc:
+            return TaskExecutionResult(
+                task_id=task_id,
+                status="failed",
+                error=str(exc)[:400],
+                error_class=ErrorClass.DATASET_SCOPE,
+                suggestion="重新声明本任务要读的表（dataset_refs 必须是 Bundle 里存在的表 id）",
+            )
         outcome, _ = self._execute(
             ctx,
             task_id=task_id,
@@ -239,7 +263,7 @@ class ExecutorAgent(BaseAgent):
             work_dir=work_dir,
             timeout=self._task_timeout(ctx),
             env={
-                "DATA_PATH": self._primary_path(ctx, task),
+                "DATA_PATH": data_path,
                 "ARTIFACTS_DIR": str(ctx.artifacts_dir),
                 **self._dataset_env(ctx, task),
                 **self._role_env(ctx, rule),

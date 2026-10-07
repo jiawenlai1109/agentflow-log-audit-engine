@@ -646,3 +646,142 @@ def test_notices_reach_the_report(capsys):
     out = capsys.readouterr().out
     assert "只记录的提示" in out and "5.8958" in out, out[-300:]
     assert "门禁判红" not in out, "提示不该借用判红那条通道（与 #13 同一个立场）"
+
+
+# ---------------------------------------------------------------- 缺陷 #46：中文报告里的"非结论数字"
+#
+# 现场（2026-10-07，拿 real 产物只换尺子量出来的三个读数）：
+#   E01 追溯率 0.5385 →（去千分位）0.9091 →（再补 CJK 边界与中文日期）1.0000
+#   E23 追溯率 0.5000 → 1.0000（全靠 CJK 边界那一条）
+# 三处都是**量具的假红**：报告老实抄了数字，却因为写法被判成造数。
+
+
+def test_thousands_separated_number_is_not_split_in_two():
+    """"1,937,509.24" 是一个数，不是 "1" 与 "937" 与 "509.24"（#46 的主体）。"""
+    evidence = make_evidence(report="合计销售额 1,937,509.24 元\n")
+    ratio, unexplained = numbers_traceable(evidence)
+    assert unexplained == [], unexplained
+    assert ratio == 1.0
+
+
+def test_number_glued_to_han_is_still_masked_as_an_ip():
+    """`\b` 在汉字旁边不成立：`立即阻断10.0.0.15` 里的 IP 以前漏挖（real E23 实测）。"""
+    evidence = make_evidence(report="处置优先级：立即阻断10.0.0.15，吊销其全部会话令牌\n")
+    ratio, unexplained = numbers_traceable(evidence)
+    assert unexplained == [], unexplained
+    assert ratio == 1.0
+
+
+def test_cjk_date_is_not_a_conclusion_number():
+    """`2024年1月1日` 是日期不是数据（real E01 的 `2024` 就是这么被判成造数的）。"""
+    evidence = make_evidence(report="输入中仅提供了2024年1月1日的示例记录\n")
+    ratio, unexplained = numbers_traceable(evidence)
+    assert unexplained == [], unexplained
+
+
+def test_masks_do_not_whitewash_a_fabricated_number():
+    """掩码只改"怎么写"，不改"写的是什么"：8,765,432.5 归一之后依然没有出处。"""
+    evidence = make_evidence(report="报告凭空写了 8,765,432.5 元\n")
+    ratio, unexplained = numbers_traceable(evidence)
+    assert "8765432.5" in unexplained, unexplained
+    assert ratio < 1.0
+
+
+def test_comma_in_a_list_is_not_glued_into_one_number():
+    """"1, 234" 与 "12345" 都不该被当成千分位——归一不能造出一个新数。"""
+    evidence = make_evidence(report="命中主体 1, 234 台，编号 12345\n")
+    _ratio, unexplained = numbers_traceable(evidence)
+    assert "1234" not in unexplained and "12345" in unexplained, unexplained
+
+
+# ---------------------------------------------------------------- 缺陷 #47：aggregate 缺键的三种成因要分开说
+
+FINDINGS = PREDICATES["findings"]
+
+
+def _evidence_without_aggregate_key(**overrides):
+    evidence = make_evidence()
+    evaluation = evidence["evaluation"]
+    for result in evaluation["results"].values():
+        result["summary"]["aggregate"] = {}
+    evaluation.update(overrides)
+    return evidence
+
+
+def test_missing_key_with_failed_task_says_so_instead_of_blaming_the_number():
+    """real 全量里 `规则T1命中数=None 期望=0` 那行把三种成因压成一种（#47）。
+
+    任务没跑成时红仍然是红，但话要说成"运行失败"，否则归因链从这一步就断了——
+    读的人会以为数值不符，然后去改门槛。
+    """
+    evidence = _evidence_without_aggregate_key(
+        task_states={"1": "SUCCEEDED", "2": "FAILED", "3": "FAILED"}
+    )
+    passed, detail = FINDINGS(evidence, {"T3": 0}, "gate")
+    assert not passed, "缺键必须照样红：修话术不是放宽门槛"
+    assert "没跑成" in detail and "不是数值不符" in detail, detail
+    assert "None 期望" not in detail, detail
+
+
+def test_missing_key_while_every_rule_spoke_is_a_contract_break():
+    """任务都成功、规则也出过 finding，却没有那一格 ⇒ 这是包与引擎的契约破了。"""
+    evidence = make_evidence()
+    for result in evidence["evaluation"]["results"].values():
+        result["summary"]["aggregate"] = {}
+        result["summary"]["findings"] = [{"rule_id": "R1", "subject": "10.0.0.7", "value": 3}]
+    passed, detail = FINDINGS(evidence, {"R1": 1}, "gate")
+    assert not passed
+    assert "契约破了" in detail, detail
+
+
+def test_zero_hit_rule_still_passes_when_the_key_is_present():
+    """真的 0 命中是结论不是缺数据：键在、值为 0，期望 0 就该绿。"""
+    evidence = make_evidence()
+    for result in evidence["evaluation"]["results"].values():
+        result["summary"]["aggregate"] = {"规则T3命中数": 0}
+    assert FINDINGS(evidence, {"T3": 0}, "gate")[0]
+
+
+def test_value_mismatch_keeps_the_old_wording():
+    """数值不符这一类不许被新话术吞掉：还是报 `键=实际 期望=期望`。"""
+    evidence = make_evidence()
+    for result in evidence["evaluation"]["results"].values():
+        result["summary"]["aggregate"] = {"规则T3命中数": 2}
+    passed, detail = FINDINGS(evidence, {"T3": 1}, "gate")
+    assert not passed and "规则T3命中数=2 期望=1" in detail, detail
+
+
+# ---------------------------------------------------------------- 缺陷 #50：评审这一票的三种状态要分得开
+
+CRITIC = PREDICATES["critic"]
+
+
+def test_none_is_never_read_as_a_pass():
+    """`critic_pass=None` 是"没评"，不是"评了且说没问题"（#13 的立场，此处钉在谓词上）。"""
+    evidence = make_evidence()
+    evidence["evaluation"]["critic_pass"] = None
+    passed, detail = CRITIC(evidence, "pass", "gate")
+    assert not passed and "None" in detail, detail
+
+
+def test_not_ran_is_the_honest_expectation_for_pre_review_terminals():
+    """E07/E09/E25 这类设计内终态走不到评审：期望 must be not_ran，写 pass 就是量具假红。"""
+    evidence = make_evidence()
+    evidence["evaluation"]["critic_pass"] = None
+    assert CRITIC(evidence, "not_ran", "gate")[0]
+
+
+def test_not_ran_goes_red_when_the_review_actually_ran():
+    """反向也要咬：某次改动把这些题推进了评审，就必须有人看见。"""
+    evidence = make_evidence()
+    evidence["evaluation"]["critic_pass"] = True
+    passed, detail = CRITIC(evidence, "not_ran", "gate")
+    assert not passed and "谁改了这个路径" in detail, detail
+
+
+def test_pass_still_catches_a_content_fail():
+    evidence = make_evidence()
+    evidence["evaluation"]["critic_pass"] = False
+    assert not CRITIC(evidence, "pass", "gate")[0]
+    evidence["evaluation"]["critic_pass"] = True
+    assert CRITIC(evidence, "pass", "gate")[0]

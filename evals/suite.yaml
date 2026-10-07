@@ -6,6 +6,14 @@
 #   gap  —— 已知该模式做不到的语义期望；红不阻塞，**绿了报 XPASS 逼人重新分类**
 # 这样 mock 的能力边界是"记在案上"而不是"假装通过"。
 #
+# 缺陷 #50（2026-10-07 补齐 `critic:` 断言的来由）：通用报告模板渲染的章节是「结论与建议」，
+# 而 Reporter 声明给评审器的是「结论建议」——Critic 于是每次都报"缺少章节"，mock 实测 17 题
+# critic_pass 长期为假红，并按 max_review_rounds 白烧 2 轮回环（每题 8→5 次调用，real 同形）。
+# 修的是"声明与模板对齐"，下面各 gate 里新增的 `critic:` 钉的是"这一票投没投、投成什么"：
+#   pass     —— 出了报告的题：评审必须跑完且不判红
+#   not_ran  —— 设计内终态（E07/E09 澄清降级、E25 缺表拒绝出结论）本来走不到评审。
+#               给它们写 pass 就是量具自己的假红；完全不写则等于允许某次改动悄悄把它们推进评审。
+#
 # golden 段全部由人独立推导（pandas 表达式随条目标注），可用
 #   python scripts/run_eval.py --check-golden
 # 重算核对：数据文件变了而 suite 没改 → 直接报漂移，不静默比错答案。
@@ -129,6 +137,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         aggregate: { task: 1, expect: { 合计_销售额: 1937509.24 } }
         report_contains: ["1937509.24"]
         verifier: pass_all
@@ -153,6 +162,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         rows: { task: 1, expect: 2000 }
         report_contains: ["2000"]
         verifier: pass_all
@@ -176,6 +186,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         chart: some
         verifier: pass_all
         llm_calls_max: 12
@@ -204,6 +215,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         chart: some
         verifier: pass_all
         # 实测：Top 类别与其销售额 mock 能给（原记为"做不到"，由 XPASS 纠正）
@@ -226,6 +238,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         verifier: pass_all
         report_contains: ["华南"]          # 排名首位类别名 mock 能给
         # 追溯率升回 gate（2026-09-28）：数字池此前漏掉样例行里的数值单元格，
@@ -248,6 +261,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         verifier: pass_all
       gap:
         # mock 不做条件筛选（实测返回全部 5 个类别、行数为全表）
@@ -268,6 +282,7 @@ cases:
         # mock 把派生列"利润率"当真实列 → MISSING_COLUMN → 路由后降级。
         # 诚实失败（degraded + 澄清）是合法终态；把数字编出来才算破。
         status: [success, partial, degraded]
+        critic: not_ran   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 降级报告的正文里不许出现环境布局：同一批文本还被追溯率当成"没有出处的数字"
         report_excludes: ["家居", ".venv", "site-packages"]
       gap:
@@ -287,6 +302,7 @@ cases:
     mock:
       gate:
         status: [success, partial]
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # mock 的窗口任务不产出 aggregate，因此"零校验"是当前事实；
         # 一旦它能产出，gap 里的 pass_all 会 XPASS 把这条顶上来
         verifier: skipped_ok
@@ -308,6 +324,7 @@ cases:
     mock:
       gate:
         status: degraded
+        critic: not_ran   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         degraded_reason: critical_task_failed
         clarify: true
         replan: { max: 1 }
@@ -329,6 +346,7 @@ cases:
     mock:
       gate:
         status: [success, partial, degraded]   # 不许崩，但 mock 未过滤，状态不算回归
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
       gap:
         # 真值 0 行：应给出"空结果 + 解释"，而不是把全表数字当答案
         rows: { expect_any: 0 }
@@ -350,6 +368,7 @@ cases:
     mock:
       gate:
         status: [success, partial]
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 实测：会话回忆能把第 1 轮数字带进续轮（原记为"只有 real 生效"，由 XPASS 纠正）
         report_contains: ["1937509.24"]
     real:
@@ -366,6 +385,7 @@ cases:
     mock:
       gate:
         status: [success, partial]
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
       gap:
         report_contains: ["华东", "75684.86"]
     real:
@@ -380,6 +400,7 @@ cases:
     mock:
       gate:
         status: [success, partial]
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
       gap:
         report_contains: ["1657348.3", "1715"]
     real:
@@ -428,6 +449,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         tasks_min: 2
         verifier: pass_all
       gap:
@@ -479,6 +501,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         aggregate: { task: 1, expect: { 合计_销售额: 1937509.24 } }
       gap: {}
     real:
@@ -495,6 +518,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 预检必须放行这个跨表任务（维表键唯一 ⇒ 期望 46 行 = 订单行数）
         join_preflight: { ok_min: 1, rejected: [] }
         aggregate: { task: 3, expect: { join_行数: 46, 合计_事件数: 10010.0 } }
@@ -516,6 +540,7 @@ cases:
       gate:
         # 两侧同键各 12 行 ⇒ 期望 144 行 = baseline 12 的 12 倍 → 必须在派发前被拒
         status: partial
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         join_preflight:
           rejected: [{ reason: expansion, expected_rows: 144 }]
         tasks_min: 1               # 拦下坏 join 不该把整条 run 打死
@@ -533,6 +558,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         aggregate: { task: 1, expect: { 合计_事件数: 10010.0 } }
         # runbook.md 里的示例数字：出现在报告里就意味着"文档进了数字来源"（违反 I1）
         report_excludes: ["987654.31", "4242"]
@@ -665,6 +691,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 断言与 E23 逐字相同：唯一的差别就是文件顺序，所以这里红了只可能是"按 id 寻址"漏了
         subjects:
           rules:
@@ -694,6 +721,7 @@ cases:
         # 立场：缺表时**拒绝出结论**并点名缺哪一列，而不是"能算几条算几条"。
         # 安全报告静默少一条加权规则，比一份没有结论的降级报告危险得多。
         status: degraded
+        critic: not_ran   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 分类也要能咬：只断 status 的话，缺列退化成 run_error 仍然全绿
         degraded_reason: pack_contract
         # 自检在 `finally` 里跑，降级运行也该有记录：两道闸门（契约拒绝 + 表级授权）同时可见
@@ -719,6 +747,7 @@ cases:
     mock:
       gate:
         status: success
+        critic: pass   # 评审这一票的状态（#50 补齐的断言；见文件头那一段）
         # 两只 skill 都装上，且正文确实进了它点名的那个角色的 prompt（只查"装上"是假的）
         skills_active:
           installed: [chart_selection, cross_table_triage]
@@ -776,3 +805,40 @@ cases:
         status: success
         external_evidence: { server: soc_intel, tool: query, rows: 5 }
         report_excludes: ["4242"]
+
+  # ---------------------------------------------------------------- C-14：表解析留痕进评测层
+  - id: E28
+    type: 多源分诊-实际递给沙箱的是哪张表
+    question: 生产域主机的异常告警有哪些？哪些需要立刻处置
+    data: sigma_attack
+    pack: sigma_triage
+    added_at: "2026-10-07"
+    # 三条盲区里能用现成数据走到的那两条（①忽略 primary_ref、③按位置贴标签）。
+    # ②"声明的表解析不到"在现成数据上到不了——缺表时包契约在生成任务之前就判死了
+    # （E25 那条路），所以那半边的回归放在 tests/test_table_resolution.py 的单元层，
+    # 这里不假装有题。
+    # 期望值来自 2026-10-07 实测产物：T1 单角色→primary_ref_only(auth.csv)，
+    # T3 join→primary_ref(auth.csv)，T4→primary_ref(edr.csv)。
+    mock:
+      gate:
+        status: success
+        table_resolution:
+          expect:
+            T1: { table_file: auth.csv, via: primary_ref_only }
+            T3: { table_file: auth.csv, via: primary_ref }
+            T4: { table_file: edr.csv, via: primary_ref }
+          # 角色解析失败后静默退回 Bundle 主表，等于"用没声明的表算出一个正常结论"
+          forbid_via: [bundle_default]
+        # 报告头的规则号与账本必须同源（抓"数字对、指代错"）
+        rule_rollup: {}
+        verifier: pass_all
+        critic: pass
+        numbers_traceable_min: 0.9
+      gap: {}
+    real:
+      gate:
+        table_resolution:
+          expect:
+            T4: { table_file: edr.csv }
+          forbid_via: [bundle_default]
+        rule_rollup: {}

@@ -14,6 +14,8 @@ class ErrorClass(str, Enum):
     CODE_ERROR = "CODE_ERROR"
     TIMEOUT = "TIMEOUT"
     LLM_ERROR = "LLM_ERROR"
+    # C-14②：任务声明的表在 Bundle 里一张都解析不到——拒绝，不退回主表
+    DATASET_SCOPE = "DATASET_SCOPE"
     UNKNOWN = "UNKNOWN"
 
 

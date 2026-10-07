@@ -180,7 +180,10 @@ class ReporterAgent(BaseAgent):
         result = ReportResult(
             report_path=str(report_path),
             degraded=False,
-            sections=["总体概况", "数据详情", "趋势分析", "结论建议"],
+            # 声明必须与模板同一措辞：模板渲染的是"结论与建议"，这里写"结论建议"
+            # 就会让 Critic 每次都报"缺少章节"——那是量具的假红，不是报告的缺陷。
+            # （E03/E05 的 critic_pass=false 一直就是这么来的，real 全量把它抄成了真红。）
+            sections=["总体概况", "数据详情", "趋势分析", "结论与建议"],
             time_base_note=time_base_note,
             summary=" ".join(narrative.split())[:200],
         )
@@ -309,13 +312,13 @@ class ReporterAgent(BaseAgent):
         这里刻意**不按 task_id 位置对号入座**：角色解析失败的规则根本不生成任务，
         任务号与规则号于是错位，用 `pack.rules[task_id - 1]` 会把 T4 的命中数标成 T3。
         报告标签说错话和被修掉的"24 条认证日志"是同一类缺陷：数字对、指代错。
-        """
-        stats = {rule.id: 0 for rule in pack.rules}
-        for finding in findings:
-            rid = str(finding.get("rule_id", ""))
-            stats[rid] = stats.get(rid, 0) + 1
-        stats_text = "，".join(f"{rid}={count}" for rid, count in stats.items())
 
+        同一族的另一半（缺陷 #49，2026-10-07 real E23 实测）：没跑成的规则在这行里
+        长成 `T3=0`，而下一行又说"T3 结论缺失，不得当作无风险"——同一份报告里
+        自相矛盾，且 SOC 值班读到的就是"这条规则查过了，没问题"。
+        所以未出结论的规则在这一行里印 `未完成`，不印 0：0 是一个**结论**，
+        它必须由跑过的那道工序给出。
+        """
         # "这条规则留下过自己的输出吗"——aggregate 键名或 finding 的 rule_id 任一命中即算出过结论
         spoke: set[str] = set()
         for entry in results.values():
@@ -328,6 +331,14 @@ class ReporterAgent(BaseAgent):
                 if isinstance(finding, dict):
                     spoke.add(str(finding.get("rule_id", "")))
         silent_rules = [rule.id for rule in pack.rules if rule.id not in spoke]
+
+        stats = {rule.id: 0 for rule in pack.rules}
+        for finding in findings:
+            rid = str(finding.get("rule_id", ""))
+            stats[rid] = stats.get(rid, 0) + 1
+        stats_text = "，".join(
+            f"{rid}={count}" if rid in spoke else f"{rid}=未完成" for rid, count in stats.items()
+        )
 
         agg_lines = [
             "，".join(f"{key}={value}" for key, value in agg.items())

@@ -33,6 +33,33 @@ class LLMTransportError(LLMError):
     """连不上 / 超时 / 连接被断。换个型号可能真的有用（上游不同），这与鉴权失败性质相反。"""
 
 
+# 实测签名：哪些型号在本次进程里真的交回过 `reasoning_content`。
+# 信封要不要放大只看这个，不看配置字符串（挂账 #48）：`thinking` 留空 = 不发这个字段，
+# 而片1 的判据当时写的是"没显式关"，于是在一个从不思考的网关上也会把 max_tokens 翻倍——
+# 那是纯浪费。反过来，本项目的实测网关（2026-10-07 real 批次）在 `thinking=null` 下照样
+# 写 8790 字草稿，所以真判据只能是"它到底写没写草稿"，不是"我配了什么"。
+# 进程级共享是有意的：跑批前的凭据 ping 已经打过一次真实调用，批次从第一次业务调用起
+# 就带着这个知识，不需要先白卷一次才学会。键是型号名，跨线程只读不写坏请求体。
+_REASONING_SEEN: set[str] = set()
+_REASONING_LOCK = threading.Lock()
+
+
+def note_reasoning_signature(model: str) -> None:
+    with _REASONING_LOCK:
+        _REASONING_SEEN.add(str(model))
+
+
+def reasoning_signatures() -> list[str]:
+    with _REASONING_LOCK:
+        return sorted(_REASONING_SEEN)
+
+
+def clear_reasoning_signatures() -> None:
+    """测试隔离用：签名是进程级的，不清就会串到下一个用例。"""
+    with _REASONING_LOCK:
+        _REASONING_SEEN.clear()
+
+
 class EmptyContentError(LLMError):
     """正文为空（`content` 不是字符串）的专用错误，带一份可比的结构化细节。
 
@@ -196,7 +223,8 @@ class OpenAILLM(BaseLLM):
         # 草稿写到封顶时正文就是 null（2026-10-06 real 全量实测：14 次白卷，每一次
         # reasoning 字数都大于当时的 max_tokens）。抬上限本身不加钱——计费按实际写出的
         # token 算，多出来的只是终于被写出来的正文；白卷那一次照样付了草稿钱却什么都没拿到。
-        # 倍率与下限只对"没关思考"的调用生效，关了思考没有草稿可挤。
+        # 倍率与下限只对"实测在写草稿"的调用生效（见 `_envelope`）：关思考没有草稿可挤，
+        # 没观察到草稿也不该预付 2× 上限。
         self.envelope_multiplier = float(envelope_multiplier)
         self.envelope_floor = int(envelope_floor)
         # 降级候选：**默认空 = 完全不启用**（多打一次真实调用就是要多花一次钱，
@@ -251,13 +279,29 @@ class OpenAILLM(BaseLLM):
             return exc.code in self.RETRYABLE_CODES
         return isinstance(exc, LLMTransportError)
 
-    def _envelope(self, max_tokens: int) -> int:
-        """按成对策略放大自然语言的请求体上限；关思考或没配策略时原样返回（一字节不改）。"""
-        if self.thinking == "disabled" or self.envelope_multiplier <= 1.0:
-            return max_tokens
+    def _envelope(self, max_tokens: int, model: str) -> tuple[int, str]:
+        """放大自然语言的请求体上限，判据是**实测签名**不是配置字符串。
+
+        返回 `(上限, 依据)`，依据只有四种，落进留痕时要能点名：
+        `policy_off`（没配策略）/ `thinking_disabled`（显式关思考，没有草稿可挤）/
+        `thinking_enabled`（配置要点开）/ `observed_reasoning`（这个型号在本进程里
+        真的交回过 reasoning）/ `unobserved`（没观察到货，一字节不改）。
+        """
+        if self.envelope_multiplier <= 1.0:
+            return max_tokens, "policy_off"
+        if self.thinking == "disabled":
+            return max_tokens, "thinking_disabled"
+        if self.thinking == "enabled":
+            basis = "thinking_enabled"
+        else:
+            with _REASONING_LOCK:
+                observed = model in _REASONING_SEEN
+            if not observed:
+                return max_tokens, "unobserved"
+            basis = "observed_reasoning"
         raised = max(int(max_tokens * self.envelope_multiplier), self.envelope_floor)
         # 只在"变大"的方向走，且不许越过封顶：宁可保住角色原值，也不把某个角色调到比自己还小
-        return max(max_tokens, min(raised, self.max_tokens_cap))
+        return max(max_tokens, min(raised, self.max_tokens_cap)), basis
 
     def _complete_once(
         self,
@@ -267,7 +311,7 @@ class OpenAILLM(BaseLLM):
         temperature: float,
         max_tokens: int,
     ) -> str:
-        max_tokens = self._envelope(max_tokens)
+        max_tokens, envelope_basis = self._envelope(max_tokens, model)
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}, *messages],
@@ -277,7 +321,9 @@ class OpenAILLM(BaseLLM):
         if self.thinking:
             payload["thinking"] = {"type": self.thinking}
         data = self._request(payload)
-        text, empty = self._text_of(data, max_tokens=max_tokens, model=model)
+        text, empty = self._text_of(
+            data, max_tokens=max_tokens, model=model, envelope_basis=envelope_basis
+        )
         if text is not None:
             self._note_model(model)
             return text
@@ -286,7 +332,9 @@ class OpenAILLM(BaseLLM):
         retry_at = self._retry_target(max_tokens, empty)
         if retry_at:
             data = self._request({**payload, "max_tokens": retry_at})
-            text, second = self._text_of(data, max_tokens=retry_at, model=model)
+            text, second = self._text_of(
+                data, max_tokens=retry_at, model=model, envelope_basis=envelope_basis
+            )
             if text is not None:
                 self._note({**empty, "recovered_with": retry_at})
                 self._note_model(model)
@@ -371,7 +419,12 @@ class OpenAILLM(BaseLLM):
         return data
 
     def _text_of(
-        self, data: dict[str, Any], *, max_tokens: int, model: str | None = None
+        self,
+        data: dict[str, Any],
+        *,
+        max_tokens: int,
+        model: str | None = None,
+        envelope_basis: str = "unknown",
     ) -> tuple[str | None, dict[str, Any]]:
         """取正文；取不到时返回 `(None, 形状细节)`——细节里没有正文，也没有凭据。"""
         choices = data.get("choices")
@@ -381,6 +434,14 @@ class OpenAILLM(BaseLLM):
         content = message.get("content")
         reasoning = message.get("reasoning_content") or ""
         finish = choices[0].get("finish_reason")
+        if reasoning:
+            # 签名在这里记，正文有没有都要记：下一次调用要不要放大信封就靠它（#48）。
+            # 本进程记一份（跨 run 复用，省掉第一次白卷），本次 run 的预算对象也记一份
+            # （`reasoning_signatures()` 是进程级的，直接印它会串到别的题上）。
+            seen = str(model or self.model)
+            note_reasoning_signature(seen)
+            if self.budget is not None:
+                self.budget.note_reasoning_model(seen)
         if isinstance(content, str) and content.strip():
             return content, {}
         # 空白正文有两种来源，只按字段值一刀切会把它们混成一类（2026-10-06 实测）：
@@ -398,6 +459,7 @@ class OpenAILLM(BaseLLM):
             "reasoning_chars": len(reasoning),
             "max_tokens": max_tokens,
             "thinking": self.thinking,
+            "envelope_basis": envelope_basis,
             "content_kind": "null" if content is None else "blank",
         }
 
@@ -416,9 +478,13 @@ class OpenAILLM(BaseLLM):
             self.budget.note_empty_content(empty)
 
     def _note_model(self, model: str) -> None:
-        """记下"这次真的服务过"的型号：跨批次比较时，先排除换了型号这个变量。"""
-        if self.budget is not None:
-            self.budget.note_model_used(model)
+        """记下"这次真的服务过"的型号与**是哪个角色用到它**：跨批次比较时，先排除
+        换了型号这个变量（I3）。降级链与按角色分档同时开着时，只有一个扁平集合就
+        说不出"executor 用的是主型号还是替身"（挂账 #44）。
+        """
+        if self.budget is None:
+            return
+        self.budget.note_model_used(model, getattr(self.agent_local, "agent", None))
 
     def _note_fallback(self, from_model: str, to_model: str, exc: Exception, tried: list[str]) -> None:
         """降级必留因：从哪个型号、到哪个型号、为什么、第几次。不记正文也不记凭据。"""

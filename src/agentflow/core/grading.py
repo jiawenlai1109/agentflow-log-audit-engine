@@ -19,12 +19,24 @@ from typing import Any, Callable
 from agentflow.core.prompts import prompt_hashes, prompt_version
 
 # 报告里允许出现的"非结论数字"：时间戳、日期、行号等运行元数据
-_META_NUMBER_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}:\d{2}:\d{2}\b")
+# 三条掩码都不写 `\b`：Python 的 `\w` 含汉字，"阻断10.0.0.15" 里 断 与 1 之间不构成词边界，
+# IP 因此漏挖、`0.15` 被当成一个没人背书的数（2026-10-07 real E23 实测追溯率 0.5000）。
+# 中文报告里数字的邻居就是汉字，边界只能按"前后是不是数字/点/横线"判。
+# `2024年1月1日` 这种中文日期同样不是结论数字（real E01 的 `2024` 就是这么被判成造数的）。
+_META_NUMBER_RE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)|(?<!\d)\d{2}:\d{2}:\d{2}(?!\d)|(?<!\d)\d{4}年(?:\d{1,2}月)?(?:\d{1,2}日)?"
+)
 # 点分四段（IPv4 等）不是"数字"：不先挖掉会把 198.51.100.23 拆成三个假未追溯数
-_DOTTED_QUAD_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_DOTTED_QUAD_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 # 标识符里的数字段同样不构成结论：`sha256` 的 256、`utf-8` 的 8、`PBKDF2` 的 2 都是名字的一部分。
 # 前后紧贴字母/数字/下划线的一律不算——否则模板里写一句"见 sources/ 的 sha256"就永久压低追溯率。
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])-?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
+# 千分位分隔符（缺陷 #46）：报告把 1234 写成 "1,234" 时，上面那条会拆成 1 与 234，
+# 于是"老实抄了账本数字"被判成造数（2026-10-07 real 全量：E01 单去逗号 0.5385→0.8182）。
+# 判据只认"逗号后面正好三个数字且不再跟数字"，不动列表里的 "1, 234"、也不动 12345。
+# 与 core/report_lint.scan_numbers 同一口径：量具与运行时必须是同一把尺，否则
+# 运行侧放行而评分侧判红，报出来的错与真因毫无关系。
+_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 
 TIER_GATE = "gate"          # 破了就红
 TIER_KNOWN_GAP = "known_gap"  # 已知该模式做不到：期望红，红不算回归；绿则报 XPASS 提醒重新分类
@@ -252,17 +264,63 @@ def _p_verifier(evidence, params, mode):
 
 
 def _p_findings(evidence, params, mode):
-    """场景包命中数：params = {R1: 1, R2: 1, ...}，按 aggregate 的"规则Rx命中数"核对。"""
+    """场景包命中数：params = {R1: 1, R2: 1, ...}，按 aggregate 的"规则Rx命中数"核对。
+
+    缺键与数值不符**不是一种错**，但 2026-10-07 之前它们印成同一句话
+    （real 全量：`规则T1命中数=None 期望=0`）。那行把三种成因压成一种，归因只能靠猜：
+
+    - 这条规则的任务根本没跑成（白卷 / 沙箱失败）——红，但原因是运行失败；
+    - 任务都成功了却没有这一格——红，原因是包与引擎的 aggregate 契约破了（#47）；
+    - 有值且对不上——红，这才是"数值不符"。
+
+    这里只把**话说清楚**，门槛一格没放：三种照样全红。把 `None` 当成 0 来"修"这个
+    缺陷才是真正不该做的事——那会把"没跑成"洗成"跑了说没问题"。
+    """
     merged: dict[str, Any] = {}
     for values in _aggregates(evidence).values():
         merged.update(values)
+    evaluation = evidence.get("evaluation") or {}
+    states = evaluation.get("task_states") or {}
+    unfinished = sorted(
+        str(tid) for tid, state in states.items() if str(state).upper() not in ("SUCCEEDED", "SUCCESS")
+    )
     problems = []
     for rule, wanted in (params or {}).items():
         key = f"规则{rule}命中数"
         actual = merged.get(key)
-        if actual is None or not _close(actual, wanted, 0):
+        if actual is None:
+            if _rule_spoke(evidence, rule):
+                problems.append(f"契约破了：{rule} 出过结论，aggregate 里却没有 {key} 这一格")
+            elif unfinished:
+                problems.append(
+                    f"{rule} 未出结论（{len(unfinished)} 个任务没跑成：task {','.join(unfinished)}），"
+                    f"期望={wanted}——这是运行失败，不是数值不符"
+                )
+            else:
+                problems.append(
+                    f"{rule} 未出结论且任务都报成功（aggregate 无 {key}，期望={wanted}）——"
+                    "要么这条规则根本没被执行，要么它没按包的契约报数"
+                )
+            continue
+        if not _close(actual, wanted, 0):
             problems.append(f"{key}={actual} 期望={wanted}")
     return not problems, ("命中数核对 " + ("；".join(problems) if problems else "全部一致"))
+
+
+def _rule_spoke(evidence: dict[str, Any], rule: str) -> bool:
+    """这条规则留下过自己的输出吗——按 finding 的 rule_id 判，不按 task_id 位置判。
+
+    按位置对号入座是本项目修过的那类缺陷（任务号与规则号在角色解析失败时会错位），
+    所以这里只认产物里写着 `rule_id == R` 的证据。
+    """
+    for _tid, summary in _iter_summaries(evidence):
+        for finding in summary.get("findings") or []:
+            if isinstance(finding, dict) and str(finding.get("rule_id")) == str(rule):
+                return True
+        for row in summary.get("head") or []:
+            if isinstance(row, dict) and str(row.get("rule_id")) == str(rule):
+                return True
+    return False
 
 
 def _p_subjects(evidence, params, mode):
@@ -346,9 +404,23 @@ def _p_chart(evidence, params, mode):
 
 
 def _p_critic(evidence, params, mode):
+    """评审内容这一票：`pass` / `fail` / `not_ran` / `any` 四种期望。
+
+    `not_ran`（缺陷 #50 的三题现场）：澄清降级与"缺表就拒绝出结论"这些**设计内终态**
+    根本走不到评审，`critic_pass` 是 `None`。给它们写 `pass` 会把量具自己变成假红——
+    而写"不断言"又等于允许某次改动悄悄让这些题跑进评审。三态分开说，才有得可回归。
+
+    与 #13 同一立场：`None`（没评）永远不许被读成 `pass`（评了且说没问题）。
+    """
     actual = (evidence["evaluation"] or {}).get("critic_pass")
     if params == "any":
         return True, f"critic_pass={actual}"
+    if params == "not_ran":
+        ran = actual is not None
+        return not ran, (
+            f"critic_pass={actual} 期望=not_ran（这一题的设计内终态走不到评审）"
+            + ("，但评审真被跑起来了——谁改了这个路径？" if ran else "")
+        )
     return bool(actual) is bool(params == "pass"), f"critic_pass={actual} 期望={params}"
 
 
@@ -362,6 +434,90 @@ def review_state(evaluation: dict[str, Any] | None) -> str:
     if not evaluation.get("review_ran"):
         return "skipped"
     return "unavailable" if evaluation.get("review_infra_error") else "clean"
+
+
+def _p_table_resolution(evidence, params, mode):
+    """C-14：断言"实际递给沙箱的是哪张表"，而不是"任务声明了哪些表"。
+
+    以前评测层只看得到 `dataset_refs`（声明），解析结果不在产物里——于是两条路完全隐身：
+    ① 声明了 `primary_ref` 却被 refs 的顺序盖掉（三源场景里规则跑在资产台账上）；
+    ② 角色解析失败后静默退回 Bundle 主表（缺表被洗成"用别的表算出来了"）。
+
+    params 形状：
+        expect:      {规则号: {table_file / via / table_id}}   # 经 plan 的 code_hint 对到任务
+        forbid_via:  [bundle_default, ...]                     # 这些来路一律算破
+    """
+    params = params or {}
+    resolutions = (evidence["evaluation"] or {}).get("table_resolutions") or {}
+    if not resolutions:
+        return False, "产物里没有 table_resolutions（引擎的表解析留痕没接上线，C-14 的前提就不成立）"
+    by_rule = _rule_to_task(evidence)
+    problems = []
+    for rule, want in (params.get("expect") or {}).items():
+        task_id = by_rule.get(str(rule))
+        record = resolutions.get(str(task_id))
+        if record is None:
+            problems.append(f"{rule}（task {task_id}）没有表解析留痕")
+            continue
+        for field, expected in (want or {}).items():
+            actual = record.get(field)
+            if str(actual) != str(expected):
+                problems.append(f"{rule}.{field}={actual} 期望={expected}")
+    for via in params.get("forbid_via") or []:
+        hit = [tid for tid, record in resolutions.items() if record.get("via") == via]
+        if hit:
+            problems.append(f"via={via} 出现在 task {','.join(sorted(hit))}（这个来路被禁止）")
+    return not problems, ("表解析 " + ("；".join(problems) if problems else "全部按声明解析"))
+
+
+def _rule_to_task(evidence) -> dict[str, str]:
+    """规则号 → 任务号，按 plan 里的 `code_hint=rule_pack:Rx` 认，不按位置猜。
+
+    按 task_id 位置对号入座就是 C-14③ 那类缺陷：角色解析失败的规则不生成任务，
+    任务号与规则号当场错位，`pack.rules[task_id - 1]` 会把 T4 标成 T3。
+    """
+    mapping: dict[str, str] = {}
+    for task in (evidence.get("plan") or {}).get("tasks") or []:
+        hint = str(task.get("code_hint") or "")
+        if hint.startswith("rule_pack:"):
+            mapping[hint.split(":", 1)[1]] = str(task.get("task_id"))
+    return mapping
+
+
+def _p_rule_rollup(evidence, params, mode):
+    """C-14③：报告头"命中统计"里的每个 `Rx=n` 必须与账本 `规则Rx命中数` 同源。
+
+    这一条抓的是"数字对、指代错"：值从 T4 的 aggregate 抄来、标签写成 T3，追溯率一分不掉
+    （两个数都在同一本账里），但报告说错了主机。params = {pack: 规则包名}（可省）。
+    """
+    report = evidence["report"] or ""
+    counts = dict(re.findall(r"\b([A-Z]+\d+)\s*=\s*(\d+)(?!\d)", _report_header(report)))
+    ledger: dict[str, Any] = {}
+    for _tid, summary in _iter_summaries(evidence):
+        for key, value in (summary.get("aggregate") or {}).items():
+            match = re.match(r"^规则([A-Z]+\d+)命中数$", str(key))
+            if match:
+                ledger[match.group(1)] = value
+    if not ledger:
+        return False, "账本里没有任何 `规则Rx命中数` 键，报告头却可能有命中统计（无从核对）"
+    problems = []
+    for rule, printed in sorted(counts.items()):
+        if rule not in ledger:
+            if printed != "0":
+                problems.append(f"报告头印了 {rule}={printed}，账本里没有这条规则的命中数")
+            continue
+        if not _close(float(printed), float(ledger[rule]), 0):
+            problems.append(f"{rule}: 报告头={printed} 账本={ledger[rule]}")
+    for rule, value in sorted(ledger.items()):
+        if rule not in counts:
+            problems.append(f"账本有 {rule}命中数={value}，报告头却没报这一条")
+    return not problems, ("命中统计同源 " + ("；".join(problems) if problems else f"{len(ledger)} 条规则逐一相等"))
+
+
+def _report_header(report: str) -> str:
+    """报告第一个 `## ` 之前的部分（命中统计与免责行都写在头部引用块里）。"""
+    head = report.split("## ")[0]
+    return head if len(head) < 20000 else head[:20000]
 
 
 def _p_review(evidence, params, mode):
@@ -833,6 +989,8 @@ PREDICATES: dict[str, Callable[[Any, Any, str], tuple[bool, str]]] = {
     "replan": _p_replan,
     "clarify": _p_clarify,
     "join_preflight": _p_join_preflight,
+    "table_resolution": _p_table_resolution,
+    "rule_rollup": _p_rule_rollup,
     "table_denied": _p_table_denied,
     "report_layers": _p_report_layers,
     "fact_triples": _p_fact_triples,
@@ -863,6 +1021,7 @@ def numbers_traceable(evidence: dict[str, Any]) -> tuple[float, list[str]]:
     cleaned = _DOTTED_QUAD_RE.sub(" ", report)
     for token in _META_NUMBER_RE.findall(cleaned):
         cleaned = cleaned.replace(token, " ")
+    cleaned = _THOUSANDS_RE.sub("", cleaned)
     tokens = [t for t in _NUMBER_RE.findall(cleaned) if _is_claim(t)]
     unexplained = [t for t in tokens if not any(_close(float(t), known, 0.01) for known in pool)]
     total = max(1, len(tokens))

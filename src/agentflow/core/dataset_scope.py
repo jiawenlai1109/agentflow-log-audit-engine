@@ -103,16 +103,72 @@ def primary_path(ctx: Any, task: dict[str, Any]) -> str:
 
     这一条是"授权真的生效"的关键：prompt 与 `DATA_PATH_<id>` 都收窄了，但若 `DATA_PATH`
     仍递未声明的主表，等于放行只在文档上成立。
+
+    C-14 的两处修正（都在这一函数里，因为口径只该有一处）：
+
+    ① **声明了 `primary_ref` 就按它选主表**。以前 refs 的*顺序*赢过声明，三源场景下
+       "把 auth.csv 当主表"这句声明会被 t1=assets 盖掉，规则在错的数据上跑出空结果，
+       而 status 照样 success。
+    ② **解析不到不许静默退回 Bundle 主表**。声明了两张以上却一张都不在 Bundle 里，
+       那是计划错了；让它去读主表等于把"缺表"洗成"用别的表算出来了"——报错，
+       由调用方收容成单任务失败（#22 的立场：不作废整条 run）。没有声明的任务照旧走
+       主表——这是本模块写死的单表策略，不改。
+    ③ 每次解析都留痕（`ctx.table_resolutions` + transcript 事件 `table_resolved`），
+       评测层才看得见"实际递给沙箱的是哪张表"。只记表 id 与文件名，**不记绝对路径**（#15）。
     """
     tables = task_tables(ctx, task)
-    if tables:
-        return str(tables[0].path)
     ref = str(task.get("primary_ref") or "")
+    if tables:
+        chosen = next((table for table in tables if str(table.id) == ref), None)
+        _note(ctx, task, chosen or tables[0], "primary_ref" if chosen else "declared_order")
+        return str((chosen or tables[0]).path)
     if ref:
         for table in getattr(getattr(ctx, "bundle", None), "tables", []) or []:
             if str(table.id) == ref:
+                _note(ctx, task, table, "primary_ref_only")
                 return str(table.path)
+    declared = scope_refs(task)
+    if declared:
+        known = sorted(
+            str(table.id) for table in (getattr(getattr(ctx, "bundle", None), "tables", []) or [])
+        )
+        raise DatasetScopeError(
+            f"任务 {task.get('task_id')} 声明的表 {declared} 一张都不在 Bundle 里"
+            f"（可用表：{known}）。不能退回 Bundle 主表——那等于用没声明的表算出一个看着很正常的结论。"
+        )
+    fallback = getattr(getattr(ctx, "bundle", None), "tables", []) or []
+    _note(ctx, task, fallback[0] if fallback else None, "bundle_default")
     return str(ctx.data_path)
+
+
+class DatasetScopeError(RuntimeError):
+    """声明的表范围无法满足（C-14②）。错误名原样进 `error_class`，路由按类型不按文案。"""
+
+
+def _note(ctx: Any, task: dict[str, Any], table: Any, via: str) -> None:
+    """解析结果落进 ctx 与 transcript——"实际递了哪张表"从此可断言、可回归。"""
+    record = {
+        "task_id": task.get("task_id"),
+        "declared_refs": declared_refs(task),
+        "primary_ref": str(task.get("primary_ref") or ""),
+        "via": via,
+        "table_id": str(table.id) if table is not None else None,
+        "table_file": getattr(table, "source_file", None) if table is not None else None,
+    }
+    resolutions = getattr(ctx, "table_resolutions", None)
+    if isinstance(resolutions, dict):
+        # 同一任务会被 env 组装问多次：留最后一次，并按 task_id 归位（不按调用顺序）
+        resolutions[str(record["task_id"])] = record
+    transcript = getattr(ctx, "transcript", None)
+    if transcript is not None:
+        key = (str(record["task_id"]), via, record["table_id"])
+        seen = getattr(ctx, "_table_resolution_events", None)
+        if seen is None:
+            seen = set()
+            setattr(ctx, "_table_resolution_events", seen)
+        if key not in seen:
+            seen.add(key)
+            transcript.write({"event": "table_resolved", **record})
 
 
 def column_scope(ctx: Any, task: dict[str, Any]) -> list[str]:

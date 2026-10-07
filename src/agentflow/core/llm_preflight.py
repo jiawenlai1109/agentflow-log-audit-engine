@@ -18,11 +18,17 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from agentflow.core.llm import EmptyContentError, LLMError, extract_json  # 与运行时同一个取正文口径
+
+# `Authorization: Bearer xxx` 与 OpenAI 风格的长 opaque token：两种来路都要抹，
+# 判据按形状不按"是不是我那把 key"（缓存备注可能是网关回显的别人的 token）。
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})")
+_OPAQUE_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
 
 PROBE_VERSION = 1
 PROBE_PROMPT = 'Return JSON only, no prose, no code fence: {"items": ["a", "b", "c"]}'
@@ -169,9 +175,34 @@ def build_report(base_url: str, entries: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def mask_secrets(text: Any) -> Any:
+    """把"像凭据"的片段从任何要落盘或外印的字符串里抹掉。
+
+    为什么在预检层也要做一遍：有些网关把请求头原样回显在错误页里，而那段文本会被当作
+    `note` 存进缓存、再被 Web 接口转述出去。`OpenAILLM._mask` 只认得**自己那把 key**，
+    缓存里的备注可能带的是别处抄来的 token——所以这里按形状抹，不按已知值抹。
+    """
+    if not isinstance(text, str):
+        return text
+    masked = _BEARER_RE.sub(r"\1<已抹掉的凭据>", text)
+    return _OPAQUE_TOKEN_RE.sub("<已抹掉的凭据>", masked)
+
+
+def _mask_report(report: dict[str, Any]) -> dict[str, Any]:
+    """落盘前把每个 entry 的 note / 各档的 message 抹一遍。只碰文本，不碰形状字段。"""
+    masked = json.loads(json.dumps(report, ensure_ascii=False))
+    for entry in masked.get("models") or []:
+        if "note" in entry:
+            entry["note"] = mask_secrets(entry.get("note"))
+        for level in (entry.get("levels") or {}).values():
+            if isinstance(level, dict) and "message" in level:
+                level["message"] = mask_secrets(level.get("message"))
+    return masked
+
+
 def write_cache(report: dict[str, Any], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(_mask_report(report), ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 

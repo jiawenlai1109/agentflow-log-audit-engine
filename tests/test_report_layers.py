@@ -273,7 +273,62 @@ def test_rule_rollup_does_not_label_by_task_position(pack_sigma):
     }
     findings = [f for row in results.values() for f in row["summary"]["findings"]]
     stats, silent, aggregates = ReporterAgent._rule_rollup(pack_sigma, results, findings)
-    assert stats == "T1=1，T3=0，T4=1"
+    # 这一行以前写的是 `T3=0`——它和下一条断言（T3 必须被点名为未出结论）本来就互相打脸，
+    # 那就是缺陷 #49 的形状：测试把模板的假 0 当成了预期值。
+    assert stats == "T1=1，T3=未完成，T4=1"
     assert silent == ["T3"], "T3 没生成任务 ⇒ 必须被点名为未出结论，而不是当作无风险"
     # 逐字核对：旧实现按位置贴标签，这里会写成"规则T3：规则T4命中数=1"
     assert aggregates == "规则T1命中数=1；规则T4命中数=1"
+
+
+# ---------------------------------------------------------------- 缺陷 #49：没跑成的规则不许印成 0
+#
+# 现场（2026-10-07 real E23）：报告头同时写着两句话——
+#   > 命中统计：T1=1，T3=0，T4=1
+#   > ⚠️ 未能完成的规则：T3（这些规则的结论缺失，不得当作"无风险"）
+# T3 的任务白卷失败了，`0` 是模板替它编的结论。SOC 值班读第一行就够了，而第一行是假的。
+# 这一族缺陷的通用形状：**"没做"被印成"做了且没问题"**。两侧都钉：
+# 生产侧（`_rule_rollup`）不许再产出 0，校验侧（`lint_report`）独立拦自相矛盾——
+# 只修一头，另一头改了就会悄悄退回去。
+
+
+def _silent_header(stats_line: str, declared: str) -> str:
+    return GOOD_REPORT.replace(
+        "> 命中统计：T1=1，T3=1",
+        f"> 命中统计：{stats_line}\n> ⚠️ 未能完成的规则：{declared}（这些规则的结论缺失，不得当作\u201c无风险\u201d）",
+    )
+
+
+def test_declaring_a_rule_unfinished_while_counting_it_zero_is_an_issue():
+    issues = _issues(_silent_header("T1=1，T3=0，T4=1", "T3"))
+    hit = [item for item in issues if "T3" in item["message"] and "无风险" in item["message"]]
+    assert hit, issues
+    assert hit[0]["severity"] == "high", hit[0]
+
+
+def test_printing_undone_instead_of_zero_is_not_an_issue():
+    """修好之后的样子：同一份自相矛盾不再存在，校验侧应当一声不响。"""
+    assert _issues(_silent_header("T1=1，T3=未完成，T4=1", "T3")) == []
+
+
+def test_zero_for_a_rule_that_finished_is_still_legal():
+    """别把这条修成"0 一律不许出现"：真查过、真没命中，0 就是结论。"""
+    assert _issues(GOOD_REPORT.replace("T1=1，T3=1", "T1=1，T3=0")) == []
+
+
+def test_rollup_prints_undone_for_a_rule_that_never_spoke(pack_sigma):
+    """生产侧的确定性单测：没有 aggregate、没有 finding 的规则，不许在命中统计里拿 0。"""
+    from agentflow.agents.reporter import ReporterAgent
+
+    results = {
+        "1": {"summary": {"aggregate": {"规则T1命中数": 1}, "findings": [{"rule_id": "T1", "subject": "10.0.0.7", "value": 5}]}},
+        # T3 的那条任务白卷失败：results 里根本没有它的 summary
+        "3": {"summary": {"aggregate": {"规则T4命中数": 1}, "findings": [{"rule_id": "T4", "subject": "10.0.0.15", "value": 3}]}},
+    }
+    findings = [f for entry in results.values() for f in entry["summary"]["findings"]]
+    stats_text, silent, _agg = ReporterAgent._rule_rollup(pack_sigma, results, findings)
+    assert "T3=未完成" in stats_text, stats_text
+    assert "T3=0" not in stats_text, stats_text
+    assert silent == ["T3"], silent
+    # 修完的产出必须过得了校验侧——两侧同向才算接上线
+    assert _issues(_silent_header(stats_text, "、".join(silent))) == []

@@ -887,6 +887,10 @@ class Orchestrator:
             "clarify": ctx.clarify,
             # M2-3：派发前 join 预检的逐任务判定（含基数与被拒原因），数字可追回键列计数
             "join_preflight": ctx.join_preflight,
+            # C-14：每个任务**实际**递给沙箱的是哪张表（via = primary_ref / declared_order /
+            # bundle_default）。以前产物里只有声明，解析结果看不见——忽略 primary_ref 与
+            # 角色解析失败退回主表这两条路因此在评测层完全隐身。
+            "table_resolutions": ctx.table_resolutions,
             # 表级授权闸门这次到底生没生效（state: passed/skipped/violated）。
             # 没有这一栏，"闸门实现了"与"闸门还接在线路上"只能靠读代码猜。
             "guard_selfcheck": ctx.guard_selfcheck,
@@ -906,6 +910,28 @@ class Orchestrator:
             # 先要用它排除"其实是换了型号才变好的"，否则 I3 归因就是空话。
             "llm_fallbacks": list(getattr(ctx.budget, "fallbacks", []) or []),
             "models_used": list(getattr(ctx.budget, "models_used", []) or []),
+            # 角色 × 型号（挂账 #44）：`models_used` 是个扁平集合，按角色分档与降级链
+            # 同时开着时说不出"这一票其实是别的型号投的"。旧键语义不动，这里补维度。
+            "llm_model_attribution": list(getattr(ctx.budget, "model_attribution", []) or []),
+            # 本次真的交回过 reasoning 的型号：信封放大与否的实测依据（挂账 #48）。
+            # 没有这一栏，"信封为什么抬了/没抬"只能回去读配置字符串，而配置写的
+            # 是"我没关"，不是"它真的在想"。
+            "llm_reasoning_models": list(getattr(ctx.budget, "reasoning_models", []) or []),
+            # 墙钟口径（挂账 #43）：`total_budget_seconds` 管的是**派发新工作**的闸门，
+            # 已经派出去的任务不会被它打断（线程无法安全中止）。以前这件事只体现在
+            # `degraded_reason=wall_clock_timeout` 上，而那要求真有人被取消——
+            # 于是一次 236s 跑完的 run 与一次 40s 跑完的 run 在这份产物里长得一样，
+            # 超没超支没人看得见。现在把预算、实际用时与判定点一起落盘。
+            "wall_clock": {
+                "budget_seconds": int(
+                    self.config.get("execution", {}).get("total_budget_seconds", 120)
+                ),
+                "elapsed_seconds": round(
+                    time.monotonic() - getattr(self, "_started", time.monotonic()), 3
+                ),
+                "enforcement": "dispatch_boundary",
+                "exceeded": self._deadline_exceeded(ctx),
+            },
             # 本次生效的 LLM 策略（档位/信封/重试/降级候选）：跨批次比较先排掉"换了策略"
             "llm_policy": dict(getattr(ctx.budget, "llm_policy", {}) or {}),
             # 真实 HTTP 请求次数：`llm_calls` 记的是逻辑调用（Agent 层计 1）。

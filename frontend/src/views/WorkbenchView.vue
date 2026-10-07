@@ -17,7 +17,19 @@
           <el-option label="real" value="real" />
         </el-select>
       </el-form-item>
+      <el-form-item label="上游">
+        <!-- 只报预检结论，不给下拉切换：换了型号就是换了计费与产出质量，那要单独一片做归因 -->
+        <el-tag :type="llmTagType" size="small" :title="llmDetail">{{ llmSummary }}</el-tag>
+      </el-form-item>
     </el-form>
+    <el-alert
+      v-if="llmWarns"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 12px"
+      :title="`real 模式将使用 ${llmInfo?.configured?.model || '未知型号'}：${llmDetail}`"
+    />
 
     <el-input
       v-model="question"
@@ -64,7 +76,7 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { ElMessage } from "element-plus";
 import { api } from "../api";
@@ -82,6 +94,48 @@ const question = ref("");
 const running = ref(false);
 const events = ref<any[]>([]);
 const messages = ref<any[]>([]);
+
+// 上游型号的预检结论（只读）。判据来自 scripts/preflight_llm.py 打的那次真实调用，
+// 页面自己不发起调用——一个 GET 请求就烧钱是本项目不接受的形状（缺陷 #14 同一类）。
+const VERDICT_TEXT: Record<string, string> = {
+  usable: "可用",
+  usable_if_thinking_disabled: "需关思考",
+  do_not_disable_thinking: "别关思考",
+  unusable: "不可用",
+  unprobed: "未测",
+};
+const llmInfo = ref<any | null>(null);
+const llmVerdict = computed(() => VERDICT_TEXT[llmInfo.value?.configured?.verdict] || "未测");
+const llmTagType = computed(() => {
+  const verdict = llmInfo.value?.configured?.verdict;
+  if (verdict === "usable") return "success";
+  if (verdict === "unusable") return "danger";
+  if (verdict === "unprobed") return "info";
+  return "warning";
+});
+const llmSummary = computed(
+  () => `${llmInfo.value?.configured?.model || "未取得型号"} · ${llmVerdict.value}`,
+);
+const llmDetail = computed(() => {
+  const info = llmInfo.value;
+  if (!info) return "型号可用性接口不可用（后端未启动或未登录）";
+  const note = info.configured?.note || "";
+  const stamp = info.fresh ? `预检于 ${info.checked_at}` : "预检结论已过期或不属于这台端点";
+  return `${info.base_host}｜${stamp}｜${note || info.hint || "无备注"}`;
+});
+// real 模式下"没测过"也要说出来：它不阻断提交（那是改行为，得单独决定），但别让它无声
+const llmWarns = computed(
+  () => mode.value === "real" && ["unusable", "unprobed"].includes(llmInfo.value?.configured?.verdict),
+);
+
+async function loadLlmStatus() {
+  try {
+    const { data } = await api.llmModels();
+    llmInfo.value = data;
+  } catch {
+    llmInfo.value = null;
+  }
+}
 
 // 切换视图或重复提交时取消上一条进度流，避免旧流回调写进新结果
 let streamController: AbortController | null = null;
@@ -168,6 +222,7 @@ onMounted(async () => {
   const { data } = await api.listDatasets();
   datasets.value = data;
   if (data.length > 0) dataset_id.value = data[0].id;
+  await loadLlmStatus();
   await loadSessions();
   await loadHistory();
 });

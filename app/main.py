@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import APP_DATA_DIR, BUNDLES_DIR, DATASETS_DIR, OUTPUTS_ROOT, SESSIONS_ROOT
 from app.db import init_db
-from app.routers import auth, bundles, datasets, jobs, media, packs, reports, sessions
+from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -51,6 +51,7 @@ app.include_router(auth.router)
 app.include_router(datasets.router)
 app.include_router(bundles.router)
 app.include_router(packs.router)
+app.include_router(llm.router)
 app.include_router(jobs.router)
 app.include_router(sessions.router)
 app.include_router(reports.router)

@@ -220,6 +220,43 @@ def test_models_used_records_the_model_that_actually_served(monkeypatch):
     assert client.budget.models_used == [BACKUP], client.budget.models_used
 
 
+def test_attribution_says_which_role_was_served_by_which_model(monkeypatch):
+    """挂账 #44：扁平的 `models_used` 说不出"这一票其实是替身投的"。
+
+    按角色分档（`agents.executor.model`）与降级链同时开着时，两个型号会进同一个集合，
+    跨批次比较就把"换了型号"与"换了角色配置"混成一件事。这里加的是**维度**，
+    `models_used` 的既有口径一字未动——旧产物与旧断言不该因此重算。
+    """
+    install_by_model(monkeypatch, {PRIMARY: _http_error(502), BACKUP: _text_payload("print(3)")})
+    client = _client(fallbacks=[BACKUP])
+    client.agent_local.agent = "executor"
+    try:
+        client.complete("你是数据工程师", [{"role": "user", "content": "x"}])
+    finally:
+        client.agent_local.agent = None
+    assert client.budget.model_attribution == [
+        {"agent": "executor", "model": BACKUP}
+    ], client.budget.model_attribution
+    assert client.budget.models_used == [BACKUP], "加维度不许改动旧键的语义"
+
+
+def test_attribution_keeps_the_two_roles_apart(monkeypatch):
+    """同一个型号服务两个角色 ⇒ 两行；不同型号服务同一角色 ⇒ 也两行。"""
+    install_by_model(monkeypatch, {PRIMARY: _text_payload("print(1)")})
+    client = _client()
+    for role in ("executor", "critic"):
+        client.agent_local.agent = role
+        try:
+            client.complete("你是数据工程师", [{"role": "user", "content": "x"}])
+        finally:
+            client.agent_local.agent = None
+    assert client.budget.model_attribution == [
+        {"agent": "executor", "model": PRIMARY},
+        {"agent": "critic", "model": PRIMARY},
+    ], client.budget.model_attribution
+    assert client.budget.models_used == [PRIMARY]
+
+
 def test_fallback_event_masks_the_key(monkeypatch):
     """降级原因里带着网关正文；网关可能回显请求头，所以截断之前先抹凭据。"""
     install_by_model(
@@ -287,6 +324,17 @@ def test_fallback_lands_in_the_artifacts(monkeypatch, tmp_path):
     assert evaluation["llm_fallbacks"][0]["from_model"] == PRIMARY
     assert evaluation["llm_fallbacks"][0]["to_model"] == BACKUP
     assert BACKUP in evaluation["models_used"], evaluation["models_used"]
+    # 角色 × 型号（挂账 #44）：只给一个扁平集合，就说不出"这一票其实是替身投的"
+    attribution = evaluation["llm_model_attribution"]
+    assert attribution, "角色×型号没落进 evaluation.json"
+    assert {entry["model"] for entry in attribution} == {BACKUP}, attribution
+    served = {entry["agent"] for entry in attribution}
+    billed = set(evaluation["token_usage"])
+    # 与 usage 同域互校：记了某个角色的 token 却记不出它由哪个型号服务，就是 #44 的原始形状
+    assert served == billed, (served, billed)
+    # 实测签名（挂账 #48）：信封抬没抬的依据必须一起落盘，否则"为什么这次贵了"又是悬案
+    assert evaluation["llm_reasoning_models"], "见过草稿这件事没落进产物"
+    assert PRIMARY in evaluation["llm_reasoning_models"], evaluation["llm_reasoning_models"]
     # 真实请求数必须多于逻辑调用数：少记一次上游请求，就等于让降级在成本口径上隐身
     assert evaluation["llm_http_attempts"] > evaluation["llm_calls"], (
         evaluation["llm_http_attempts"],

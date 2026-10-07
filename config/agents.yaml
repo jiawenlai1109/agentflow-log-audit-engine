@@ -8,6 +8,12 @@ llm:
   #                             "reasoning 在场 + finish_reason=length" 才算交白卷（#41/#42）。
   #                             留空是为了不改变默认请求体——上游认不认 thinking 需要实测，
   #                             "配置写了"不等于"思考关了"。
+  #                             挂账 #48：real 默认那 2× 输出信封现在按**实测签名**放大——
+  #                             这个型号真的交回过 reasoning 才抬。`thinking` 留空不是"在想"
+  #                             的同义词，按配置字符串抬信封会在不思考的网关上白付一倍预算。
+  #                             依据落在 `evaluation.json.llm_reasoning_models` 与空正文细节的
+  #                             `envelope_basis`（policy_off / thinking_disabled / thinking_enabled /
+  #                             observed_reasoning / unobserved），不靠猜。
   # fallback_models: []       # 型号降级链，默认空=完全不启用。只在三种失败下换下一个型号：
   #                             白卷签名对 / 传输层错误或超时 / 5xx+429 重试用尽。
   #                             401、403、404、非 JSON 响应（网关配额页）、结构异常、预算耗尽
@@ -19,6 +25,10 @@ llm:
 execution:
   max_concurrency: 3
   task_timeout_seconds: 30
+  # total_budget_seconds 管的是**派发新工作**的闸门，不是整条 run 的硬顶：波次一旦派出去
+  # 就跑完当前波（线程无法安全中止）。实测 real 单题 236~585s 都在这个数之上而无人被砍。
+  # 挂账 #43 的处理方式是把这件事印出来（`evaluation.json.wall_clock`：预算、实际用时、
+  # 判定点、有没有超支），而不是偷偷把它做成硬限——那会砍掉现存的长 run，属于改口径。
   total_budget_seconds: 120
   max_llm_calls: 30
   max_executor_attempts: 3

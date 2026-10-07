@@ -19,6 +19,12 @@ class BudgetCounter:
         # 必须先能排除"其实是换了型号"这个变量（I3 归因）。见 core/llm.py 的 complete()。
         self.fallbacks: list[dict[str, Any]] = []
         self.models_used: list[str] = []
+        # 角色 × 型号（挂账 #44）：`models_used` 只说得出"这次动过哪些型号"，
+        # 降级链与按角色分档同时开着时，看不出哪个角色用的是主型号还是替身。
+        # 这是加一个维度，不是改 `models_used` 的口径——旧键的语义一字未动。
+        self.model_attribution: list[dict[str, str]] = []
+        # 本次 run 里真的交回过 reasoning 的型号（信封判据的实测依据，见 core/llm.py #48）
+        self.reasoning_models: list[str] = []
         # 本次实际生效的 LLM 策略（档位/信封/重试/降级候选）：由 pipeline 写入。
         # 两次跑批的差异必须先能排除"策略换了"，才谈得上归因到代码（I3）。
         self.llm_policy: dict[str, Any] = {}
@@ -39,11 +45,23 @@ class BudgetCounter:
         with self._lock:
             self.fallbacks.append(detail)
 
-    def note_model_used(self, model: str) -> None:
-        """顺序保留（第一次出现的位置），值去重——留痕要能看出这次跑的是哪个主型号。"""
+    def note_model_used(self, model: str, agent: str | None = None) -> None:
+        """顺序保留（第一次出现的位置），值去重——留痕要能看出这次跑的是哪个主型号。
+
+        同时记一份 `(角色, 型号)` 配对：只开主型号时它就是角色自己的一行，开了降级链
+        才会多出第二行，读的人一眼看得出"这一票其实是别的型号投的"（挂账 #44）。
+        """
         with self._lock:
             if model not in self.models_used:
                 self.models_used.append(model)
+            entry = {"agent": agent or "unknown", "model": model}
+            if entry not in self.model_attribution:
+                self.model_attribution.append(entry)
+
+    def note_reasoning_model(self, model: str) -> None:
+        with self._lock:
+            if model not in self.reasoning_models:
+                self.reasoning_models.append(model)
 
     def spend(self, n: int = 1) -> bool:
         """尝试消费 n 次调用额度；超限返回 False。"""

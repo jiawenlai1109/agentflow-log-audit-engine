@@ -94,6 +94,10 @@ class RunContext:
     external_evidence: list[dict[str, Any]] = field(default_factory=list)  # 外部证据（只作证据，不进数字来源）
     clarify: dict[str, Any] | None = None  # v1.2：非阻塞澄清请求
     join_preflight: dict[str, Any] = field(default_factory=dict)  # M2-3：派发前 join 预检留痕
+    # C-14：本任务**实际**递给沙箱的是哪张表。以前只有声明（dataset_refs）看得见，
+    # 解析结果看不见——于是"忽略 primary_ref"与"角色解析失败退回主表"这两条路
+    # 在评测层完全隐身，跑错了表也没人报。与 join_preflight 同一立场。
+    table_resolutions: dict[str, Any] = field(default_factory=dict)
     replan_used: int = 0  # v1.2：重规划预算（每 run ≤ max_replan_rounds）
     wall_clock_timeout: bool = False  # v1.2：运行墙钟超时标记
     results: dict[int, dict[str, Any]] = field(default_factory=dict)
