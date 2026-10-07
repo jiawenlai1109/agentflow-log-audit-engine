@@ -209,6 +209,15 @@ cd frontend && npm install && npm run dev   # http://localhost:5173（默认账�
 - 环境变量：`APP_SECRET`（签名密钥，未设置则每次启动随机、重启即令全部 token 失效）、`ADMIN_PASSWORD`、`APP_TOKEN_TTL_SECONDS`。
 - 已知代价：CLI 直跑产生的 run 与鉴权上线前的历史产物不出现在 Web 历史列表中（无 `jobs` 归属记录 = 默认拒绝）。
 
+## 作业执行与队列
+
+- **提交即入库**：一次分析"要跑什么"以**引用**形式写在作业行里（数据源用 `bundle:<id>` / `dataset:<id>`，不存服务器绝对路径），所以换一个进程也能认领它；Web 进程默认自己也当认领者。
+- **想把执行与受理分开**：`.\.venv\Scripts\python.exe scripts\worker.py` 起独立 worker，多起几个就是水平扩。数据位置只由环境变量决定（`APP_DATA_DIR` / `OUTPUTS_ROOT` / `DATABASE_URL` 等，见 `.env.example`）——worker 是另一个进程，它读不到别人内存里的副本，所以配置也只有一条权威。
+- **认领是原子的、带租约**：判据是"那条 UPDATE 改动了几行"，不是"我先查到了"。worker 崩了，租约过期后作业被别的进程重新认领；同一作业被认领到上限就判失败并写清原因——不把"没人负责"伪装成"还在跑"。
+- **事件落库、断线可续**：作业事件存在库里，SSE 重连按 `Last-Event-ID` 续读，不重放已看过的那几帧。
+- **队列深度是给运维看的**：作业详情与事件流首帧都带 `queued` / `running` / `stale_pending` 分栏。没人能认领的旧行单独一栏，不混进"排队"里给前端一个永远不动的数字。
+- **跨企业隔离还没做**：数据目前按 `user_id` 隔离，企业（`org_id`）这一层的表与列已建、但还没有一条查询在用；多租户与共享协作是下一片。
+
 ## 目录结构
 
 ```text
