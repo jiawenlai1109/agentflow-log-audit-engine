@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 
-from app import config, llm_gate
+from app import config, llm_gate, ratelimit
 from app.db import init_db
 from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions, users
 from app.runner import reclaim_at_boot
@@ -37,6 +37,16 @@ async def lifespan(_: FastAPI):
         gate_view.get("limit"),
         gate_view.get("limit_source"),
         f"｜{gate_view.get('note')}" if gate_view.get("limit_source") != "env" else "",
+    )
+    limits = ratelimit.snapshot()
+    logger.info(
+        "入口限流：登录每 %ss 账号 %s 次 / 来源 %s 次，建号每 %ss %s 次｜范围=%s（每个进程各自的额度，不是平台级）",
+        limits["limits"]["window_s"],
+        limits["limits"]["login_per_user"],
+        limits["limits"]["login_per_source"],
+        limits["limits"]["account_window_s"],
+        limits["limits"]["account_create_per_actor"],
+        limits["scope"],
     )
     # 上次进程被杀时留下的"running"要收回来（P0 读数：28 个 job 永远停在非终态）。
     # 先收再开认领循环，否则新起的认领者看不到那批僵尸行要等的更久。

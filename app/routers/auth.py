@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
+from app import ratelimit
 from app.db import query, query_one
 from app.deps import get_current_user
 from app.schemas import LoginRequest
@@ -20,7 +21,29 @@ _TIMING_PAD_HASH = (
 
 
 @router.post("/login")
-def login(payload: LoginRequest) -> dict:
+def login(payload: LoginRequest, request: Request) -> dict:
+    # 限流排在这条路由最前面，而且**在查库与那次"陪跑 PBKDF2"之前**：24000 次迭代是真实的
+    # CPU 成本，一台机器对着不存在的用户名每秒刷几百次，挡不住的话先倒下的是我们自己的进程。
+    # 两道闸的顺序有讲究：来源在前、账号在后——只按账号计，拿一批用户名各试一次的枚举
+    # 完全没有成本；来源那道会在扫到几十个名字时先响。
+    ratelimit.guard(
+        "login_source",
+        ratelimit.source_of(request),
+        limit=ratelimit.LOGIN_PER_SOURCE,
+        window_s=ratelimit.WINDOW_S,
+        request=request,
+        reason="这台来源的登录尝试太频繁",
+    )
+    ratelimit.guard(
+        # 键取小写并去空格：`ADMIN` 与 `admin` 在 SQLite 的 BINARY 比较下是两个不同的查询，
+        # 但在限流上必须是同一个预算——否则每个大小写变体都有一条新的额度。
+        "login_user",
+        payload.username.strip().lower(),
+        limit=ratelimit.LOGIN_PER_USER,
+        window_s=ratelimit.WINDOW_S,
+        request=request,
+        reason="这个账号的登录尝试太频繁",
+    )
     user = query_one("SELECT * FROM users WHERE username = ?", (payload.username,))
     granted = verify_password(payload.password, user["password_hash"] if user else _TIMING_PAD_HASH)
     if not user or not granted:

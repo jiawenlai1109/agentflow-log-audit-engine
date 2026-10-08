@@ -30,3 +30,21 @@ def _schema_once():
 
     init_db()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limits():
+    """每个用例面前进程级的限流账清零。
+
+    为什么必须有：登录与建号的计数住在**进程**里，键是"来源 IP + 用户名/管理员 id"。
+    整个测试会话里 TestClient 的来源永远是同一个值，`admin` 也永远是同一个 id，
+    所以不清就会跨用例累加——表现是跑到后面随机冒出一堆 429，而且**红在哪个用例取决于
+    跑了哪些用例**（与 `_fresh_gate` 那一条同族：进程级状态必须显式交接，不然就是串味）。
+    要测"连续尝试会被拒"那条性质，请在**单个用例内**制造那几次尝试
+    （见 `tests/test_rate_limit.py`）。
+    """
+    from app import ratelimit
+
+    ratelimit.reset()
+    yield
+    ratelimit.reset()

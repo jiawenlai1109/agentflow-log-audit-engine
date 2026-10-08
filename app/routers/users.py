@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app import queueing
+from app import queueing, ratelimit
 from app.db import execute, query, query_one
 from app.deps import get_current_user, require_admin
 from app.schemas import AccountCreateRequest, AccountOut, MemberOut, OrgOut, QuotaPatchRequest
@@ -42,9 +42,20 @@ def list_orgs(user: dict = Depends(require_admin)) -> list[dict]:
 
 @router.post("/users", response_model=AccountOut)
 def create_account(
-    payload: AccountCreateRequest, user: dict = Depends(require_admin)
+    payload: AccountCreateRequest, request: Request, user: dict = Depends(require_admin)
 ) -> dict:
     """建号并（可选）当场入企业。重名是 409，不是"静默改密码"。"""
+    # 限流排在所有校验之前：一条被拒的请求不该先把口令送去 PBKDF2、再查一次库。
+    # 判的是"这个管理员在这一段时间里开了多少个号"——批量开号是真需求（一次几十个），
+    # 一秒几十个不是，而那种形状要么是脚本出事，要么是这把 admin 凭证被人拿去用了。
+    ratelimit.guard(
+        "account_create",
+        f"actor:{user['id']}",
+        limit=ratelimit.ACCOUNTS_PER_ACTOR,
+        window_s=ratelimit.ACCOUNTS_WINDOW_S,
+        request=request,
+        reason="这个账号创建得太快",
+    )
     username = payload.username.strip()
     if not USERNAME.match(username):
         raise HTTPException(
