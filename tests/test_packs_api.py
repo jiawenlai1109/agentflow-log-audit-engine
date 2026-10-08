@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app import paths
 from app.db import execute, query, query_one
 from app.main import app
 from app.security import hash_password
@@ -188,9 +189,13 @@ def test_bundle_plus_pack_runs_the_triage_scenario_end_to_end(workspace, owner):
         for subject in T1_SUBJECTS:
             assert subject in report, f"命中主体没进报告：{subject}"
 
-        evaluation_path = (
-            Path(workspace) / "outputs" / finished["run_id"] / "evaluation.json"
-        )
+        # 这条断言伸手进文件系统，所以它必须用**同一个**定位函数（app/paths.py）。
+        # 原来这里硬拼 `outputs/<run_id>/evaluation.json`：P3 产物按企业分树之后它立刻红了，
+        # 而红的原因是量具自己写了第二套位置推导，不是包没进事实层——那正是"定位有第二处实现"
+        # 要付的账，只不过这次付在测试里。
+        evaluation_path = paths.run_dir(
+            str(finished["run_id"]), {"id": owner, "role": "user"}
+        ) / "evaluation.json"
         evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
         assert evaluation["pack"]["name"] == "sigma_triage"
         assert evaluation["pack"]["rule_ids"] == ["T1", "T3", "T4"]

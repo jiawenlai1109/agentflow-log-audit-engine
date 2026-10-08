@@ -12,6 +12,18 @@ export const api = {
   login: (username: string, password: string) =>
     client.post("/api/auth/login", { username, password }),
 
+  /** 当前身份：后端回 username / role / orgs。role 与企业在本地的副本只用来显示，
+   *  判定一律留在服务端——前端藏不住判据，这里也不假装能。 */
+  me: () => client.get("/api/auth/me"),
+
+  /** 同企业成员名单（后端按调用者的企业过滤；没有企业的人拿到空列表）。 */
+  listMembers: () => client.get("/api/users"),
+  /** 企业名单：只给管理员，建号时选归属用。 */
+  listOrgs: () => client.get("/api/orgs"),
+  /** 建号（只给管理员）：org 留空 = 该账号未归属，只能看见自己的资源。 */
+  createAccount: (payload: { username: string; password: string; org?: string }) =>
+    client.post("/api/users", payload),
+
   listDatasets: () => client.get("/api/datasets"),
   /** 型号可用性的只读预检结论。页面只看不动上游——一次真实调用只能由预检脚本发起。 */
   llmModels: () => client.get("/api/llm/models"),

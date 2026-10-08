@@ -115,7 +115,7 @@ def enqueue(job_id: str, spec: dict[str, Any]) -> None:
 def claim(worker: str, lease_s: int = LEASE_SECONDS) -> dict[str, Any] | None:
     """认领下一个 job。抢到返回行，没抢到返回 None（包括"看起来有但被人抢先"）。"""
     candidate = query_one(
-        "/*queue-internal*/ SELECT job_id, user_id, spec, attempts FROM jobs "
+        "/*queue-internal*/ SELECT job_id, user_id, org_id, spec, attempts FROM jobs "
         "WHERE status='queued' ORDER BY id ASC LIMIT 1"
     )
     if not candidate:

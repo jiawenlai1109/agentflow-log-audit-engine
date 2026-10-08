@@ -18,12 +18,13 @@ from app.runner import reclaim_at_boot
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 只建"根"。企业树（`outputs/org/<id>/`）由第一次落盘时 `mkdir(parents=True)` 带出来：
+    # 启动时把库里已有的企业逐个建目录，等于让一次启动去猜将来会有多少棵空树。
     for directory in (
         config.app_data_dir(),
         config.datasets_dir(),
         config.bundles_dir(),
         config.outputs_root(),
-        config.sessions_root(),
     ):
         directory.mkdir(parents=True, exist_ok=True)
     init_db()

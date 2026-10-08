@@ -2,30 +2,27 @@
 
 `<img>` 带不了自定义请求头，所以这里认的是报告接口签发的**只读媒体 token**：
 scope 与 API token 互斥、900 秒过期、绑定单个 run、只放行图片扩展名。
+
+地址里没有企业段（`/outputs/<run_id>/<文件>`），org 段只在服务器本地的解析结果里——
+把 org_id 拼进 URL 换不来任何功能，只是把内部编号与存储布局交给客户端。
 """
 
 from __future__ import annotations
 
-import re
-
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app import config
-from app.deps import ensure_run_access, get_media_principal, guard_within
+from app import config, paths
+from app.deps import get_media_principal
 
 router = APIRouter(tags=["media"])
-
-RUN_ID_PATTERN = re.compile(r"^run_\d{8}_\d{6}_[0-9a-f]{8}$")
 
 
 @router.get("/outputs/{run_id}/{rel_path:path}")
 def read_media(run_id: str, rel_path: str, request: Request) -> FileResponse:
-    if not RUN_ID_PATTERN.match(run_id):
-        raise HTTPException(status_code=404, detail="资源不存在")
     user = get_media_principal(request, run_id)
-    ensure_run_access(run_id, user)
-    target = guard_within(config.outputs_root() / run_id, rel_path)
+    target = paths.media_target(run_id, rel_path, user)
     if target.suffix.lower() not in config.MEDIA_EXTENSIONS or not target.is_file():
         raise HTTPException(status_code=404, detail="资源不存在")
     return FileResponse(target)
+

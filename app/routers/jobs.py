@@ -116,7 +116,7 @@ def validate_approvals(payload: AnalyzeRequest) -> dict[str, bool]:
     return dict(payload.mcp_approvals)
 
 
-def preflight_pack_data(pack_obj: Any, sources: Any) -> None:
+def preflight_pack_data(pack_obj: Any, sources: Any, org_id: int) -> None:
     """包与数据对不对得上，派发前就说清缺哪几列、去哪看约定。
 
     预检看的是**归一化之后**的列，不是 `datasets.columns` 里存的原始表头：归一化会派生出
@@ -124,13 +124,18 @@ def preflight_pack_data(pack_obj: Any, sources: Any) -> None:
     "缺 time 列"，而引擎实际跑得通。这条是测试跑出来的真错。
     所以这里直接复用运行时要走的 `as_bundle`：同一份归一化、同一个判据，
     两处不可能算出两个"缺列"结论。
+
+    `org_id` 决定这份归一化缓存落在哪棵树上。必须是**待会儿那次运行用的同一棵**：
+    预检在 `outputs/bundles/` 建一份、运行在 `outputs/org/<id>/bundles/` 再建一份的话，
+    "同一份快照"这句就变成假的（同一批数据被解析两遍，磁盘两份，而报告里的数字各自指回
+    一份 — 那正是 #23 加锁与原子 rename 想避免的形状）。
     """
     if pack_obj is None:
         return
     if not hasattr(sources, "tables"):
         # 单文件也归一化成 Bundle 再比列：与运行时要走的 `as_bundle` 同一条路径、同一个指纹，
         # 所以这里建的缓存就是待会儿那次运行要用的那份，不多写一份数据
-        sources = as_bundle(sources, config.outputs_root())
+        sources = as_bundle(sources, config.org_outputs_root(org_id))
     missing = missing_required(pack_obj, available_columns(pack_obj, sources))
     if missing:
         raise HTTPException(
@@ -148,6 +153,8 @@ def submit_analysis(
     mode: str,
     session_id: str | None,
     user: dict[str, Any],
+    *,
+    org_id: int,
     pack: str | None = None,
     mcp_approvals: dict[str, bool] | None = None,
     run_origin: dict[str, Any] | None = None,
@@ -159,6 +166,11 @@ def submit_analysis(
 
     `pack` 落进 jobs 表：一次跑的是哪个领域场景，属于"这次结果是怎么来的"的一部分。
     只记问题文本的话，历史页上"登录审计"和"多源分诊"长得一模一样，出了分歧无从回溯。
+
+    `org_id` 是**必填的关键字参数**，而且由调用方算（`access.primary_org(user)`）：
+    这一个数同时决定"这条作业同企业谁能看见"与"它的产物落在哪棵树下"，两者必须是同一个
+    答案。做成可选参数（内部自己算）的话，将来加一个入口就有人忘了传，表现不是报错而是
+    全都落到 `org/0`（未归属 ⇒ 共享读默认拒绝 ⇒ 同事永远看不见彼此跑过什么）。
     """
     job_id = f"job_{uuid.uuid4().hex[:12]}"
 
@@ -179,9 +191,10 @@ def submit_analysis(
     queueing.accept(
         job_id=job_id,
         user_id=user["id"],
-        # 企业归属在受理这一刻盖：作业行没归属（org_id=0）的话，共享读对它默认拒绝，
-        # 同企业的人就永远看不见彼此跑过什么——那等于接了线但没人能共享。
-        org_id=access.primary_org(user),
+        # 企业归属在受理这一刻盖（由调用方算好传进来）：作业行没归属（org_id=0）的话，
+        # 共享读对它默认拒绝，同企业的人就永远看不见彼此跑过什么——那等于接了线但没人能共享。
+        # 同一列还决定这次运行的产物落在哪棵树下，所以这里不给默认值。
+        org_id=org_id,
         question=question,
         mode=mode,
         session_id=session_id,
@@ -200,6 +213,9 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
     # 把"包名写错"排在解析 Bundle 之后，等于让一个必然失败的请求先去读盘。
     pack_obj = validate_pack(payload)
     approvals = validate_approvals(payload)
+    # 一次请求只算一遍企业归属：预检建缓存的那棵树、与运行要落的那棵树必须是同一棵，
+    # 而"谁属于哪家企业"这件事的权威在 access（取最小的那条成员关系，没成员关系 = 0）。
+    org_id = access.primary_org(user)
     if payload.bundle_id:
         # 归属、状态、目录包含、快照可读——四步都在 bundles 模块里做一次（同一个 BUNDLES_DIR）
         sources = load_bundle_for_analysis(payload.bundle_id, user)
@@ -211,7 +227,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
             raise HTTPException(status_code=404, detail="数据集不存在")
         sources = dataset["path"]
         source_ref = f"dataset:{payload.dataset_id}"
-    preflight_pack_data(pack_obj, sources)
+    preflight_pack_data(pack_obj, sources, org_id)
     # 会话是**个人**上下文：同企业也不共享，所以这里用 OWNER
     sql, params = access.scope(user, access.OWNER)
     if payload.session_id and not query_one(
@@ -224,6 +240,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
         payload.mode,
         payload.session_id,
         user,
+        org_id=org_id,
         pack=payload.pack,
         mcp_approvals=approvals,
         # 谁发起的、从哪发起的、请求批了什么：批准链有了第二个入口，

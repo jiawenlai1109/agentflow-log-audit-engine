@@ -8,22 +8,18 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import access, config
+from app import access, paths
 from app.db import query
-from app.deps import ensure_run_access, get_current_user, guard_within
+from app.deps import get_current_user
 from app.schemas import EvaluationSummary
 from app.security import MEDIA_TOKEN_TTL_SECONDS, SCOPE_MEDIA, make_token
 
 router = APIRouter(prefix="/api", tags=["reports"])
 
-RUN_ID_PATTERN = re.compile(r"^run_\d{8}_\d{6}_[0-9a-f]{8}$")
-
 
 def _valid_run_id(run_id: str) -> str:
     """run_id 来自 URL，进文件路径前先按生成规则收紧，杜绝 `..` 与任意段。"""
-    if not RUN_ID_PATTERN.match(run_id):
-        raise HTTPException(status_code=404, detail="报告不存在")
-    return run_id
+    return paths.validate_run_id(run_id)
 
 
 def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
@@ -32,19 +28,22 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
     鉴权上线前由 CLI 直跑产生的 run 没有 jobs 记录，因此不出现在列表里——默认拒绝。
     判据来自 `app/access.py`：报告是企业内的共享资产，所以列表里既有自己跑的，也有同企业
     成员跑的；`org_id = 0`（没归属企业）的行仍然只有自己看得见。
+
+    产物位置按**行里已有的 `org_id`** 算，不再为每一行补一次查询：这批行本来就是带归属
+    谓词的查询出来的，再查一遍等于给同一件事两条查询。
     """
     sql, params = access.scope(user)
     rows = query(
-        "SELECT run_id, user_id, question, status, created_at FROM jobs "
+        "SELECT run_id, user_id, org_id, question, status, created_at FROM jobs "
         f"WHERE 1{sql} AND run_id IS NOT NULL ORDER BY id DESC",
         params,
     )
     runs: list[dict[str, Any]] = []
     for row in rows:
         run_id = str(row["run_id"])
-        if not RUN_ID_PATTERN.match(run_id):
+        if not paths.RUN_ID_PATTERN.match(run_id):
             continue
-        evaluation_file = config.outputs_root() / run_id / "evaluation.json"
+        evaluation_file = paths.run_dir_for_row(row, run_id) / "evaluation.json"
         try:
             evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -92,8 +91,15 @@ def _normalize_report_links(
 
     def _absolute_link(match: re.Match) -> str:
         raw = match.group(2).replace("\\", "/")
-        marker = "/outputs/"
-        idx = raw.find(marker)
+        parts = raw.split("/")
+        if run_id in parts:
+            # 绝对路径里现在可能带企业树段（`.../outputs/org/3/run_x/artifacts/a.png`），
+            # 也可能是命名空间之前的 `.../outputs/run_x/...`。按"哪一段是这次运行的 run_id"
+            # 切下去，org 段就留在服务器本地了——它不该出现在给客户端的地址里（#15 撤
+            # `report_path` 用的是同一条判据：不外泄存储布局）。
+            rel = "/".join(parts[parts.index(run_id) + 1 :])
+            return f"![{match.group(1)}]({_signed(f'/outputs/{run_id}/{rel}')})"
+        idx = raw.find("/outputs/")
         if idx >= 0:
             return f"![{match.group(1)}]({_signed(raw[idx:])})"
         return match.group(0)
@@ -114,8 +120,8 @@ def list_runs(user: dict = Depends(get_current_user)) -> list[dict]:
 @router.get("/reports/{run_id}")
 def get_report(run_id: str, user: dict = Depends(get_current_user)) -> dict:
     run_id = _valid_run_id(run_id)
-    ensure_run_access(run_id, user)
-    report_path = guard_within(config.outputs_root() / run_id, "report.md")
+    # 授权与定位合成一步：这条 run 在哪家企业树下，只有"我看得见它"才问得出来
+    report_path = paths.run_dir(run_id, user) / "report.md"
     if not report_path.exists():
         raise HTTPException(status_code=404, detail="报告不存在")
     content = report_path.read_text(encoding="utf-8")

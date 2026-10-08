@@ -9,6 +9,7 @@ const router = createRouter({
     { path: "/datasets", component: () => import("../views/DatasetsView.vue") },
     { path: "/sessions", component: () => import("../views/SessionsView.vue") },
     { path: "/reports", component: () => import("../views/ReportsView.vue") },
+    { path: "/members", component: () => import("../views/MembersView.vue") },
   ],
 });
 

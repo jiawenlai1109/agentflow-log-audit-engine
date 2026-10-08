@@ -37,7 +37,8 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from agentflow.core.streams import harden_streams  # noqa: E402
 from app.main import app  # noqa: E402
-from app.db import init_db  # noqa: E402
+from app.db import init_db, query_one  # noqa: E402
+from app import paths  # noqa: E402
 
 PORT = 8178
 BASE = f"http://127.0.0.1:{PORT}"
@@ -135,7 +136,12 @@ def main() -> int:
         checks.append(("命中主体在报告里", "203.0.113.7->admin" in report, ""))
         checks.append(("外部库独有的 4242 不在报告里", "4242" not in report, ""))
 
-    run_dir = config.outputs_root() / finished["run_id"]
+    # 产物在哪棵树下由**作业行的企业归属**决定，脚本不猜：读同一条库里的那个数，
+    # 再用同一个定位函数（app/paths.py）——自己拼 `outputs/<run_id>` 的话，
+    # 这份探针会在命名空间改动后"读不到文件"，而它测的东西其实没坏。
+    job_row = query_one("SELECT org_id FROM jobs WHERE run_id = ?", (finished["run_id"],))
+    assert job_row, f"作业行里没有这条 run：{finished['run_id']}"
+    run_dir = paths.resolve(int(job_row["org_id"]), str(finished["run_id"]))
     evaluation = json.loads((run_dir / "evaluation.json").read_text(encoding="utf-8"))
     checks.append(("事实层记下了包与规则", evaluation["pack"]["rule_ids"] == ["T1", "T3", "T4"], str(evaluation["pack"])))
     events = [json.loads(line) for line in (run_dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]

@@ -46,8 +46,34 @@ def bundles_dir() -> Path:
     return _env_path("BUNDLES_DIR", app_data_dir() / "bundles")
 
 
-def sessions_root() -> Path:
-    return _env_path("SESSIONS_ROOT", outputs_root() / "sessions")
+# 企业命名空间：**一个企业一棵树**。run 产物、引擎的 `bd_<指纹>` 归一化缓存、会话目录
+# 全都在 `$OUTPUTS_ROOT/org/<id>/` 底下。
+#
+# 为什么要物理分树（P3 之前只有 API 那一层拦着）：
+# ① 报告按企业共享读，产物文件却是一棵全局树——隔离只剩"路由记得判归属"这一条依赖，
+#    漏一处就是跨企业读文件；分树之后跨企业连"这个文件在不在"都探测不到。
+# ② `bd_<内容指纹>` 那份归一化缓存原来是全局共享的：字节完全相同的上传会让两个企业在
+#    同一个目录名下相遇，"目录已存在"这个事实本身就在泄露别家传过什么。
+# ③ P4 要按企业算磁盘配额，物理分树之后一次目录遍历就是答案，不用先还原本该属于谁。
+ORG_NAMESPACE = "org"
+
+
+def org_outputs_root(org_id: int) -> Path:
+    """企业树根。这里 `int()` 一把是刻意的：org_id 来自库里但会进文件路径，
+    非数字要当场炸在这里，而不是拼出一个多一层或带 `..` 的位置。"""
+    return outputs_root() / ORG_NAMESPACE / str(int(org_id))
+
+
+def sessions_root(org_id: int) -> Path:
+    """会话目录 = 企业树里的 `sessions/`。
+
+    这里原来读一个 `SESSIONS_ROOT` 环境变量，而**它从来没生效过**：引擎算会话目录用的是
+    它拿到的 `outputs_root`（`pipeline.run_analysis`），一个字都不读这个变量。所以只要有人
+    真去设它，Web 侧读 A、引擎写 B，同一份会话被劈成两个目录——一个看起来能配置、实际会
+    把上下文搞丢的旋钮，比没有旋钮更坏。现在位置只有一条推导式，并且由调用方**告知**引擎
+    （`sessions_root=` 参数），不让它猜。
+    """
+    return org_outputs_root(org_id) / "sessions"
 
 
 MAX_UPLOAD_MB = 50

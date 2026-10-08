@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import config
+from app import access, paths
 from app.db import execute, query, query_one
 from app.deps import get_current_user
 from app.routers.jobs import submit_analysis
@@ -19,7 +19,6 @@ from app.schemas import (
     SessionCreateRequest,
     SessionOut,
 )
-from app import access
 from agentflow.core.context import SessionContext
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -66,7 +65,7 @@ def list_sessions(user: dict = Depends(get_current_user)) -> list[dict]:
     rows = query(f"SELECT * FROM sessions WHERE 1{sql} ORDER BY id DESC", params)
     result = []
     for row in rows:
-        session = SessionContext(row["session_id"], config.sessions_root() / row["session_id"])
+        session = SessionContext(row["session_id"], paths.session_dir(row))
         result.append(
             {
                 "session_id": row["session_id"],
@@ -81,8 +80,8 @@ def list_sessions(user: dict = Depends(get_current_user)) -> list[dict]:
 def session_messages(
     session_id: str, user: dict = Depends(get_current_user)
 ) -> list[dict]:
-    _owned_session(session_id, user)
-    session = SessionContext(session_id, config.sessions_root() / session_id)
+    row = _owned_session(session_id, user)
+    session = SessionContext(session_id, paths.session_dir(row))
     return [
         {
             "turn": turn.get("turn"),
@@ -115,6 +114,9 @@ def post_message(
         session_id,
         user,
         source_ref=f"path:{dataset_path}",
+        # 作业行的企业归属 = **此刻提交者的企业**（可见性判据用它算）；会话树的位置另按
+        # 会话行自己的 org 算（见 app/paths.py）。两条各管各的，谁也不覆盖谁。
+        org_id=access.primary_org(user),
     )
     sql, params = access.scope(user, access.OWNER)
     execute(
@@ -134,10 +136,10 @@ def post_message(
 
 @router.delete("/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)) -> dict:
-    _owned_session(session_id, user)
+    row = _owned_session(session_id, user)
     sql, params = access.scope(user, access.OWNER)
     execute(f"DELETE FROM sessions WHERE session_id = ?{sql}", (session_id, *params))
-    session_dir = config.sessions_root() / session_id
+    session_dir = paths.session_dir(row)
     if session_dir.exists():
         shutil.rmtree(session_dir)
     return {"ok": True}

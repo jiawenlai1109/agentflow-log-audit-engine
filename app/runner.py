@@ -19,7 +19,7 @@ import logging
 import threading
 from typing import Any
 
-from app import config, queueing
+from app import access, config, queueing
 from app.jobs import JobManager
 # `run_analysis` 在模块顶层导入，不在函数里延迟导：执行路径搬到这一份代码之后，
 # 全局只剩**一个**可替换的跑批缝隙。缝隙有两处（这里 + routers/jobs.py）迟早出现
@@ -81,6 +81,21 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
     worker = str(claim["worker"])
     spec = queueing.get_spec(claim)
     sources = resolve_sources(spec, user_id)
+    # 一次运行的产物落在**作业行自己那条企业树**下（`outputs/org/<id>/<run_id>/`）。
+    # 用的是库里的 org_id，不是"当前请求者"的企业：认领这个 job 的进程可能压根没有请求者
+    # （scripts/worker.py），而"跑在谁的树上"必须与"这条 job 属于哪家企业"是同一个答案，
+    # 否则共享判据读到的报告与文件实际所在的地方会对不上。
+    org_id = int(claim.get("org_id") or access.UNASSIGNED_ORG)
+    session_id = spec.get("session_id") or None
+    sessions_root = None
+    if session_id:
+        session_org = access.session_org(user_id, str(session_id))
+        if session_org is None:
+            # 排队期间会话被删了（提交与认领之间的那段时间）。这里退回作业自己那棵树里
+            # 新建一份空上下文——与改造前引擎的行为一致（它也是 mkdir 一个新目录），
+            # 但把这条分支写在明处：会话树的位置由**会话行**决定，行没了才轮到作业行。
+            session_org = org_id
+        sessions_root = config.sessions_root(session_org)
     last = {"status": "failed", "run_id": None, "error": None}
 
     def on_event(event: dict[str, Any]) -> None:
@@ -106,8 +121,9 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
             question=str(spec.get("question") or ""),
             sources=sources,
             mode=str(spec.get("mode") or "mock"),
-            outputs_root=config.outputs_root(),
-            session_id=spec.get("session_id"),
+            outputs_root=config.org_outputs_root(org_id),
+            session_id=session_id,
+            sessions_root=sessions_root,
             on_event=on_event,
             pack=spec.get("pack"),
             mcp_approvals=spec.get("mcp_approvals") or None,

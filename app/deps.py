@@ -73,15 +73,15 @@ def ensure_run_access(run_id: str, user: dict[str, Any]) -> None:
     若有多条 job 记录（重跑、测试残留），首行匹配会把别人的归属当成结论。
     无 jobs 记录的 run（CLI 直跑、鉴权上线前的历史产物）一律拒绝——默认关闭。
     判据只有一份，在 `app/access.py`：媒体 token 的签发、报告正文的读取都走这条。
+
+    2026-10-08：这条查询与"这条 run 的产物在哪家企业树下"合成了一次（`access.visible_run_org`）。
+    原来这里是独立的一条 `SELECT 1 FROM jobs WHERE run_id = ?{sql}`，而读文件的那侧还要再查一次
+    位置——两条查询之间状态会动，而且 admin 的旁路就有两份，改一漏一。要判权限的场合仍然
+    直接调这个函数（它只回"看得见过与否"），要读文件的场合调 `app/paths.py:run_dir`。
     """
     from app import access
 
-    if user.get("role") == "admin":
-        return
-    sql, params = access.scope(user)
-    if not query_one(
-        f"SELECT 1 AS ok FROM jobs WHERE run_id = ?{sql}", (run_id, *params)
-    ):
+    if access.visible_run_org(run_id, user) is None:
         raise HTTPException(status_code=404, detail="资源不存在")
 
 

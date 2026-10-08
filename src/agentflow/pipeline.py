@@ -237,6 +237,7 @@ def run_analysis(
     mcp_config: str | Path | None = None,
     mcp_approvals: dict[str, bool] | None = None,
     run_origin: dict[str, Any] | None = None,
+    sessions_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
 
@@ -248,6 +249,9 @@ def run_analysis(
         **这里不做裁决**：原样交给 hub，由闸门按 config 的 grantable_approvals 过滤——
         判定权只在一处，任何调用方都过同一道。
     run_origin：这次运行的来源与经手人（如 {source: web, actor_user_id: 1}），只用于留痕。
+    sessions_root：多轮会话状态放哪。缺省 = `<outputs_root>/sessions/`（CLI 单跑的形状）；
+        Web 侧必须显式给，因为产物按企业分树之后"会话属于哪家企业"只有会话行知道，
+        引擎猜不出来（见 app/paths.py:session_dir）。
     """
     config = load_config(config_path)
     registry = build_default_registry(config)
@@ -271,7 +275,15 @@ def run_analysis(
 
     session = None
     if session_id:
-        session_dir = outputs_root / "sessions" / session_id
+        # 会话目录**由调用方告知**（`sessions_root=`），引擎不再自己猜。
+        # 原来这里是 `<outputs_root>/sessions/<id>`，于是"会话在哪"有两处推导：引擎按它
+        # 拿到产物根算一处，Web 侧按会话行的企业归属算一处。两边一致的唯一原因是"那时
+        # 产物根还没有企业段"——一旦产物按企业分树，表现就是"这个会话的记忆忽然空了"
+        # （引擎在另一棵树里新建了个空目录），而且整条路径一个错都不报。
+        session_root = (
+            Path(sessions_root) if sessions_root else outputs_root / "sessions"
+        ).resolve()
+        session_dir = session_root / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
         session = SessionContext(session_id=session_id, session_dir=session_dir)
 

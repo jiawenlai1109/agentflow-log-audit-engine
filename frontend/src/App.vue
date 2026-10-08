@@ -8,11 +8,20 @@
         <el-menu-item index="/datasets">数据管理</el-menu-item>
         <el-menu-item index="/sessions">会话管理</el-menu-item>
         <el-menu-item index="/reports">历史与报告</el-menu-item>
+        <el-menu-item index="/members">成员与企业</el-menu-item>
       </el-menu>
     </el-aside>
     <el-container>
       <el-header class="header">
         <span>{{ auth.username || "用户" }}</span>
+        <el-tag v-if="auth.isAdmin" size="small" type="danger">管理员</el-tag>
+        <el-tag v-if="!auth.unassigned" size="small">{{ auth.orgLabel }}</el-tag>
+        <el-tooltip
+          v-else
+          content="没有企业归属：只看得见自己的数据集与报告（共享读默认拒绝）。要协作请让管理员在建号时指定企业。"
+        >
+          <el-tag size="small" type="warning">未归属企业</el-tag>
+        </el-tooltip>
         <el-button link type="primary" @click="auth.logout(); router.push('/login')">退出</el-button>
       </el-header>
       <el-main>
@@ -41,7 +50,13 @@ function onUnauthorized() {
   if (route.path !== "/login") router.push("/login");
 }
 
-onMounted(() => window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized));
+onMounted(() => {
+  window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  // 每次开页都向服务端回读一次身份与企业归属：本地的 role/orgs 只是显示用的副本，
+  // 企业成员关系与管理角色是会被管理员改的，界面不该拿着上次登录时的快照继续显示。
+  // 失败不去动 token：401 由上面的拦截器统一收，其它错误（断网）保持可读的旧值。
+  if (auth.isAuthed) auth.fetchMe().catch(() => undefined);
+});
 onBeforeUnmount(() => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized));
 </script>
 
