@@ -12,6 +12,25 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class QuotaPatchRequest(BaseModel):
+    """给一家企业设配额（PATCH 语义）。
+
+    **四类值三种命运**要分清，所以这里不用"整行覆盖"的写法：
+    键没出现 = 不动这一列；出现且为 null = 清除（不设限）；正整数 = 上限；
+    0 与负数 = 配错，`gt=0` 当场 422，而不是让它进库等下一次判定变成"全都别想提交"。
+
+    四列里现在只有前两列参与判定（`limit_llm_calls_per_day` / `limit_upload_bytes` 只存不判），
+    这条自曝写在响应里，不让"表里有这一列"被读成"配额有了这一条"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit_concurrent_jobs: int | None = Field(default=None, gt=0)
+    limit_jobs_per_day: int | None = Field(default=None, gt=0)
+    limit_llm_calls_per_day: int | None = Field(default=None, gt=0)
+    limit_upload_bytes: int | None = Field(default=None, gt=0)
+
+
 class AccountCreateRequest(BaseModel):
     """建号：用户名、口令，以及（可选）当场加入哪家企业。
 

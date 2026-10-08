@@ -351,7 +351,9 @@ def test_every_owned_table_query_is_user_scoped():
     owned = ("datasets", "jobs", "sessions")
     marker = "/*queue-internal*/"
     queue_sql_home = "queueing.py"
-    queue_sql_max = 12  # 2026-10-07 实测 12 条；涨一条要先写清"归属在哪儿判"，才准动这个数
+    queue_sql_max = 14  # 2026-10-07 实测 12 条；涨一条要先写清"归属在哪儿判"，才准动这个数
+    # 2026-10-08 P4-2 +2：`org_usage` 的两条按企业聚合的用量查询。豁免理由写在函数 docstring 里
+    # （配额判的是企业不是个人），而 org_id 的来源仍是 `access.primary_org`——归属判据没有搬家。
     statement_start = re.compile(r"\s*(?:/\*[^*]*\*/\s*)?(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
     offenders: list[str] = []
     queue_internal: list[str] = []

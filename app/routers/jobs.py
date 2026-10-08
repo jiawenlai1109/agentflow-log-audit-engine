@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app import access, config, eventlog, llm_gate, queueing
+from app import access, config, eventlog, llm_gate, queueing, quota
 from app.runner import Dispatcher
 from app.db import query_one
 from app.deps import get_current_user
@@ -219,6 +219,17 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
     # 一次请求只算一遍企业归属：预检建缓存的那棵树、与运行要落的那棵树必须是同一棵，
     # 而"谁属于哪家企业"这件事的权威在 access（取最小的那条成员关系，没成员关系 = 0）。
     org_id = access.primary_org(user)
+    # 配额判在**受理这一刻**，判据住在 `app/quota.py`：worker 认领之后已经没有"拒绝"这个出口，
+    # 那时才发现超配额只能把作业跑成 failed——"配额"就变成"失败计数"，而 P4 要的恰恰是失败计数不涨。
+    # 放在解析数据源之前：一条必然被拒的请求不该先去读盘（与上面"最便宜的校验先做"同一个顺序）。
+    decision = quota.decide(org_id)
+    if not decision["allowed"]:
+        quota.note_refusal(decision, org_id, user)
+        raise HTTPException(
+            status_code=429,
+            detail=decision["reason"],
+            headers={"Retry-After": str(decision["retry_after"])},
+        )
     if payload.bundle_id:
         # 归属、状态、目录包含、快照可读——四步都在 bundles 模块里做一次（同一个 BUNDLES_DIR）
         sources = load_bundle_for_analysis(payload.bundle_id, user)

@@ -21,9 +21,10 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app import queueing
 from app.db import execute, query, query_one
 from app.deps import get_current_user, require_admin
-from app.schemas import AccountCreateRequest, AccountOut, MemberOut, OrgOut
+from app.schemas import AccountCreateRequest, AccountOut, MemberOut, OrgOut, QuotaPatchRequest
 from app.security import hash_password
 
 router = APIRouter(prefix="/api", tags=["accounts"])
@@ -104,3 +105,23 @@ def _as_int(value: str) -> int:
     """`org` 允许写 slug 也允许写数字 id；非数字时给 0，让 slug 那条支路去命中。"""
     text = str(value).strip()
     return int(text) if text.isdigit() else 0
+
+
+@router.patch("/orgs/{org_id}/quota")
+def patch_org_quota(
+    org_id: int, payload: QuotaPatchRequest, user: dict = Depends(require_admin)
+) -> dict:
+    """给一家企业设配额（仅全局 admin）。响应里同时给出**此刻的用量**与**哪几项不生效**。
+
+    为什么用量跟着返回：配额这个数字单独放着没有意义——"上限 5"要和"现在几个"一起看才知道
+    是"还宽"还是"已经贴着"。而"哪几项不生效"必须出现在写的那一步，而不是等人来问：
+    设了一条不判的列却没人说，运维会以为已经拦住了。
+
+    `exclude_unset` 是这条接口的语义本身：键没出现 = 不动这一列，出现且为 null = 清除。
+    """
+    if not query_one("SELECT id FROM organizations WHERE id = ?", (org_id,)):
+        raise HTTPException(status_code=404, detail=f"企业 {org_id} 不存在（配额不给没谈过的租户留一行）")
+    from app import quota  # 局部导入：判定与用量的读法都在 quota 那侧，路由只做 HTTP 形状
+
+    row = quota.set_quota(org_id, payload.model_dump(exclude_unset=True))
+    return {"org_id": org_id, "quota": row, "usage": queueing.org_usage(org_id), **quota.capabilities()}

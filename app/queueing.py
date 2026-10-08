@@ -113,10 +113,24 @@ def enqueue(job_id: str, spec: dict[str, Any]) -> None:
 
 
 def claim(worker: str, lease_s: int = LEASE_SECONDS) -> dict[str, Any] | None:
-    """认领下一个 job。抢到返回行，没抢到返回 None（包括"看起来有但被人抢先"）。"""
+    """认领下一个 job。抢到返回行，没抢到返回 None（包括"看起来有但被人抢先"）。
+
+    **认领顺序按企业公平**（P4-2）：先给"这家企业现在在跑几个"最少的那家，同一家企业内部仍按
+    提交顺序 FIFO。为什么不是纯 FIFO：一条队纯 FIFO 时，一家企业批量提交 50 个作业就能把
+    worker 全占住，别家企业第 2 个提交的作业排在第 51 位——"队列公平"在这里不是美学问题，
+    是"同事三秒后能看到报告"和"明天能看到"的差别。
+    代价量过（`.appdata/probe_fair_claim_cost.py`，复用一条连接、只量那条候选查询本身的净差）：
+    500 待领 / 20 在跑 / 1 家企业，有 `ix_jobs_org_status` 时公平比 FIFO 多花 **0.5ms**，
+    2000 待领 / 40 在跑多花 **0.88ms**。同一形状下**没有**那条索引时是 **24.6ms / 79.3ms**：
+    索引写在模型与迁移里、运行时那份库里却没有，这条守卫（`test_org_indexes_exist_on_both_schema_paths`）
+    现在把它列进必查名单。认领是 worker 每秒都在做的事，几十毫秒就是它每秒都在付的钱。
+    """
     candidate = query_one(
-        "/*queue-internal*/ SELECT job_id, user_id, org_id, spec, attempts FROM jobs "
-        "WHERE status='queued' ORDER BY id ASC LIMIT 1"
+        "/*queue-internal*/ SELECT job_id, user_id, org_id, spec, attempts FROM jobs j "
+        "WHERE j.status='queued' "
+        "ORDER BY (SELECT COUNT(*) FROM jobs r "
+        "          WHERE r.status='running' AND r.org_id=j.org_id) ASC, j.id ASC "
+        "LIMIT 1"
     )
     if not candidate:
         return None
@@ -200,6 +214,35 @@ def stats() -> dict[str, int]:
         "running": counts.get("running", 0),
         "queued": counts.get("queued", 0),
         "stale_pending": counts.get("pending", 0),
+    }
+
+
+def org_usage(org_id: int) -> dict[str, int]:
+    """一家企业**此刻**的用量：还在队里/在跑的几个（`active`）、今天一共提交了几个（`today`）。
+
+    这两条按 `org_id` 聚合而不带 `user_id` 谓词，是故意的：配额判的是"这家企业"，不是某个人——
+    同企业三个人各提交 3 个、上限 5，那么第 6 个就该被拒，跟它是谁提交没有关系。
+    **归属在哪儿判**：`org_id` 由调用方给，而调用方只有 `app/routers/jobs.py` 一处，它的那个
+    `org_id` 来自 `access.primary_org(user)`（唯一的归属权威），**不来自请求体**——把企业号
+    交给客户端就等于让 A 企业的人花 B 企业的配额。
+    两条读数都从库里取，不取本进程的簿记：多进程部署下后者只看得见自己那几个。
+    """
+    active = query_one(
+        "/*queue-internal*/ SELECT COUNT(*) AS n FROM jobs "
+        "WHERE org_id = ? AND status IN ('queued', 'running')",
+        (org_id,),
+    )
+    # "今天"按本地日界（与 `created_at` 写入口径 `datetime('now','localtime')` 同源）。
+    # 用 `date('now','localtime')` 而不是进程启动时算的零点：worker 是长跑进程，跨零点之后
+    # 还按昨天的界判，表现是"配额明明还有余量却一直被拒"。
+    today = query_one(
+        "/*queue-internal*/ SELECT COUNT(*) AS n FROM jobs "
+        "WHERE org_id = ? AND created_at >= date('now', 'localtime')",
+        (org_id,),
+    )
+    return {
+        "active": int((active or {}).get("n") or 0),
+        "today": int((today or {}).get("n") or 0),
     }
 
 

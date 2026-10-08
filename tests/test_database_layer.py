@@ -317,6 +317,10 @@ def test_org_indexes_exist_on_both_schema_paths(tmp_path, monkeypatch):
         "idx_sessions_org",
         "idx_bundles_org",
         "idx_memberships_user",
+        # P4-2 的公平认领每次轮询都要跑一条按 (org_id, status) 的相关子查询：这条索引不在，
+        # 认领就从 0.006ms 变成几十 ms（实测见 app/db.py 的注释）。模型与迁移里一直写着它，
+        # 运行时那份此前没有——正是这条守卫要抓的那种"写了等于建了"。
+        "ix_jobs_org_status",
     }
 
     def index_names(db: Path) -> set[str]:

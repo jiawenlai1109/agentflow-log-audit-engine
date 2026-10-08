@@ -188,6 +188,12 @@ CREATE INDEX IF NOT EXISTS idx_datasets_org ON datasets (org_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_org ON jobs (org_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_org ON sessions (org_id, id);
 CREATE INDEX IF NOT EXISTS idx_bundles_org ON bundles (org_id, id);
+-- P4-2 的公平认领按企业数"在跑几个"，每轮认领都要跑一次那条相关子查询。
+-- 实测（`.appdata/probe_fair_claim_cost.py`，复用一条连接量的净差）：500 待领 / 20 在跑 / 1 家企业
+-- 没有这条索引要 **24.6ms**，2000 待领 / 40 在跑要 **79.3ms**——那是 worker 每秒都在付的钱。
+-- 名字跟着模型与迁移里那份（`ix_jobs_org_status`），不是另起一个：两条路径上出现两个同义索引
+-- 比没有索引更难查。
+CREATE INDEX IF NOT EXISTS ix_jobs_org_status ON jobs (org_id, status);
 """
 
 
