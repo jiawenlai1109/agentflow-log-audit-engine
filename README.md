@@ -219,8 +219,10 @@ cd frontend && npm install && npm run dev   # http://localhost:5173（默认账�
 - **企业维度（P3 进行中）**：数据集、Bundle、作业与报告在**同一企业成员之间共享**；跨企业一律不可见，越权访问统一按"不存在"返回（不给资源枚举留缝）。
   - 可见性判据只有**一处实现**（`app/access.py`），路由与 worker 都拼那一条；`tests/test_auth.py` 里有一条按 AST 查的守卫，防止判据出现第二份。
   - **删除仍只认造它的人**——可见不等于可删；会话（多轮上下文）是个人的，不随企业共享。
+  - **成员从哪来：建号时指定企业**。`POST /api/users`（仅全局 admin：用户名 + 口令 + 可选 `org`）、`GET /api/orgs`（admin 选名单）、`GET /api/users`（自己企业内的成员名单）。不做邀请制——那会多一套"未接受的邀请"与一条对外可达的写入口，而当前需求只是"企业内部多人能上传、能出报告"。`org` 留空 = 该账号未归属，只能看见自己的资源（默认拒绝，不是错误）。企业内角色 `memberships.role` **还不参与授权**：要放"企业 admin 自己建号"是单独一片，带自己的判据与测试。
+  - 建号接口的五种拒法各有理由：非管理员 403、用户名形状不对 422、口令太短 422、重名 409（静默复用等于改别人口令）、请求里有拼错的键 422（静默通过的表现是"管理员以为把人建进了企业，实际那人未归属"）。
   - `org_id = 0` 表示"未归属企业"，这类行只有自己看得见：默认拒绝，而不是默认放行。
-- **还没做的**：企业成员的加入/管理界面、产物按企业分目录（现在仍在同一个 `outputs/<run_id>/` 下，靠 API 判可见）、以及按企业的配额与上游并发闸门。
+- **还没做的**：成员管理的前端界面（接口已有，页面没有）、产物按企业分目录（现在仍在同一个 `outputs/<run_id>/` 下，靠 API 判可见）、以及按企业的配额与上游并发闸门。
 
 ## 目录结构
 
@@ -237,11 +239,14 @@ prompts/        # 9 份 system prompt（7 角色 + 摘要器 + 数据内容防�
 skills/         # 方法包：chart_selection（含 references/rules.yaml 规则表）/ cross_table_triage
 packs/          # 场景包（login_audit 单表 4 规则 / sigma_triage 三源 3 规则，含跨表加权）
 config/         # agents.yaml（角色白名单与预算、skills.disabled）+ mcp.yaml（外部 server 与出站 SQL）
-evals/          # 冻结评测集 suite.yaml（27 题）+ 基线 baseline.json
+evals/          # 冻结评测集 suite.yaml（28 题）+ 基线 baseline.json
 scripts/        # CLI 入口、demo 数据生成（零售/登录日志/SOC 三源/外部情报库）、批量跑测(run_batch)、评估聚合(evaluate)、门禁(run_eval)
 .github/        # CI：golden 自检 → pytest → mock 评测集门禁 → 前端构建
 demo/data/      # 固定验收数据集（含 triage/ 三源与 soc_intel.sqlite）
 tests/          # 自动化测试（单元/机制/端到端/API 全流程/鉴权与隔离/评分器/场景包/报告分档/skill/MCP/门禁容差/授权自检/LLM 响应形状/三元组等值）
+app/            # Web 后端：受理路由 + 一条归属判据(access.py) + 队列(queueing.py) +
+                #   执行体(runner.py) + 事件落库(eventlog.py) + 模型/迁移(models.py, migrations/)
+                #   独立 worker 入口在 scripts/worker.py（与 Web 共用 runner，不开第二套语义）
 outputs/        # 运行产物（不入 git）
 ```
 
