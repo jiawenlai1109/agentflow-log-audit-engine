@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import os
+from agentflow.core.atomic import replace_atomically
 
 MANIFEST_NAME = "manifest.json"
 TABLES_DIR = "tables"
@@ -267,7 +269,7 @@ class Bundle:
             staging.write_text(
                 json.dumps(self.manifest(), ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            os.replace(staging, target)
+            replace_atomically(staging, target)
         finally:
             staging.unlink(missing_ok=True)
         return target

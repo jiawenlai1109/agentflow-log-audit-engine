@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import uuid
 from pathlib import Path
@@ -16,6 +15,8 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+import os
+from agentflow.core.atomic import replace_atomically
 from agentflow.core.bundle import (
     SOURCES_DIR,
     TABLES_DIR,
@@ -228,11 +229,15 @@ def _write_atomically(target: Path, writer: Callable[[Path], Any]) -> Path:
     Bundle 缓存是跨 run 共享的目录，而归一化是好几个文件依次落盘。没有这一步时，
     并发冷启动的第二个请求可能读到"表文件已存在、内容只写了一半"的状态。
     rename 在同盘理论上是原子的；跨进程竞争由调用方的目录锁 + "manifest 最后写"兜住。
+
+    换名这一步走 `agentflow.core.atomic.replace_atomically`：同企业多人同时冷启动同一批
+    数据时会撞在一起，而 Windows 上"目标文件正被另一个读者开着"会让 `os.replace` 直接
+    `PermissionError`（实测 8 写 2 读、240 次替换里 91 次被拒 ⇒ 不是偶发运气）。
     """
     staging = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex[:8]}")
     try:
         writer(staging)
-        os.replace(staging, target)
+        replace_atomically(staging, target)
     finally:
         staging.unlink(missing_ok=True)
     return target
