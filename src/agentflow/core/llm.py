@@ -15,6 +15,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from agentflow.core.gate import get_gate
+
 
 class LLMError(RuntimeError):
     """LLM 调用失败（网络 / 鉴权 / 响应结构异常 / 预算耗尽）。"""
@@ -121,6 +123,10 @@ class BaseLLM(ABC):
 
     budget: Any = None  # BudgetCounter（由 pipeline 注入）
     agent_local = threading.local()  # 线程本地 agent 名（用于 usage 归因）
+    # 这次调用的事件该发给谁（由 pipeline 注入）。上游排队的事件走这个口子：
+    # 闸门不该认识 run，也不该靠线程登记表猜"现在是谁在调"——客户端实例本来就跟着调用走。
+    # 与 `budget` 同一个形状：缺省 None = 没人收，只留计数，绝不报错。
+    event_sink: Any = None
 
     def _spend(self) -> None:
         if self.budget is not None and not self.budget.spend():
@@ -354,10 +360,23 @@ class OpenAILLM(BaseLLM):
         )
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """发一次 chat/completions，含传输层退避重试与 usage 记账。"""
-        if self.budget is not None:
-            # 每次进入都记一次真实请求（退避重试的每一次也算）：成本口径不许只看到"逻辑调用"
-            self.budget.note_http_attempt()
+        """发一次 chat/completions，含传输层退避重试与 usage 记账。
+
+        **上游并发闸门就在这一层的入口**（P4）：所有真调用都从这一个漏斗过，所以
+        "Web 的 worker × 引擎内部 DAG 的 max_concurrency × 进程数"乘出来的那些路数
+        不可能有人绕过去——绕过的形状恰恰是"我在别处加了一道闸，这里忘了"。
+        闸门只管"几路在飞"，退避与重试仍在下面这一层：排队与重试是两件事，
+        混在一处就会把"配额到了"读成"网络不好"。
+        """
+        with get_gate().slot(sink=self.event_sink, model=self.model):
+            if self.budget is not None:
+                # 记一次真实请求（退避重试的每一次都算一次 `_request`）：成本口径不许只看到"逻辑调用"。
+                # 记账在槽位**里面**：排不上槽位就没发出任何 HTTP，把它算成一次请求会把成本读高。
+                self.budget.note_http_attempt()
+            return self._request_locked(payload)
+
+    def _request_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """真正发一次 HTTP 请求（已经被闸门罩住了）。"""
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

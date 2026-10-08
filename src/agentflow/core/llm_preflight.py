@@ -21,9 +21,16 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
-from agentflow.core.llm import EmptyContentError, LLMError, extract_json  # 与运行时同一个取正文口径
+from agentflow.core.llm import (  # 与运行时同一个取正文口径
+    EmptyContentError,
+    LLMError,
+    LLMHTTPError,
+    LLMTransportError,
+    extract_json,
+)
+from agentflow.core.stats import shape  # 与负载压测同一把尺：p95 在两边必须是同一个算法
 
 # `Authorization: Bearer xxx` 与 OpenAI 风格的长 opaque token：两种来路都要抹，
 # 判据按形状不按"是不是我那把 key"（缓存备注可能是网关回显的别人的 token）。
@@ -83,8 +90,23 @@ def probe(client: Any, *, max_tokens: int = DEFAULT_MAX_TOKENS) -> dict[str, Any
         )
         return record
     except LLMError as exc:
+        # 错误**按类型分格**，不靠读文案：`LLMHTTPError` 自带 code，而"网关回了 429"与
+        # "连不上"是两件事——混成一格就没法回答"闸门该定在几路"。文案改一个字就静默失效的
+        # 判据，是本项目最不该再犯的那类错（型号降级那条已经吃过一次）。
+        kind = "llm_error"
+        status = getattr(exc, "code", None)
+        if isinstance(exc, LLMHTTPError):
+            kind = f"http_{status}"
+        elif isinstance(exc, LLMTransportError):
+            kind = "transport"
         record.update(
-            {"ok": False, "seconds": round(time.monotonic() - started, 2), "error": "llm_error", "message": str(exc)[:200]}
+            {
+                "ok": False,
+                "seconds": round(time.monotonic() - started, 2),
+                "error": kind,
+                "http_status": status,
+                "message": str(exc)[:200],
+            }
         )
         return record
     except Exception as exc:  # noqa: BLE001 - 裸异常本身就是要抓的形状问题（见 #42 的教训）
@@ -206,6 +228,88 @@ def write_cache(report: dict[str, Any], path: Path) -> Path:
     return path
 
 
+CONCURRENCY_HISTORY_KEEP = 20
+
+# 历史条目留哪几格：**读数 + 判定依据**，不留正文（正文本来就不进缓存），也不留 `history` 本身。
+# 后者不是洁癖：第一版把自己塞进自己的取值里，缓存变成循环引用，写盘时 json 递归爆栈。
+CONCURRENCY_HISTORY_FIELDS = (
+    "measured_at",
+    "widths",
+    "calls_total",
+    "recommended_limit",
+    "waves",
+    "latency_payout_ratio",
+    "latency_payout_floor_seconds",
+)
+
+
+def _reading_only(concurrency: dict[str, Any]) -> dict[str, Any]:
+    """取一份读数的**独立副本**，只带形状字段。历史里放的必须是副本，不是容器本身。"""
+    return {key: concurrency.get(key) for key in CONCURRENCY_HISTORY_FIELDS if key in concurrency}
+
+
+def merge_concurrency(cache: Path, base_url: str, concurrency: dict[str, Any]) -> Path:
+    """把并发读数并进预检缓存，**不覆盖型号结论，也不覆盖上一次的读数**。
+
+    缓存按主机归组：换 endpoint 就是另一台网关，那台上量出来的干净档数在这台不作数
+    （与 `lookup` 那条"缓存属于别台站就判 unprobed"是同一个口径）。
+    按型号分开存：不同型号的配额可以完全不同，混成一个"这台站的上限"是假的。
+
+    为什么要留 `history`：2026-10-08 第一版把读数直接盖在旧读数上，于是"闸门默认值从哪来"
+    这句在第二次跑之后就查不到出处了。带时间戳的历史才是证据，最后一格就是当前值
+    （`history[-1]` 与顶层同源，两处不一致时以能读出来的这份为准）。
+    """
+    report = read_cache(cache) or {}
+    if report.get("probe_version") != PROBE_VERSION or (
+        report.get("base_host") and report.get("base_host") != host_of(base_url)
+    ):
+        report = {
+            "probe_version": PROBE_VERSION,
+            "base_host": host_of(base_url),
+            "models": [],
+        }
+    by_model = report.get("concurrency_by_model") or {}
+    key = str(concurrency.get("model"))
+    previous = by_model.get(key) or {}
+    history = list(previous.get("history") or [])
+    # 兼容"没有 history 的旧缓存"：上一版是直接把读数盖掉的，那份证据只挂在顶层。
+    # 按 measured_at 判重，顶层已经是历史最后一格时不重复推进去。
+    if previous.get("measured_at") and (
+        not history or history[-1].get("measured_at") != previous.get("measured_at")
+    ):
+        history.append(_reading_only(previous))
+    entry = dict(concurrency)
+    # 这里放的是**副本**：把 `concurrency` 自己塞进 `concurrency["history"]` 会让缓存变成
+    # 循环引用，写盘时 json 递归爆栈（第一版的真 bug，被这条链的用例抓住的）。
+    entry["history"] = (history + [_reading_only(concurrency)])[-CONCURRENCY_HISTORY_KEEP:]
+    by_model[key] = entry
+    report["concurrency_by_model"] = by_model
+    report["generated_at"] = int(time.time())
+    report["generated_at_text"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return write_cache(report, cache)
+
+
+def measured_concurrency(
+    report: dict[str, Any] | None, base_url: str, model: str
+) -> tuple[int | None, str]:
+    """闸门默认值的**出处**：(实测干净档数或 None, 给运维看的一句话)。
+
+    查不到就回 `None` 而不是回一个猜测值——让调用方明确知道自己没有读数可用，
+    这比"看起来有个默认值"诚实。主机与型号都要对上，否则是别台站/别个型号的数。
+    """
+    if not report or report.get("probe_version") != PROBE_VERSION:
+        return None, "没有预检缓存（或缓存来自旧版探针）"
+    if report.get("base_host") != host_of(base_url):
+        return None, f"缓存属于 {report.get('base_host')}，与当前端点 {host_of(base_url)} 不是同一台"
+    entry = (report.get("concurrency_by_model") or {}).get(str(model))
+    if not entry:
+        return None, f"这台站上没给 {model} 量过并发形状"
+    limit = entry.get("recommended_limit")
+    if not isinstance(limit, int) or limit <= 0:
+        return None, f"量过了但最低档都不干净（{concurrency_note(entry)}）"
+    return limit, concurrency_note(entry)
+
+
 def read_cache(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -221,6 +325,145 @@ def is_fresh(report: dict[str, Any], hours: int = DEFAULT_FRESH_HOURS) -> bool:
     if not isinstance(generated, (int, float)):
         return False
     return (time.time() - generated) <= hours * 3600
+
+
+# ---------------------------------------------------------------- 上游并发形状（P4-0）
+
+# 默认三档：1 路是基准，4 与 8 是"100 个用户同时点分析"在最省的形态下会打出来的路数。
+# 为什么不是 300：300 = 100 job × 内部 3 路，那是**算术**不是上限；把尺子拉到 300 去撞
+# 网关，撞出来的红分不清是"配额到了"还是"我们自己被打死了"。要谈 300 得先有 8 的读数。
+DEFAULT_WIDTHS = (1, 4, 8)
+# p95 相对 1 路基准的容忍倍率与绝对下限：超过两者才判"这一档已经开始排队"。
+# 绝对下限是必要的：快网关的 1 路基准 p95 会四舍五入成 0.0，那时任何抖动都能"超过基准 3 倍"，
+# 判据就会把噪声读成排队。倍率与下限都跟着读数一起落盘，改判据要重跑，不许只改结论。
+LATENCY_PAYOUT_RATIO = 3.0
+LATENCY_PAYOUT_FLOOR_S = 0.5
+
+
+def probe_concurrency(
+    make_client: Callable[[], Any],
+    widths: Sequence[int] = DEFAULT_WIDTHS,
+    *,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    settle_s: float = 1.0,
+    payout_ratio: float = LATENCY_PAYOUT_RATIO,
+    payout_floor_s: float = LATENCY_PAYOUT_FLOOR_S,
+) -> dict[str, Any]:
+    """按 1/4/8… 路**同时**打真实调用，量"这台网关此刻接得住几路"。
+
+    三条判据的形状，都得写清楚，否则读数会被读成它没有说的东西：
+
+    - **每档只发一波**（并发 = 该档路数，一次一发）。测的是"同时打开几个连接会不会被拒"，
+      不是吞吐量极限；把同一批连接反复用会低估拒绝率。
+    - **退避关掉**（调用方构造客户端时 `max_retries=0`）。带重试的探针会把 429 藏在
+      "最终成功"里，于是配额看起来比实际大——这正是 P4 闸门最不能骗自己的一格。
+    - **"排队"与"被拒"是两种红**：HTTP 429/5xx 是被拒，延迟涨到基准的数倍是被排队。
+      两者都记，`recommended_limit` 只取**两者都干净**的最大档。
+
+    `make_client` 每路调一次：客户端里有线程本地的 usage 归因，但预算与重试计数是实例状态，
+    多线程共用一个客户端会互相踩，量出来的延迟就不是上游的形状而是我们自己的锁竞争。
+    """
+    import threading
+
+    waves: list[dict[str, Any]] = []
+    baseline: dict[str, Any] | None = None
+    for width in sorted({int(item) for item in widths if int(item) > 0}):
+        results: list[dict[str, Any]] = []
+        lock = threading.Lock()
+
+        def one() -> None:
+            record = probe(make_client(), max_tokens=max_tokens)
+            with lock:
+                results.append(record)
+
+        threads = [threading.Thread(target=one, name=f"preflight-{width}") for _ in range(width)]
+        started = time.monotonic()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wall = round(time.monotonic() - started, 2)
+
+        latencies = [float(item.get("seconds") or 0.0) for item in results]
+        distribution = shape(f"width_{width}", latencies)
+        errors: dict[str, int] = {}
+        for item in results:
+            if item.get("ok"):
+                continue
+            # 直接用 `probe` 分好的格子（http_429 / transport / empty_content / …）。
+            # 这里不再从文案里正则找状态码：那样判据就建在"错误怎么写"上，文案一改就漏计。
+            key = str(item.get("error") or "unknown")
+            errors[key] = errors.get(key, 0) + 1
+        refused = sum(count for code, count in errors.items() if code.startswith("http_"))
+        failed = sum(errors.values())
+        if width == min(sorted({int(item) for item in widths if int(item) > 0})):
+            baseline = distribution
+        # "排队"要**比值与绝对差都过线**才算：快网关的基准 p95 会四舍五入成 0.0，
+        # 那时"大于基准的 3 倍"对任何噪声都成立，判据会自己失效（这把尺第一版就是这样）。
+        delta = round(distribution["p95"] - (baseline or {}).get("p95", 0.0), 3)
+        payout = bool(
+            baseline
+            and distribution["p95"] > (baseline["p95"] * payout_ratio)
+            and delta > payout_floor_s
+        )
+        waves.append(
+            {
+                "width": width,
+                "calls": len(results),
+                "ok": sum(1 for item in results if item.get("ok")),
+                "refused": refused,
+                "failed": failed,
+                "errors": errors,
+                "wall_seconds": wall,
+                "latency": distribution,
+                "queued": payout,
+                "payout_delta_seconds": delta,
+                "payout_ratio": (
+                    round(distribution["p95"] / baseline["p95"], 2)
+                    if baseline and baseline["p95"]
+                    else None
+                ),
+            }
+        )
+        if settle_s:
+            time.sleep(settle_s)  # 让上一波的限流窗口过去，否则第二档测到的是第一档的余震
+
+    # 干净 = 没人被拒、没人失败、也没人排队。少一条都会把默认值定高，
+    # 而闸门定高一次的代价是线上跑到那档时才现形——那已经是用户的作业了。
+    clean = [
+        wave["width"]
+        for wave in waves
+        if wave["refused"] == 0 and wave["failed"] == 0 and not wave["queued"]
+    ]
+    recommended = max(clean) if clean else 0
+    return {
+        "widths": [wave["width"] for wave in waves],
+        "calls_total": sum(wave["calls"] for wave in waves),
+        "latency_payout_ratio": payout_ratio,
+        "latency_payout_floor_seconds": payout_floor_s,
+        "waves": waves,
+        "recommended_limit": recommended,
+        # 这个数是"我这把尺判出来的干净最大档"，不是网关公布的配额。闸门可以拿它当默认值，
+        # 但谁都不许把它读成"上游支持 N 路"。
+        "recommended_meaning": "最后一档没有 429/5xx、没有失败、p95 也没超基准的 3 倍；再往上没有数据",
+        "measured_at": int(time.time()),
+    }
+
+
+def concurrency_note(concurrency: dict[str, Any] | None) -> str:
+    """把并发读数说成一句人话（包括"根本没测过"这一种）。"""
+    if not concurrency:
+        return "上游并发形状未测：闸门用的是保守占位值，不是实测配额"
+    waves = concurrency.get("waves") or []
+    parts = [
+        f"{wave['width']}路:{wave['ok']}/{wave['calls']}ok,p95={wave['latency']['p95']}s"
+        + (f",拒{wave['refused']}" if wave["refused"] else "")
+        + (",排队" if wave["queued"] else "")
+        for wave in waves
+    ]
+    limit = concurrency.get("recommended_limit")
+    tail = f"干净上限≥{limit}" if limit else "连最低档都不干净"
+    return "上游并发实测：" + " ｜ ".join(parts) + f" ⇒ {tail}"
 
 
 def lookup(report: dict[str, Any] | None, base_url: str, model: str) -> tuple[str, str]:

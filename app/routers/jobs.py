@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app import access, config, eventlog, queueing
+from app import access, config, eventlog, llm_gate, queueing
 from app.runner import Dispatcher
 from app.db import query_one
 from app.deps import get_current_user
@@ -57,6 +57,9 @@ def _visible_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
     job["queue"] = queueing.stats()
+    # 上游闸门的读数与队列深度**分两个字段**：queue 是库里的全局事实，gate 是本进程的累计量。
+    # 合成一个字典就会让人以为 inflight/limit 也是全局数——那是"没测过"说成"测过了"的变种。
+    job["llm_gate"] = llm_gate.snapshot()
     return job
 
 
@@ -290,7 +293,10 @@ async def job_events(job_id: str, request: Request, user: dict = Depends(get_cur
         sql, params = access.scope(user)
         # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者。
         # 数从库里读（queueing.stats）而不是读本进程簿记——job 可能被另一个进程的 worker 认领。
-        yield _sse({"type": "queue", **queueing.stats()})
+        # 首帧同时给两份深度：库里的队列深度（全局）与本进程的闸门读数（局部）。
+        # 只给前者，"上游 16 路全在飞、还有 9 个作业在等槽位"这件事在读数上就是隐形的，
+        # 用户看到的仍是"点了没反应"——那正是 P4 要消掉的那格。
+        yield _sse({"type": "queue", **queueing.stats(), "gate": llm_gate.snapshot()})
         cursor = start
         while True:
             rows = eventlog.read_after(job_id, cursor)

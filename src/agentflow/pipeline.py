@@ -151,6 +151,9 @@ def _agent_llm(llm: BaseLLM, agent_cfg: dict[str, Any]) -> BaseLLM:
             envelope_floor=llm.envelope_floor,
         )
         clone.budget = llm.budget
+        # 克隆体要带上事件出口：少了这一行，"按角色换型号"的那个角色就变成哑巴——
+        # 它排队照样计入闸门读数，但没人能看见（预算也是同一个道理，见上面那行）。
+        clone.event_sink = llm.event_sink
         return clone
     return llm
 
@@ -289,6 +292,10 @@ def run_analysis(
 
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
     llm.budget = budget  # v1.2：预算计数点下沉到 LLM 层（每次真实 API 调用计 1）
+    # 事件出口跟着客户端走（P4 的排队留痕要用）。必须在 `build_agents` **之前**挂上，
+    # 否则按角色克隆出来的那些客户端（`_agent_llm`）拿不到 sink——症状是"换型号的那个
+    # 角色排队了但没人知道"，而计数仍然对，这种不对称最难查。
+    llm.event_sink = on_event
     budget.llm_policy = llm_policy(llm)  # 档位/信封/重试/降级候选：进 evaluation.json 供归因
     # skill 装载必须在 build_agents 之前：注入发生在各角色 __init__ 里。
     # 权限预检用的就是运行时那一份白名单函数，两套口径必然打架（见 core/skill.py）。

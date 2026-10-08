@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agentflow.core import dataset_scope
+from agentflow.core import dataset_scope, gate
 from agentflow.core.budget import BudgetCounter
 from agentflow.core.context import RunContext, new_run_id
 from agentflow.core.messages import AgentMessage
@@ -937,6 +937,12 @@ class Orchestrator:
             # 真实 HTTP 请求次数：`llm_calls` 记的是逻辑调用（Agent 层计 1）。
             # 降级与提额重试只动前者——两个数一分开，"这次到底打了多少次上游"才看得见。
             "llm_http_attempts": int(getattr(ctx.budget, "http_attempts", 0) or 0),
+            # 上游并发闸门的读数（P4）。口径先说清：这是**本进程自启动以来**的累计量，
+            # 不是这一次 run 独享的数（同进程里两个 job 交错跑，等待样本就交错进来了）。
+            # 为什么还要落进产物：闸门有没有真的在拦人、排队排到什么程度、上限是从哪来的，
+            # 是"我们说它生效了"和"它到底生效了"之间的差别。没有这份读数，那次 real 全量
+            # 里"上游被打爆"与"我们自己打爆自己"就永远分不开。
+            "llm_gate": gate.snapshot(),
             # 数据集行数是报告"审计范围 N 条"这类结论数字的确定性出处，评估器据此核对
             "dataset_rows": (ctx.schema_profile or {}).get("row_count"),
             # 多源报告头部会逐张表报行数（"auth.csv 282 行、assets.csv 24 行…"）。

@@ -17,14 +17,10 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends
 
-from app import config as app_config
-from app.deps import get_current_user
 from agentflow.core.config import load_config
 from agentflow.core.llm_preflight import (
     PROBE_VERSION,
@@ -34,22 +30,14 @@ from agentflow.core.llm_preflight import (
     mask_secrets,
     read_cache,
 )
+from app.deps import get_current_user
+
+# 缓存位置与"当前实际用的端点/型号"这两条口径住在 `app/llm_gate.py`：那边是闸门开闸时读它，
+# 这里是接口转述它。两处各写一遍的下场是——接口说"没有预检结论"，闸门却按一份旧缓存开闸。
+from app.llm_gate import cache_path as _cache_path
+from app.llm_gate import effective as _effective
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
-
-
-def _cache_path(config: dict[str, Any]) -> Path:
-    """缓存位置与命令行默认同一个：`llm.preflight_cache` 可覆盖，否则 `.appdata/`。"""
-    configured = (config.get("llm", {}) or {}).get("preflight_cache")
-    return Path(configured) if configured else app_config.app_data_dir() / "llm_preflight.json"
-
-
-def _effective(config: dict[str, Any]) -> tuple[str, str]:
-    """当前实际会用的 (base_url, model)：配置留空退环境变量，与 pipeline 同一套优先级。"""
-    llm_cfg = config.get("llm", {}) or {}
-    base_url = llm_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-    model = llm_cfg.get("model") or os.getenv("LLM_MODEL") or "gpt-4o-mini"
-    return str(base_url), str(model)
 
 
 @router.get("/models")

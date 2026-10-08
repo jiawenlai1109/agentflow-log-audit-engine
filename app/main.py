@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
 
-from app import config
+from app import config, llm_gate
 from app.db import init_db
 from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions, users
 from app.runner import reclaim_at_boot
@@ -28,6 +29,15 @@ async def lifespan(_: FastAPI):
     ):
         directory.mkdir(parents=True, exist_ok=True)
     init_db()
+    # 上游并发闸门在**开认领循环之前**定档：晚了就没有"第一批作业就撞上未开闸的窗口"这种
+    # 说不清的状态。读数一行打进日志——运维要能在启动日志里看到这个数是量来的还是占位。
+    gate_view = llm_gate.apply_for_process()
+    logger.info(
+        "LLM 闸门：%s 路（来源=%s）%s",
+        gate_view.get("limit"),
+        gate_view.get("limit_source"),
+        f"｜{gate_view.get('note')}" if gate_view.get("limit_source") != "env" else "",
+    )
     # 上次进程被杀时留下的"running"要收回来（P0 读数：28 个 job 永远停在非终态）。
     # 先收再开认领循环，否则新起的认领者看不到那批僵尸行要等的更久。
     reclaim_at_boot()
@@ -37,6 +47,8 @@ async def lifespan(_: FastAPI):
     finally:
         jobs.dispatcher.stop()
 
+
+logger = logging.getLogger("agentflow.web")
 
 app = FastAPI(
     title="多智能体数据分析引擎",

@@ -115,6 +115,10 @@ class JobOut(BaseModel):
     # "点了没反应"与"卡死了"之间猜。100 并发下这条从体验问题变成必要的运维信息。
     # `stale_pending` 单列：那是"没人能认领也没人负责"的行，混进 queued 就是给运维一个不动的数。
     queue: dict[str, int] | None = None
+    # 上游并发闸门的读数（P4）。刻意与 `queue` **分成两个字段**：queue 是库里的全局事实，
+    # gate 是"本进程此刻看到的那一段"。并成一个字典就会让人以为 limit/inflight 也是全局数——
+    # 那是把"没测"说成"测过"的同一类错，只是换了一个地方。
+    llm_gate: dict[str, Any] | None = None
 
 
 class DatasetOut(BaseModel):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,10 +31,16 @@ from agentflow.core.llm import LLMError, OpenAILLM  # noqa: E402
 from agentflow.core.streams import harden_streams  # noqa: E402
 from agentflow.core.llm_preflight import (  # noqa: E402
     DEFAULT_MAX_TOKENS,
+    PROBE_VERSION,
     build_report,
     classify,
+    concurrency_note,
+    host_of,
     list_models,
+    merge_concurrency,
     probe,
+    probe_concurrency,
+    read_cache,
     write_cache,
 )
 
@@ -41,15 +48,77 @@ LEVELS = ("default", "disabled")
 COLUMNS = 104
 
 
+def _run_concurrency(args, config: dict, base_url: str, api_key: str) -> int:
+    """`--concurrency` 模式：只量上游并发形状，不重探型号可用性。
+
+    成本口径先打在屏幕上再动手——**这笔钱是花在读数上的，得让人看得见花在几次调用**。
+    每档一波、退避关掉：带重试会把 429 藏进"最终成功"，量出来的配额会比真值大。
+    """
+    import os
+
+    widths = [int(item) for item in args.widths.split(",") if item.strip().isdigit()]
+    widths = [item for item in widths if item > 0]
+    if not widths:
+        print("--widths 一个都没解析出来（要写成 1,4,8 这样）。一次调用都不发。")
+        return 1
+    llm_cfg = config.get("llm", {}) or {}
+    model = args.model or os.getenv("LLM_MODEL") or llm_cfg.get("model") or "gpt-4o-mini"
+    thinking = llm_cfg.get("thinking") or None
+    planned = sum(widths)
+    print(f"端点 {base_url} ｜ 型号 {model} ｜ thinking={thinking or '（不发这个字段）'}")
+    print(
+        f"将产生 {planned} 次真实调用：并发档 {'/'.join(str(item) for item in widths)}，每档一波，"
+        f"max_tokens={args.max_tokens}，传输层退避已关（不关就把 429 藏进成功里）"
+    )
+
+    def make_client() -> OpenAILLM:
+        return OpenAILLM(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            timeout=120,
+            max_retries=0,
+            thinking=thinking,
+        )
+
+    concurrency = probe_concurrency(make_client, widths, max_tokens=args.max_tokens)
+    concurrency["model"] = model
+    concurrency["thinking"] = thinking
+    path = merge_concurrency(Path(args.cache), base_url, concurrency)
+    if args.json:
+        print(json.dumps(concurrency, ensure_ascii=False, indent=2))
+    else:
+        print("-" * COLUMNS)
+        for wave in concurrency["waves"]:
+            latency = wave["latency"]
+            print(
+                f"  {wave['width']:>3} 路  ok={wave['ok']}/{wave['calls']}  拒={wave['refused']}  "
+                f"墙钟={wave['wall_seconds']:>6}s  p50={latency['p50']}s p95={latency['p95']}s max={latency['max']}s"
+                + ("  ← 排队" if wave["queued"] else "")
+                + (f"  错误形状={wave['errors']}" if wave["errors"] else "")
+            )
+        print("-" * COLUMNS)
+        print(concurrency_note(concurrency))
+        print(f"已并入缓存：{path}（只有形状与计数，没有正文、没有凭据）")
+    return 0
+
+
 def main() -> int:
     harden_streams()
-    parser = argparse.ArgumentParser(description="LLM 型号可用性预检（产生真实调用）")
+    parser = argparse.ArgumentParser(description="LLM 型号可用性与上游并发预检（产生真实调用）")
     parser.add_argument("--models", default="", help="逗号分隔的型号；留空 = 用 GET /models 列出的全部")
     parser.add_argument("--levels", default=",".join(LEVELS), help="逗号分隔：default / disabled")
     parser.add_argument("--base-url", default="", help="覆盖 OPENAI_BASE_URL（测别的站时用）")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--cache", default=str(PROJECT_ROOT / ".appdata" / "llm_preflight.json"))
     parser.add_argument("--json", action="store_true", help="输出 JSON 而不是表格")
+    parser.add_argument(
+        "--concurrency",
+        action="store_true",
+        help="只测上游并发形状（P4 闸门的默认值出处）；配合 --model 点一个型号",
+    )
+    parser.add_argument("--widths", default="1,4,8", help="逗号分开的并发档，如 1,4,8")
+    parser.add_argument("--model", default="", help="并发模式点名的型号（留空 = 用 .env/config 里那个）")
     args = parser.parse_args()
 
     load_dotenv(PROJECT_ROOT / ".env")
@@ -62,6 +131,9 @@ def main() -> int:
     if not api_key:
         print("缺少 OPENAI_API_KEY（.env 或环境变量），预检中止——一次调用都不发。")
         return 1
+
+    if args.concurrency:
+        return _run_concurrency(args, config, base_url, api_key)
 
     levels = [level for level in args.levels.split(",") if level.strip()]
     if args.models.strip():

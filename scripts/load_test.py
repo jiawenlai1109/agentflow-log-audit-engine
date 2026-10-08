@@ -39,6 +39,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402  # 驱动就用电机客户端：同一份请求形状，不自己造第二套协议
 
+# 分位数与分布读数**只有这一把尺**：压测与上游并发探针（P4）比的是同一组 p50/p95/max，
+# 各写一遍的话，两次改造的读数就没法放进同一张表里比了。
+from agentflow.core.stats import percentile, shape  # noqa: E402,F401（load_test.shape 仍被用例引用）
 from agentflow.core.streams import harden_streams  # noqa: E402
 from app.queueing import TERMINAL as TERMINAL_STATUSES  # noqa: E402
 
@@ -49,28 +52,6 @@ NON_TERMINAL_WHERE = "status NOT IN (" + ", ".join(f"'{state}'" for state in TER
 CSV = ROOT / "demo" / "data" / "login_auth.csv"
 QUESTION = "对2026-09-05的登录日志做安全审计，列出失败次数最高的账号"
 PACK = "login_audit"
-
-
-def percentile(values: list[float], q: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round(q / 100 * (len(ordered) - 1)))))
-    return ordered[index]
-
-
-def shape(name: str, values: list[float]) -> dict[str, float]:
-    """一条分布的六个读数。平均值不在这里——平均值是这批里最容易被挑来骗人的那一个。"""
-    if not values:
-        return {"n": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0, "mean": 0.0}
-    return {
-        "n": len(values),
-        "p50": round(percentile(values, 50), 3),
-        "p95": round(percentile(values, 95), 3),
-        "p99": round(percentile(values, 99), 3),
-        "max": round(max(values), 3),
-        "mean": round(statistics.fmean(values), 3),
-    }
 
 
 def free_port() -> int:
