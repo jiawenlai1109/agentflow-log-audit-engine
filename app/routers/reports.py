@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import config
+from app import access, config
 from app.db import query
 from app.deps import ensure_run_access, get_current_user, guard_within
 from app.schemas import EvaluationSummary
@@ -30,11 +30,14 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
     """归属来自 jobs 表（run 由谁提交），指标来自 evaluation.json（谁跑出了什么）。
 
     鉴权上线前由 CLI 直跑产生的 run 没有 jobs 记录，因此不出现在列表里——默认拒绝。
+    判据来自 `app/access.py`：报告是企业内的共享资产，所以列表里既有自己跑的，也有同企业
+    成员跑的；`org_id = 0`（没归属企业）的行仍然只有自己看得见。
     """
+    sql, params = access.scope(user)
     rows = query(
-        "SELECT run_id, question, status, created_at FROM jobs "
-        "WHERE user_id = ? AND run_id IS NOT NULL ORDER BY id DESC",
-        (user["id"],),
+        "SELECT run_id, user_id, question, status, created_at FROM jobs "
+        f"WHERE 1{sql} AND run_id IS NOT NULL ORDER BY id DESC",
+        params,
     )
     runs: list[dict[str, Any]] = []
     for row in rows:
@@ -57,7 +60,12 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
                 "critic_pass": evaluation.get("critic_pass"),
                 "degraded_reason": evaluation.get("degraded_reason"),
                 "created_at": row.get("created_at"),
-                "report_path": str(evaluation_file.parent / "report.md"),
+                # 协作列表要能分清"我跑的"与"同事跑的"。这里给布尔而不是对方的 user_id：
+                # 列出别人的内部标识对使用者没有意义，却是一次信息外泄。
+                "is_mine": int(row.get("user_id") or 0) == int(user["id"]),
+                # 原来这里还回一份 `report_path`（服务器绝对路径）。共享读把它的作用域从
+                # "只有 owner 看得见"扩到"同企业都看得见"，而前端从来没用过这个字段
+                # （全仓 grep 只命中引擎产物里的同名键）——那就撤掉，不外泄存储布局。
             }
         )
     return runs

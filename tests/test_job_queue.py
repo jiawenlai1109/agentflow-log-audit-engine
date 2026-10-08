@@ -97,9 +97,9 @@ def test_depth_reports_running_and_queued_separately():
 
 
 def test_queue_depth_reaches_the_api_shape():
-    """`JobOut.queue` 不是装饰字段：`_owned_job` 每次都要带上深度，否则前端拿不到位置。"""
+    """`JobOut.queue` 不是装饰字段：`_visible_job` 每次都要带上深度，否则前端拿不到位置。"""
     from app.db import execute, query_one
-    from app.routers.jobs import _owned_job, manager
+    from app.routers.jobs import _visible_job, manager
     from app.security import hash_password
 
     execute("DELETE FROM users WHERE username = ?", ("queue-shape-user",))
@@ -113,19 +113,20 @@ def test_queue_depth_reaches_the_api_shape():
     queueing.accept(
         job_id="job_queue_shape",
         user_id=uid,
+        org_id=0,
         question="测试队列可见性",
         mode="mock",
         session_id=None,
         pack=None,
         spec={"question": "测试队列可见性", "source_ref": ""},
     )
-    row = _owned_job("job_queue_shape", {"id": uid})
+    row = _visible_job("job_queue_shape", {"id": uid})
     # 深度从库里读，不从本进程的簿记读：多进程部署下后者只看得见自己那几个
     assert row["queue"] == queueing.stats(), row
     assert {"workers", "running", "queued", "stale_pending"} == set(row["queue"]), row["queue"]
     # 别人的 job 一律 404：加了 queue 字段不能顺手把归属过滤放宽
     with pytest.raises(Exception) as raised:
-        _owned_job("job_queue_shape", {"id": 999_999})
+        _visible_job("job_queue_shape", {"id": 999_999})
     assert getattr(raised.value, "status_code", None) == 404
     execute("DELETE FROM jobs WHERE job_id = ?", ("job_queue_shape",))
     execute("DELETE FROM users WHERE id = ?", (uid,))

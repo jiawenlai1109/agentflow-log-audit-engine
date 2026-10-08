@@ -21,7 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
-from app import config
+from app import access, config
 from app.db import execute, query, query_one
 from app.deps import get_current_user
 from app.upload_guard import scan_formula_cells, sniff_rejection, zip_bomb_rejection
@@ -85,7 +85,8 @@ def create_bundle(
         path, size, oversize = _assemble(staging, spec, user["id"])
         assembled_files.append((spec["filename"], path, size, oversize))
 
-    _insert_bundle_row(bundle_id, user["id"], display_name, root)
+    org_id = access.primary_org(user)
+    _insert_bundle_row(bundle_id, user["id"], org_id, display_name, root)
 
     accepted: list[Path] = []
     records: list[dict[str, Any]] = []
@@ -105,10 +106,12 @@ def create_bundle(
 
     if async_parse and accepted:
         # 分片重组后的包可能上百 MB，解析不能占住请求线程；用独立单线程池，
-        # 不与分析任务抢 JobManager 的两个 worker
-        _PARSE_POOL.submit(_finish_bundle, bundle_id, user["id"], display_name, root, records, accepted)
+        # 不与分析任务抢 JobManager 的两个 worker。
+        # 线程只拿 id，不拿整个 user 字典：它是请求对象之外的生命周期，
+        # 传进去的东西越少，越不容易在很久以后被人当成"当前登录者"来用。
+        _PARSE_POOL.submit(_finish_bundle, bundle_id, user["id"], org_id, display_name, root, records, accepted)
         return get_bundle_view(bundle_id, user)
-    _finish_bundle(bundle_id, user["id"], display_name, root, records, accepted)
+    _finish_bundle(bundle_id, user["id"], org_id, display_name, root, records, accepted)
     return get_bundle_view(bundle_id, user)
 
 
@@ -158,6 +161,7 @@ def _guard_file(
 def _finish_bundle(
     bundle_id: str,
     user_id: int,
+    org_id: int,
     name: str,
     root: Path,
     records: list[dict[str, Any]],
@@ -176,7 +180,7 @@ def _finish_bundle(
     elif not bundle.tables:
         error = error or "Bundle 里没有任何可分析的表：文本/日志只能作证据，数字必须来自表"
     _merge_parse_results(records, bundle)
-    _store_result(bundle_id, user_id, root, records, bundle, error)
+    _store_result(bundle_id, user_id, org_id, root, records, bundle, error)
 
 
 def _write_limited(upload: UploadFile, target: Path, limit: int) -> tuple[int, bool]:
@@ -363,18 +367,23 @@ def _merge_parse_results(records: list[dict[str, Any]], bundle: Bundle | None) -
         record["reason"] = "解析后未归入任何表或证据文件"
 
 
-def _insert_bundle_row(bundle_id: str, user_id: int, name: str, root: Path) -> None:
-    """先落一行 `parsing`：解析崩在后台线程里时，前端仍然查得到这个包和它的状态。"""
+def _insert_bundle_row(bundle_id: str, user_id: int, org_id: int, name: str, root: Path) -> None:
+    """先落一行 `parsing`：解析崩在后台线程里时，前端仍然查得到这个包和它的状态。
+
+    `org_id` 与 `user_id` 一起写：Bundle 是企业内的共享资产，子表（bundle_files /
+    bundle_tables）后续也按同一个 org 落行——少了这一列，同企业成员读子表会被判不可见。
+    """
     execute(
-        "INSERT INTO bundles (bundle_id, user_id, name, root, status, file_count) VALUES"
-        " (?, ?, ?, ?, 'parsing', 0)",
-        (bundle_id, user_id, name, str(root)),
+        "INSERT INTO bundles (bundle_id, user_id, org_id, name, root, status, file_count) VALUES"
+        " (?, ?, ?, ?, ?, 'parsing', 0)",
+        (bundle_id, user_id, org_id, name, str(root)),
     )
 
 
 def _store_result(
     bundle_id: str,
     user_id: int,
+    org_id: int,
     root: Path,
     records: list[dict[str, Any]],
     bundle: Bundle | None,
@@ -383,21 +392,24 @@ def _store_result(
     status = "failed" if error else "ready"
     tables = list(bundle.tables) if bundle else []
     documents = list(bundle.documents) if bundle else []
+    # 这是"造它的人的写入"，所以判据用 OWNER（按 id 的那一份，见 access.scope_by_id）
+    sql, params = access.scope_by_id(user_id, access.OWNER)
     execute(
         "UPDATE bundles SET status = ?, error = ?, file_count = ?, table_count = ?,"
-        " document_count = ? WHERE bundle_id = ? AND user_id = ?",
-        (status, error, len(records), len(tables), len(documents), bundle_id, user_id),
+        f" document_count = ? WHERE bundle_id = ?{sql}",
+        (status, error, len(records), len(tables), len(documents), bundle_id, *params),
     )
     # 重解析（同一 bundle_id 再入库）要先清干净，否则逐文件状态会累积成两份
     for child in ("bundle_tables", "bundle_files"):
-        execute(f"DELETE FROM {child} WHERE bundle_id = ? AND user_id = ?", (bundle_id, user_id))
+        execute(f"DELETE FROM {child} WHERE bundle_id = ?{sql}", (bundle_id, *params))
     for record in records:
         execute(
-            "INSERT INTO bundle_files (bundle_id, user_id, filename, stored_path, size, sha256,"
-            " kind, table_ref, reason, hint, risk) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bundle_files (bundle_id, user_id, org_id, filename, stored_path, size, sha256,"
+            " kind, table_ref, reason, hint, risk) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 bundle_id,
                 user_id,
+                org_id,
                 record["filename"],
                 record["stored_path"],
                 record["size"],
@@ -411,11 +423,12 @@ def _store_result(
         )
     for table in tables:
         execute(
-            "INSERT INTO bundle_tables (bundle_id, user_id, table_ref, source_file, path,"
-            " row_count, columns, encoding, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO bundle_tables (bundle_id, user_id, org_id, table_ref, source_file, path,"
+            " row_count, columns, encoding, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 bundle_id,
                 user_id,
+                org_id,
                 table.id,
                 table.source_file,
                 str(table.path),
@@ -427,10 +440,10 @@ def _store_result(
         )
 
 
-def _owned_bundle_row(bundle_id: str, user: dict[str, Any]) -> dict[str, Any]:
-    row = query_one(
-        "SELECT * FROM bundles WHERE bundle_id = ? AND user_id = ?", (bundle_id, user["id"])
-    )
+def _visible_bundle_row(bundle_id: str, user: dict[str, Any]) -> dict[str, Any]:
+    """Bundle 与它的逐文件状态是企业内共享的资产：判据来自 access，不在这里重写。"""
+    sql, params = access.scope(user)
+    row = query_one(f"SELECT * FROM bundles WHERE bundle_id = ?{sql}", (bundle_id, *params))
     if not row:
         # 不区分"不存在"与"别人的"：一律 404，不给枚举留缝
         raise HTTPException(status_code=404, detail="Bundle 不存在")
@@ -438,18 +451,21 @@ def _owned_bundle_row(bundle_id: str, user: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_bundle_view(bundle_id: str, user: dict[str, Any]) -> dict:
-    row = _owned_bundle_row(bundle_id, user)
+    row = _visible_bundle_row(bundle_id, user)
+    # 子表也带 org_id（`_store_result` 写进去的），所以同企业成员读到的是同一份逐文件状态；
+    # 若这里退回 user_id 判据，协作者会看见"包在、文件列表是空的"——那比报错更难查。
+    sql, params = access.scope(user)
     files = query(
         "SELECT filename, size, sha256, kind, table_ref, reason, hint, risk"
-        " FROM bundle_files WHERE bundle_id = ? AND user_id = ? ORDER BY id",
-        (bundle_id, user["id"]),
+        f" FROM bundle_files WHERE bundle_id = ?{sql} ORDER BY id",
+        (bundle_id, *params),
     )
     for item in files:
         item["risk"] = json.loads(item.get("risk") or "{}")
     tables = query(
         "SELECT table_ref, source_file, row_count, columns, encoding, sha256"
-        " FROM bundle_tables WHERE bundle_id = ? AND user_id = ? ORDER BY table_ref",
-        (bundle_id, user["id"]),
+        f" FROM bundle_tables WHERE bundle_id = ?{sql} ORDER BY table_ref",
+        (bundle_id, *params),
     )
     for item in tables:
         item["columns"] = json.loads(item["columns"] or "[]")
@@ -476,10 +492,11 @@ def get_bundle_view(bundle_id: str, user: dict[str, Any]) -> dict:
 
 @router.get("")
 def list_bundles(user: dict = Depends(get_current_user)) -> list[dict]:
+    sql, params = access.scope(user)
     rows = query(
         "SELECT bundle_id, name, status, file_count, table_count, document_count, created_at"
-        " FROM bundles WHERE user_id = ? ORDER BY id DESC",
-        (user["id"],),
+        f" FROM bundles WHERE 1{sql} ORDER BY id DESC",
+        params,
     )
     return rows
 
@@ -490,7 +507,7 @@ def load_bundle_for_analysis(bundle_id: str, user: dict[str, Any]) -> Bundle:
     放在本模块而不是 jobs.py，是因为它必须与本文件的写入用**同一个** `config.bundles_dir()`——
     两处各自 import 的话，改一处配置就会让"自己写的快照"被判成越界文件。
     """
-    row = _owned_bundle_row(bundle_id, user)
+    row = _visible_bundle_row(bundle_id, user)
     if row["status"] != "ready":
         raise HTTPException(
             status_code=409, detail=f"Bundle 不可分析：{row['error'] or row['status']}"
@@ -517,10 +534,11 @@ def preview_table(
     user: dict = Depends(get_current_user),
 ) -> dict:
     """表预览：只读声明存在的那张表的前 N 行（数字来源仍是表，不是文档）。"""
-    row = _owned_bundle_row(bundle_id, user)
+    row = _visible_bundle_row(bundle_id, user)
+    sql, params = access.scope(user)
     table = query_one(
-        "SELECT * FROM bundle_tables WHERE bundle_id = ? AND table_ref = ? AND user_id = ?",
-        (bundle_id, table_ref, user["id"]),
+        f"SELECT * FROM bundle_tables WHERE bundle_id = ? AND table_ref = ?{sql}",
+        (bundle_id, table_ref, *params),
     )
     if table is None:
         raise HTTPException(status_code=404, detail=f"Bundle {bundle_id} 里没有表 {table_ref}")
@@ -543,10 +561,12 @@ def preview_table(
 
 @router.delete("/{bundle_id}")
 def delete_bundle(bundle_id: str, user: dict = Depends(get_current_user)) -> dict:
-    row = _owned_bundle_row(bundle_id, user)
+    row = _visible_bundle_row(bundle_id, user)
+    # 删除只认造它的人：可见 ≠ 可删（判据与理由见 app/access.py）
+    sql, params = access.scope(user, access.OWNER)
     directory = config.bundles_dir() / bundle_id
     if directory.exists() and _within(config.bundles_dir(), directory):
         shutil.rmtree(directory, ignore_errors=True)
     for table in ("bundle_tables", "bundle_files", "bundles"):
-        execute(f"DELETE FROM {table} WHERE bundle_id = ? AND user_id = ?", (bundle_id, user["id"]))
+        execute(f"DELETE FROM {table} WHERE bundle_id = ?{sql}", (bundle_id, *params))
     return {"ok": True, "removed_root": str(Path(row["root"]).parent)}

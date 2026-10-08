@@ -335,7 +335,7 @@ def test_every_owned_table_query_is_user_scoped():
       ② 只住在 `app/queueing.py` 这一个文件里；
       ③ 条数封上限，多一条要单独决策；
       ④ 归属仍在别处判：读数据源时用行里的 user_id 重校验（runner.resolve_sources），
-         面向用户的每条读路径自带谓词（_owned_job / SSE / reports）。
+         面向用户的每条读路径自带谓词（access.scope 拼出来的那条 / SSE / reports）。
 
     读代码用 AST，不用"正则 + 相邻三行"：后者会被语句自己的形状骗过。第一版豁免就是这么
     失效的——把标记拼到 SQL 字面量开头之后，`"(SELECT|UPDATE|…)` 那条正则**一条都匹配不到**，
@@ -351,12 +351,32 @@ def test_every_owned_table_query_is_user_scoped():
     statement_start = re.compile(r"\s*(?:/\*[^*]*\*/\s*)?(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
     offenders: list[str] = []
     queue_internal: list[str] = []
+    composed: list[str] = []
+    composed_files: set = set()
     for py in sorted((PROJECT_ROOT / "app").rglob("*.py")):
-        for node in ast.walk(ast.parse(py.read_text(encoding="utf-8"))):
+        if py.name == "access.py":
+            # 判据的**家**允许出现 `user_id = ?` 这样的字面量——它是唯一那份实现。
+            # "只许有一份"由 test_ownership_predicate_has_exactly_one_home 反向钉住。
+            continue
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        # f-string 里的字面量段会被 ast.walk **单独**走一遍：那些碎片当然不含 user_id，
+        # 但判据是从外面拼进来的（{sql}），把它们当独立语句就会把每一条接线都误报成漏判。
+        # 所以先记下"属于某个 f-string 的字面量段"，只判整体。
+        inside_format = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                for part in node.values:
+                    if isinstance(part, ast.Constant):
+                        inside_format.add(id(part))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and id(node) in inside_format:
+                continue
+            has_format = False
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 text = node.value
             elif isinstance(node, ast.JoinedStr):  # f-string：把字面量段拼起来才是完整语句
                 text = "".join(part.value for part in node.values if isinstance(part, ast.Constant) and isinstance(part.value, str))
+                has_format = any(isinstance(part, ast.FormattedValue) for part in node.values)
             else:
                 continue
             if not statement_start.match(text):
@@ -368,8 +388,90 @@ def test_every_owned_table_query_is_user_scoped():
             if text.lstrip().startswith(marker) and py.name == queue_sql_home:
                 queue_internal.append(" ".join(text.split())[:70])
                 continue
+            if has_format:
+                # P3 之后判据不在语句字面量里，而是从 access 拼进来的（`WHERE id = ?{sql}`）。
+                # 这条豁免不是放行：它要求**本文件确实引用了 access.scope**，而
+                # "每个碰归属表的函数都真的调了它"由下一条守卫按函数逐个查
+                # （test_ownership_predicate_has_exactly_one_home）。
+                composed.append(f"{py.name}: {' '.join(text.split())[:70]}")
+                composed_files.add(py)
+                continue
             offenders.append(f"{py.name}: {' '.join(text.split())[:70]}")
     assert not offenders, "这些语句没有把归属写进 SQL：\n" + "\n".join(offenders)
     assert len(queue_internal) <= queue_sql_max, (
         f"跨用户的队列 SQL 从上限 {queue_sql_max} 涨到 {len(queue_internal)} 条：\n" + "\n".join(queue_internal)
     )
+    # 豁免要能查回来源：每一条"从 access 拼进来"的语句，所在文件必须真的引用了 access.scope
+    for path in sorted(composed_files, key=str):
+        body = path.read_text(encoding="utf-8")
+        assert "access.scope" in body, f"{path.name} 用 f-string 拼归属却没有引用 access.scope"
+    assert composed, "一条从 access 拼进来的语句都没有：P3 的接线被撤了？"
+
+
+def test_ownership_predicate_has_exactly_one_home():
+    """归属判定**只许住在 `app/access.py`**：路由里不许出现第二条实现。
+
+    P3 加企业共享时，"谁能看见哪一行"这条判据如果在 22 个路由里各写一遍，漏掉一处的表现
+    不是报错，而是**该被挡住的人看见了**。所以这里钉两件事：
+      ① `app/` 里除 access.py 之外，不许出现字面量 `user_id = ?`（那条只在判据的家里）；
+      ② 碰归属表的 SELECT/UPDATE/DELETE 语句，所在函数必须引用 `access.scope`/`access.scope_by_id`；
+         碰归属表的 INSERT，所在函数必须引用 `access.primary_org`——
+         只写 user_id 不写 org_id 的新行会永远落在"未归属"，共享读对它默认拒绝，
+         那种"接了线但没人能共享"的形态必须由守卫拦住，而不是靠人记得。
+    队列族（语句里带 `/*queue-internal*/`）不在拦截范围：它**故意**跨用户认领，
+    归属在读取时由 access 重判（见 app/runner.py 的 resolve_sources）。
+    """
+    import ast
+    import re
+
+    owned = ("datasets", "jobs", "sessions", "bundles", "bundle_files", "bundle_tables")
+    statement_start = re.compile(r"\s*(?:/\*[^*]*\*/\s*)?(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+    bare_predicate = []
+    unscoped = []
+    for py in sorted((PROJECT_ROOT / "app").rglob("*.py")):
+        if py.name == "access.py":
+            continue
+        source = py.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        if "user_id = ?" in source:
+            bare_predicate.append(py.name)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = ast.get_source_segment(source, node) or ""
+            if "queue-internal" in body:
+                continue
+            sql_texts = []
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                    sql_texts.append(inner.value)
+                elif isinstance(inner, ast.JoinedStr):
+                    sql_texts.append(
+                        "".join(
+                            part.value
+                            for part in inner.values
+                            if isinstance(part, ast.Constant) and isinstance(part.value, str)
+                        )
+                    )
+            reads = writes = writes_without_org = False
+            for text in sql_texts:
+                match = statement_start.match(text)
+                if not match:
+                    continue
+                if not any(re.search(rf"\b{table}\b", text) for table in owned):
+                    continue
+                kind = match.group(1).upper()
+                if kind == "INSERT":
+                    writes = True
+                    if not re.search(r"\borg_id\b", text):
+                        writes_without_org = True
+                else:
+                    reads = True
+            if reads and "access.scope" not in body:
+                unscoped.append(f"{py.name}:{node.name}（读/改路径没走 access.scope）")
+            if writes and writes_without_org and "access.primary_org" not in body:
+                # 只写 user_id 不写 org_id 的新行会永远落在"未归属"，共享读对它默认拒绝：
+                # 那种"接了线但没人能共享"的形态要由守卫拦住，而不是靠人记得
+                unscoped.append(f"{py.name}:{node.name}（INSERT 没盖 org 归属）")
+    assert not bare_predicate, "这些文件自己写了 `user_id = ?`，判据出现了第二份：\n" + "\n".join(bare_predicate)
+    assert not unscoped, "归属判据没走单点：\n" + "\n".join(unscoped)

@@ -35,8 +35,8 @@ MAX_ATTEMPTS = int(os.getenv("JOB_MAX_ATTEMPTS", "3"))
 LEASE_SECONDS = int(os.getenv("JOB_LEASE_SECONDS", "90"))
 # 队列的认领必须跨用户（共享队列的全部意义），所以这一族的 SQL 不带 user_id 谓词。
 # 那不是把归属关掉，而是把它挪到两个真正管得住的地方：
-#   ① 读数据源时用行里的 user_id 重校验（app/runner.resolve_sources）；
-#   ② 面向用户的每一条读路径仍带谓词（_owned_job / SSE / reports）。
+#   ① 读数据源时用行里的 user_id 重校验（app/runner.resolve_sources → app/access.dataset_row）；
+#   ② 面向用户的每一条读路径都拼 access.scope 那条谓词（jobs / SSE / reports / bundles）。
 # 标记一律**写在 SQL 字面量里**，不当常量拼在前面：tests/test_auth.py 的结构守卫读的是
 # 语句本身，`_MARK + "SELECT ..."` 那种拼法它看不见，于是"豁免"变成了"这条用例没管"。
 # 写进字面量还有个副作用是想要的：出现在 sqlite 日志里时，"这条 SQL 跨用户"是明着的。
@@ -78,6 +78,7 @@ def accept(
     *,
     job_id: str,
     user_id: int,
+    org_id: int,
     question: str,
     mode: str,
     session_id: str | None,
@@ -89,11 +90,14 @@ def accept(
     原来分两步（先插 `pending`，再 UPDATE 成 `queued` 并写 spec），中间那个窗口里的行
     又没人能认领（claim 只认 `queued`）、又被深度算进"排队"，于是崩溃或老数据留下的
     `pending` 会永远显示成"有人在等"。一步写完，窗口就不存在了。
+
+    `org_id` 由调用方给（`access.primary_org`）：作业行没归属的话，共享读对它默认拒绝，
+    同企业的人就永远看不见彼此跑过什么——那等于接了线但没人能共享。
     """
     execute(
-        "INSERT INTO jobs (job_id, user_id, question, mode, session_id, pack, status, spec) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-        (job_id, user_id, question, mode, session_id, pack, json.dumps(spec, ensure_ascii=False, default=str)),
+        "INSERT INTO jobs (job_id, user_id, org_id, question, mode, session_id, pack, status, spec) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+        (job_id, user_id, org_id, question, mode, session_id, pack, json.dumps(spec, ensure_ascii=False, default=str)),
     )
     notify()
 

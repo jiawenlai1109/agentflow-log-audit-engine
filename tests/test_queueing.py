@@ -312,15 +312,19 @@ def test_accept_writes_a_claimable_row_with_one_statement():
         queueing.accept(
             job_id="job_accept",
             user_id=uid,
+            org_id=7,
             question="一步受理",
             mode="mock",
             session_id=None,
             pack=None,
             spec={"question": "一步受理", "source_ref": "dataset:1"},
         )
-        row = query_one("SELECT status, spec, worker, user_id, attempts FROM jobs WHERE job_id='job_accept'")
+        row = query_one("SELECT status, spec, worker, user_id, org_id, attempts FROM jobs WHERE job_id='job_accept'")
         assert row["status"] == "queued" and row["worker"] is None, row
         assert row["user_id"] == uid and int(row["attempts"] or 0) == 0, row
+        # 企业归属在受理这一行就盖下去：没归属的作业行会被共享读默认拒绝，
+        # 同企业的人就看不见彼此跑过什么（P3 的接线靠这一列）
+        assert int(row["org_id"]) == 7, row
         assert json.loads(row["spec"])["source_ref"] == "dataset:1", row
     finally:
         _clean("job_accept", uid)

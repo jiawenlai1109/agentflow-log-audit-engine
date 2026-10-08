@@ -19,17 +19,21 @@ from app.schemas import (
     SessionCreateRequest,
     SessionOut,
 )
+from app import access
 from agentflow.core.context import SessionContext
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
 
 def _owned_session(session_id: str, user: dict) -> dict:
-    """不区分"不存在"与"别人的"，一律 404。"""
-    row = query_one(
-        "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
-        (session_id, user["id"]),
-    )
+    """不区分"不存在"与"别人的"，一律 404。
+
+    会话用 OWNER 而不是 SHARED：多轮记忆是**个人上下文**，用户没有说要把对话共享给同事，
+    而共享一份能驱动分析的会话历史，等于把别人写的提示词与中间结论也一起给出去。
+    数据集/报告走 SHARED，会话不走——这条区分是刻意的，不是漏了。
+    """
+    sql, params = access.scope(user, access.OWNER)
+    row = query_one(f"SELECT * FROM sessions WHERE session_id = ?{sql}", (session_id, *params))
     if not row:
         raise HTTPException(status_code=404, detail="会话不存在")
     return row
@@ -40,16 +44,14 @@ def create_session(payload: SessionCreateRequest, user: dict = Depends(get_curre
     session_id = f"session_{uuid.uuid4().hex[:10]}"
     dataset_path = None
     if payload.dataset_id:
-        dataset = query_one(
-            "SELECT * FROM datasets WHERE id = ? AND user_id = ?",
-            (payload.dataset_id, user["id"]),
-        )
+        # 数据集可以是同企业别人的（SHARED），会话本身仍是私有的
+        dataset = access.dataset_row(user, payload.dataset_id)
         if not dataset:
             raise HTTPException(status_code=404, detail="数据集不存在")
         dataset_path = dataset["path"]
     execute(
-        "INSERT INTO sessions (session_id, user_id, title, dataset_path) VALUES (?, ?, ?, ?)",
-        (session_id, user["id"], payload.title, dataset_path),
+        "INSERT INTO sessions (session_id, user_id, org_id, title, dataset_path) VALUES (?, ?, ?, ?, ?)",
+        (session_id, user["id"], access.primary_org(user), payload.title, dataset_path),
     )
     return {
         "session_id": session_id,
@@ -60,9 +62,8 @@ def create_session(payload: SessionCreateRequest, user: dict = Depends(get_curre
 
 @router.get("", response_model=list[SessionOut])
 def list_sessions(user: dict = Depends(get_current_user)) -> list[dict]:
-    rows = query(
-        "SELECT * FROM sessions WHERE user_id = ? ORDER BY id DESC", (user["id"],)
-    )
+    sql, params = access.scope(user, access.OWNER)
+    rows = query(f"SELECT * FROM sessions WHERE 1{sql} ORDER BY id DESC", params)
     result = []
     for row in rows:
         session = SessionContext(row["session_id"], config.sessions_root() / row["session_id"])
@@ -112,25 +113,30 @@ def post_message(
         dataset_path,
         payload.mode,
         session_id,
-        user["id"],
+        user,
         source_ref=f"path:{dataset_path}",
     )
+    sql, params = access.scope(user, access.OWNER)
     execute(
         "UPDATE sessions SET updated_at = datetime('now','localtime') "
-        "WHERE session_id = ? AND user_id = ?",
-        (session_id, user["id"]),
+        f"WHERE session_id = ?{sql}",
+        (session_id, *params),
     )
+    # 作业与报告是共享的，但这一次运行是**这个会话**里发起的：读回时用 OWNER 判据，
+    # 别人在同一企业里跑的作业不会串到这条会话的时间线里。
+    job_sql, job_params = access.scope(user, access.OWNER)
     return query_one(
         "SELECT job_id, status, progress, run_id, error, question FROM jobs "
-        "WHERE job_id = ? AND user_id = ?",
-        (job_id, user["id"]),
+        f"WHERE job_id = ?{job_sql}",
+        (job_id, *job_params),
     )
 
 
 @router.delete("/{session_id}")
 def delete_session(session_id: str, user: dict = Depends(get_current_user)) -> dict:
     _owned_session(session_id, user)
-    execute("DELETE FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user["id"]))
+    sql, params = access.scope(user, access.OWNER)
+    execute(f"DELETE FROM sessions WHERE session_id = ?{sql}", (session_id, *params))
     session_dir = config.sessions_root() / session_id
     if session_dir.exists():
         shutil.rmtree(session_dir)

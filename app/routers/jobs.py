@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app import config, eventlog, queueing
+from app import access, config, eventlog, queueing
 from app.runner import Dispatcher
 from app.db import query_one
 from app.deps import get_current_user
@@ -42,14 +42,17 @@ dispatcher = Dispatcher(manager)
 _JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question, pack"
 
 
-def _owned_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
+def _visible_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     """归属过滤写进 SQL 本身，不靠调用方先查再比——将来谁删了比对，这条语句仍然拦得住。
 
     不区分"不存在"与"别人的"，一律 404，避免 job_id 枚举。
+    判据在 `app/access.py`：作业与报告是企业内的共享资产，同企业成员看得见彼此的进度；
+    `org_id = 0`（未归属）的行只对造它的人可见。
     """
+    sql, params = access.scope(user)
     job = query_one(
-        f"SELECT {_JOB_FIELDS} FROM jobs WHERE job_id = ? AND user_id = ?",
-        (job_id, user["id"]),
+        f"SELECT {_JOB_FIELDS} FROM jobs WHERE job_id = ?{sql}",
+        (job_id, *params),
     )
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -144,7 +147,7 @@ def submit_analysis(
     sources: Any,
     mode: str,
     session_id: str | None,
-    user_id: int,
+    user: dict[str, Any],
     pack: str | None = None,
     mcp_approvals: dict[str, bool] | None = None,
     run_origin: dict[str, Any] | None = None,
@@ -175,7 +178,10 @@ def submit_analysis(
     }
     queueing.accept(
         job_id=job_id,
-        user_id=user_id,
+        user_id=user["id"],
+        # 企业归属在受理这一刻盖：作业行没归属（org_id=0）的话，共享读对它默认拒绝，
+        # 同企业的人就永远看不见彼此跑过什么——那等于接了线但没人能共享。
+        org_id=access.primary_org(user),
         question=question,
         mode=mode,
         session_id=session_id,
@@ -194,24 +200,22 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
     # 把"包名写错"排在解析 Bundle 之后，等于让一个必然失败的请求先去读盘。
     pack_obj = validate_pack(payload)
     approvals = validate_approvals(payload)
-    dataset_columns: list[str] | None = None
     if payload.bundle_id:
         # 归属、状态、目录包含、快照可读——四步都在 bundles 模块里做一次（同一个 BUNDLES_DIR）
         sources = load_bundle_for_analysis(payload.bundle_id, user)
         source_ref = f"bundle:{payload.bundle_id}"
     else:
-        dataset = query_one(
-            "SELECT * FROM datasets WHERE id = ? AND user_id = ?",
-            (payload.dataset_id, user["id"]),
-        )
+        # 数据集可以是同企业别人的：判据走 access，与 runner 读取时那条是同一条
+        dataset = access.dataset_row(user, payload.dataset_id)
         if not dataset:
             raise HTTPException(status_code=404, detail="数据集不存在")
         sources = dataset["path"]
         source_ref = f"dataset:{payload.dataset_id}"
     preflight_pack_data(pack_obj, sources)
+    # 会话是**个人**上下文：同企业也不共享，所以这里用 OWNER
+    sql, params = access.scope(user, access.OWNER)
     if payload.session_id and not query_one(
-        "SELECT * FROM sessions WHERE session_id = ? AND user_id = ?",
-        (payload.session_id, user["id"]),
+        f"SELECT * FROM sessions WHERE session_id = ?{sql}", (payload.session_id, *params)
     ):
         raise HTTPException(status_code=404, detail="会话不存在")
     job_id = submit_analysis(
@@ -219,7 +223,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
         sources,
         payload.mode,
         payload.session_id,
-        user["id"],
+        user,
         pack=payload.pack,
         mcp_approvals=approvals,
         # 谁发起的、从哪发起的、请求批了什么：批准链有了第二个入口，
@@ -233,12 +237,12 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
         },
         source_ref=source_ref,
     )
-    return _owned_job(job_id, user)
+    return _visible_job(job_id, user)
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
-    return _owned_job(job_id, user)
+    return _visible_job(job_id, user)
 
 
 TERMINAL_STATUSES = set(queueing.TERMINAL)  # 名单只有一份（queueing.TERMINAL），这里不另立
@@ -260,10 +264,13 @@ def _last_event_id(request: Request) -> int:
 
 @router.get("/jobs/{job_id}/events")
 async def job_events(job_id: str, request: Request, user: dict = Depends(get_current_user)) -> StreamingResponse:
-    _owned_job(job_id, user)
+    _visible_job(job_id, user)
     start = _last_event_id(request)
 
     async def event_stream():
+        # 判据取在**用的地方**而不是外层函数的闭包里：这条流活多久，判据就要在它自己那次
+        # 查询里说清楚——外层变量被重构掉时，读代码的人不会拿到一条"看不见但查得到"的语句。
+        sql, params = access.scope(user)
         # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者。
         # 数从库里读（queueing.stats）而不是读本进程簿记——job 可能被另一个进程的 worker 认领。
         yield _sse({"type": "queue", **queueing.stats()})
@@ -285,8 +292,7 @@ async def job_events(job_id: str, request: Request, user: dict = Depends(get_cur
                 cursor = seq
                 yield _sse(event, seq)
             row = query_one(
-                "SELECT status FROM jobs WHERE job_id = ? AND user_id = ?",
-                (job_id, user["id"]),
+                f"SELECT status FROM jobs WHERE job_id = ?{sql}", (job_id, *params)
             )
             state = (row or {}).get("status")
             if state in TERMINAL_STATUSES:

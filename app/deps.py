@@ -56,16 +56,20 @@ def get_media_principal(request: Request, run_id: str) -> dict[str, Any]:
 
 
 def ensure_run_access(run_id: str, user: dict[str, Any]) -> None:
-    """run 归属：只有产出该 run 的 job 的属主能读（admin 例外）。
+    """run 归属：产出该 run 的 job 的属主，或同企业成员（报告是企业内的共享资产）。
 
-    判定必须是"存在一条属于我的 job 产出了这个 run"，不能取首行比对——同一 run_id
+    判定必须是"存在一条我看得见的 job 产出了这个 run"，不能取首行比对——同一 run_id
     若有多条 job 记录（重跑、测试残留），首行匹配会把别人的归属当成结论。
     无 jobs 记录的 run（CLI 直跑、鉴权上线前的历史产物）一律拒绝——默认关闭。
+    判据只有一份，在 `app/access.py`：媒体 token 的签发、报告正文的读取都走这条。
     """
+    from app import access
+
     if user.get("role") == "admin":
         return
+    sql, params = access.scope(user)
     if not query_one(
-        "SELECT 1 AS ok FROM jobs WHERE run_id = ? AND user_id = ?", (run_id, user["id"])
+        f"SELECT 1 AS ok FROM jobs WHERE run_id = ?{sql}", (run_id, *params)
     ):
         raise HTTPException(status_code=404, detail="资源不存在")
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from app import config
+from app import access, config
 from app.db import execute, query
 from app.deps import get_current_user
 from app.schemas import DatasetOut
@@ -38,9 +38,12 @@ def upload_dataset(
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"CSV 解析失败：{exc}") from exc
     dataset_id = execute(
-        "INSERT INTO datasets (user_id, filename, path, size, row_count, columns) VALUES (?, ?, ?, ?, ?, ?)",
+        # org_id 在这里盖：企业归属是"这一行是谁的"的一部分，不能等读到时才现补
+        "INSERT INTO datasets (user_id, org_id, filename, path, size, row_count, columns) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             user["id"],
+            access.primary_org(user),
             file.filename,
             str(path),
             path.stat().st_size,
@@ -59,7 +62,9 @@ def upload_dataset(
 
 @router.get("", response_model=list[DatasetOut])
 def list_datasets(user: dict = Depends(get_current_user)) -> list[dict]:
-    rows = query("SELECT * FROM datasets WHERE user_id = ? ORDER BY id DESC", (user["id"],))
+    # 数据集是企业内的共享资产。判据来自 access，这一层只负责拼上去。
+    sql, params = access.scope(user)
+    rows = query(f"SELECT * FROM datasets WHERE 1{sql} ORDER BY id DESC", params)
     for row in rows:
         row["columns"] = __import__("json").loads(row["columns"] or "[]")
     return rows
@@ -67,13 +72,13 @@ def list_datasets(user: dict = Depends(get_current_user)) -> list[dict]:
 
 @router.delete("/{dataset_id}")
 def delete_dataset(dataset_id: int, user: dict = Depends(get_current_user)) -> dict:
-    rows = query(
-        "SELECT * FROM datasets WHERE id = ? AND user_id = ?", (dataset_id, user["id"])
-    )
+    # 删除是破坏性的：即便同企业，也仍然只有造它的人能删（判据见 app/access.py）
+    sql, params = access.scope(user, access.OWNER)
+    rows = query(f"SELECT * FROM datasets WHERE id = ?{sql}", (dataset_id, *params))
     if not rows:
         raise HTTPException(status_code=404, detail="数据集不存在")
     path = Path(rows[0]["path"])
     if path.exists():
         path.unlink()
-    execute("DELETE FROM datasets WHERE id = ? AND user_id = ?", (dataset_id, user["id"]))
+    execute(f"DELETE FROM datasets WHERE id = ?{sql}", (dataset_id, *params))
     return {"ok": True}

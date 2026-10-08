@@ -20,7 +20,6 @@ import threading
 from typing import Any
 
 from app import config, queueing
-from app.db import query_one
 from app.jobs import JobManager
 # `run_analysis` 在模块顶层导入，不在函数里延迟导：执行路径搬到这一份代码之后，
 # 全局只剩**一个**可替换的跑批缝隙。缝隙有两处（这里 + routers/jobs.py）迟早出现
@@ -60,10 +59,12 @@ def resolve_sources(spec: dict[str, Any], user_id: int) -> Any:
         except HTTPException:
             raise
     if ref.startswith("dataset:"):
-        row = query_one(
-            "SELECT path FROM datasets WHERE id = ? AND user_id = ?",
-            (int(ref.split(":", 1)[1]), user_id),
-        )
+        # 读取时重做归属校验，而且用的是**同一条**判据（access）：认领作业的人可能来自
+        # 另一个进程，而"提交时选得到、跑的时候说不是你的"就是两处各写一遍迟早分叉的样子。
+        # 传进判据的是**作业行里的 user_id**，不是"当前请求者"——作业属于谁就在为谁读数据。
+        from app import access
+
+        row = access.dataset_row({"id": user_id}, int(ref.split(":", 1)[1]))
         if not row:
             raise RuntimeError("数据集不存在或不属于该用户")
         return str(row["path"])
