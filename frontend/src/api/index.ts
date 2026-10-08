@@ -1,6 +1,21 @@
 import client from "./client";
+import { withRetry } from "./backoff";
 
 const CHUNK_BYTES = 4 * 1024 * 1024;
+
+/** 一次"提交"的幂等键（P5-1 的那把锁）。形状服从后端的判据：1-200 个可见字符、无空格。 */
+export function newIdempotencyKey(): string {
+  const random =
+    (globalThis.crypto?.randomUUID?.() as string | undefined) ||
+    Array.from({ length: 32 }, () => Math.floor(Math.random() * 36).toString(36)).join("");
+  return `sub_${random.replace(/-/g, "").slice(0, 32)}`;
+}
+
+/** 创建作业的请求：重试必须带**同一个键**（键在外面算一次，不进 task 里）。
+ *  写反了的后果很具体——网络抖一下，同一次提问变成两个作业、双份上游调用、两份报告。 */
+function submitWithKey(path: string, payload: unknown, key: string, signal?: AbortSignal) {
+  return withRetry(() => client.post(path, payload, { headers: { "Idempotency-Key": key } }), { signal });
+}
 
 /** 客户端生成的 upload_id：后端的形状校验是 ^[A-Za-z0-9_-]{8,64}$，这里必须服从。 */
 function newUploadId(): string {
@@ -68,21 +83,45 @@ export const api = {
     return client.post("/api/bundles", form);
   },
 
-  analyze: (payload: {
-    question: string;
-    mode: string;
-    dataset_id?: number;
-    bundle_id?: string;
-    session_id?: string;
-  }) => client.post("/api/analyze", payload),
-  getJob: (jobId: string) => client.get(`/api/jobs/${jobId}`),
+  /** 提交分析。默认自己生成一个幂等键并按退避重试；调用方也可以把"这一次提交"的键传进来，
+   *  让它跟同一次用户意图共享（比如先在 Workbench 提交、失败后再由界面重试按钮重发）。 */
+  analyze: (
+    payload: {
+      question: string;
+      mode: string;
+      dataset_id?: number;
+      bundle_id?: string;
+      session_id?: string;
+    },
+    options: { idempotencyKey?: string; signal?: AbortSignal } = {}
+  ) =>
+    submitWithKey(
+      "/api/analyze",
+      payload,
+      options.idempotencyKey || newIdempotencyKey(),
+      options.signal
+    ),
+  /** 状态查询：断线与"服务正在重启"是这一片最常见的两种瞬时失败，所以也走同一份退避。 */
+  getJob: (jobId: string, options: { signal?: AbortSignal } = {}) =>
+    withRetry(() => client.get(`/api/jobs/${jobId}`), options),
 
   createSession: (payload: { title: string; dataset_id?: number }) =>
     client.post("/api/sessions", payload),
   listSessions: () => client.get("/api/sessions"),
   sessionMessages: (sessionId: string) => client.get(`/api/sessions/${sessionId}/messages`),
-  postMessage: (sessionId: string, payload: { question: string; mode: string }) =>
-    client.post(`/api/sessions/${sessionId}/messages`, payload),
+  /** 会话续轮同样创建作业，所以同样要有键——只在 /api/analyze 上装护栏，
+   *  "重试不会重复"这条承诺就只对一半的请求成立。 */
+  postMessage: (
+    sessionId: string,
+    payload: { question: string; mode: string },
+    options: { idempotencyKey?: string; signal?: AbortSignal } = {}
+  ) =>
+    submitWithKey(
+      `/api/sessions/${sessionId}/messages`,
+      payload,
+      options.idempotencyKey || newIdempotencyKey(),
+      options.signal
+    ),
   deleteSession: (sessionId: string) => client.delete(`/api/sessions/${sessionId}`),
 
   listRuns: () => client.get("/api/runs"),

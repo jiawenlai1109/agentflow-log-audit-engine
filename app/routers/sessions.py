@@ -6,12 +6,12 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import access, paths
 from app.db import execute, query, query_one
 from app.deps import get_current_user
-from app.routers.jobs import submit_analysis
+from app.routers.jobs import parse_idempotency_key, submit_analysis
 from app.schemas import (
     JobOut,
     MessageCreateRequest,
@@ -96,8 +96,14 @@ def session_messages(
 
 @router.post("/{session_id}/messages", response_model=JobOut)
 def post_message(
-    session_id: str, payload: MessageCreateRequest, user: dict = Depends(get_current_user)
+    session_id: str,
+    payload: MessageCreateRequest,
+    user: dict = Depends(get_current_user),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ) -> dict:
+    # 会话续轮也要有幂等键：它是**第二个会创建作业的入口**，只在 /api/analyze 上装护栏
+    # 等于"重试不会重复"这条承诺只对一半的请求成立（判据本身仍只有一份，在 queueing.accept）。
+    key = parse_idempotency_key(idempotency_key)
     session = _owned_session(session_id, user)
     question = payload.question.strip()
     if not question:
@@ -107,7 +113,7 @@ def post_message(
         raise HTTPException(status_code=400, detail="会话未绑定数据集或数据集已删除")
     # 会话这条线只有路径可用（sessions.dataset_path 本来就存的是路径）。存成 `path:` 引用
     # 不算新开一个泄漏面——这一列今天已经在库里了；新写的分析入口一律用 bundle:/dataset: id。
-    job_id = submit_analysis(
+    submitted = submit_analysis(
         question,
         dataset_path,
         payload.mode,
@@ -117,7 +123,9 @@ def post_message(
         # 作业行的企业归属 = **此刻提交者的企业**（可见性判据用它算）；会话树的位置另按
         # 会话行自己的 org 算（见 app/paths.py）。两条各管各的，谁也不覆盖谁。
         org_id=access.primary_org(user),
+        idempotency_key=key,
     )
+    job_id = submitted["job_id"]
     sql, params = access.scope(user, access.OWNER)
     execute(
         "UPDATE sessions SET updated_at = datetime('now','localtime') "
@@ -127,11 +135,16 @@ def post_message(
     # 作业与报告是共享的，但这一次运行是**这个会话**里发起的：读回时用 OWNER 判据，
     # 别人在同一企业里跑的作业不会串到这条会话的时间线里。
     job_sql, job_params = access.scope(user, access.OWNER)
-    return query_one(
+    row = query_one(
         "SELECT job_id, status, progress, run_id, error, question FROM jobs "
         f"WHERE job_id = ?{job_sql}",
         (job_id, *job_params),
     )
+    if row:
+        # 续轮也报 `idempotency_replayed` 这一格：两个创建作业的入口要说同一种话，
+        # 否则"重试不会产生第二个作业"这条判据只对一半的请求成立。
+        row["idempotency_replayed"] = submitted["replayed"]
+    return row
 
 
 @router.delete("/{session_id}")

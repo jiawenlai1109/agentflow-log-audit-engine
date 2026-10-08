@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app import access, config, eventlog, llm_gate, queueing, quota
@@ -60,6 +61,10 @@ def _visible_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     # 上游闸门的读数与队列深度**分两个字段**：queue 是库里的全局事实，gate 是本进程的累计量。
     # 合成一个字典就会让人以为 inflight/limit 也是全局数——那是"没测过"说成"测过了"的变种。
     job["llm_gate"] = llm_gate.snapshot()
+    # 终态与否由服务端算（名单只有 `queueing.TERMINAL` 那一份），前端只读一个布尔。
+    # 让前端自己抄一份"哪些状态算完了"的下场是两份名单分叉：多出来的那个终态会被
+    # 当成"还在跑"，客户端就一直重连一条早就结束的流。
+    job["terminal"] = str(job.get("status")) in TERMINAL_STATUSES
     return job
 
 
@@ -150,6 +155,33 @@ def preflight_pack_data(pack_obj: Any, sources: Any, org_id: int) -> None:
         )
 
 
+# 幂等键的形状：可见 ASCII，最长 200 字符（与列宽一致），**只在受理这一处判形状**。
+_IDEMPOTENCY_SHAPE = re.compile(r"^[\x21-\x7e]{1,200}$")
+
+
+def parse_idempotency_key(raw: str | None) -> str | None:
+    """`Idempotency-Key` 请求头的形状判据。三种命运，各自有理由：
+
+    - **没带这个头** → None。这次提交没有护栏，两次相同提问照样建两行（正常语义）。
+    - **带了但是空的 / 形状不对** → 422，不当成"没带"。客户端写了 `Idempotency-Key: `
+      或者塞了空格与控制字符，通常是它自己出 bug；静默放行等于**让它以为有护栏而实际没有**，
+      那比直接报错更坏（与"一个看着能配、实际会搞丢东西的旋钮比没有更坏"同族）。
+    - **形状对** → 原样用，不 strip、不归一化。键是不透明串；把两个不同的键洗成同一个，
+      表现是"我明明提交了两次，第二次没有任何反应"。
+    """
+    if raw is None:
+        return None
+    if not _IDEMPOTENCY_SHAPE.match(raw):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Idempotency-Key 形状不对：要 1-200 个可见字符、不含空格与控制字符。"
+                "带了空值或坏值不当成「没带」——那样你会以为这次提交有幂等护栏，而实际没有。"
+            ),
+        )
+    return raw
+
+
 def submit_analysis(
     question: str,
     sources: Any,
@@ -164,7 +196,10 @@ def submit_analysis(
     # 数据源的**引用**（bundle:<id> / dataset:<id）。绝对路径不进 jobs 表：
     # 那既是可外泄的位置信息（#15），也会在换机/换进程时变成一句跑不通的谎。
     source_ref: str = "",
-) -> str:
+    # 幂等键（P5-1）：同一个人带同一个键，只有第一次真的建出作业行。判据在库层，
+    # 这里只负责把它原样递下去——路由不自己判"是不是重放"，那会有第二份答案。
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     """sources 可以是文件路径，也可以是 Bundle——pipeline 里 `as_bundle` 会归一化。
 
     `pack` 落进 jobs 表：一次跑的是哪个领域场景，属于"这次结果是怎么来的"的一部分。
@@ -174,6 +209,10 @@ def submit_analysis(
     这一个数同时决定"这条作业同企业谁能看见"与"它的产物落在哪棵树下"，两者必须是同一个
     答案。做成可选参数（内部自己算）的话，将来加一个入口就有人忘了传，表现不是报错而是
     全都落到 `org/0`（未归属 ⇒ 共享读默认拒绝 ⇒ 同事永远看不见彼此跑过什么）。
+
+    返回值是 `{"job_id": …, "replayed": 是否只是重放}`，不是裸的 job_id：
+    "我这次提交排上了一个活"与"我这次提交撞回了自己上一次那条"对用户是两种结果，
+    界面与压测读数都要能分开这两件事。
     """
     job_id = f"job_{uuid.uuid4().hex[:12]}"
 
@@ -191,7 +230,7 @@ def submit_analysis(
         "run_origin": run_origin or {},
         "source_ref": source_ref,
     }
-    queueing.accept(
+    accepted = queueing.accept(
         job_id=job_id,
         user_id=user["id"],
         # 企业归属在受理这一刻盖（由调用方算好传进来）：作业行没归属（org_id=0）的话，
@@ -203,19 +242,27 @@ def submit_analysis(
         session_id=session_id,
         pack=pack,
         spec=spec,
+        idempotency_key=idempotency_key,
     )
     # Web 进程自己也是认领者（默认形态）。独立 worker 进程起来后这只是多一个消费者，
     # 不是第二条执行路径——认领是原子的，一个 job 只会被一个认领者拿到。
     dispatcher.start()
-    return job_id
+    return accepted
 
 
 @router.post("/analyze", response_model=JobOut)
-def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> dict:
+def analyze(
+    payload: AnalyzeRequest,
+    user: dict = Depends(get_current_user),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+) -> dict:
     # 顺序是有意的：最便宜的校验先做（读目录、读一份小配置），资源解析放后面。
     # 把"包名写错"排在解析 Bundle 之后，等于让一个必然失败的请求先去读盘。
     pack_obj = validate_pack(payload)
     approvals = validate_approvals(payload)
+    # 幂等键的形状排在配额之前：一条形状不对的请求连"该不该拦"都还没资格问，
+    # 而且它 422 之后什么都不会发生（既不占配额，也不留作业行）。
+    key = parse_idempotency_key(idempotency_key)
     # 一次请求只算一遍企业归属：预检建缓存的那棵树、与运行要落的那棵树必须是同一棵，
     # 而"谁属于哪家企业"这件事的权威在 access（取最小的那条成员关系，没成员关系 = 0）。
     org_id = access.primary_org(user)
@@ -248,7 +295,7 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
         f"SELECT * FROM sessions WHERE session_id = ?{sql}", (payload.session_id, *params)
     ):
         raise HTTPException(status_code=404, detail="会话不存在")
-    job_id = submit_analysis(
+    job = submit_analysis(
         payload.question,
         sources,
         payload.mode,
@@ -267,8 +314,13 @@ def analyze(payload: AnalyzeRequest, user: dict = Depends(get_current_user)) -> 
             "approvals_requested": dict(payload.mcp_approvals),
         },
         source_ref=source_ref,
+        idempotency_key=key,
     )
-    return _visible_job(job_id, user)
+    visible = _visible_job(job["job_id"], user)
+    # "这次真的排上了一个活"与"这次只是撞回我自己上一次那条"，客户端有权知道：
+    # 压测的"重试不产生第二个作业"这条判据也读这一格，不靠数日志。
+    visible["idempotency_replayed"] = job["replayed"]
+    return visible
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)

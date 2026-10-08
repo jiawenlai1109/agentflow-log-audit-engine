@@ -28,6 +28,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from app.access import OWNER, scope_by_id
 from app.db import execute, query, query_one
 
 TERMINAL = ("success", "partial", "degraded", "failed", "error", "cancelled")
@@ -84,22 +85,65 @@ def accept(
     session_id: str | None,
     pack: str | None,
     spec: dict[str, Any],
-) -> None:
-    """受理 = **一条 INSERT 就写完可认领状态**。
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """受理 = **一条 INSERT 就写完可认领状态**；带幂等键时由库层的唯一约束决定谁是真的。
 
-    原来分两步（先插 `pending`，再 UPDATE 成 `queued` 并写 spec），中间那个窗口里的行
-    又没人能认领（claim 只认 `queued`）、又被深度算进"排队"，于是崩溃或老数据留下的
-    `pending` 会永远显示成"有人在等"。一步写完，窗口就不存在了。
+    为什么原来分两步（先插 `pending`，再 UPDATE 成 `queued` 并写 spec）不行：中间那个窗口里的行
+    又没人能认领（claim 只认 `queued`）、又被深度算进"排队"，于是崩溃或老数据留下的 `pending`
+    会永远显示成"有人在等"。一步写完，窗口就不存在了。
 
     `org_id` 由调用方给（`access.primary_org`）：作业行没归属的话，共享读对它默认拒绝，
     同企业的人就永远看不见彼此跑过什么——那等于接了线但没人能共享。
+
+    幂等键（P5-1）三条口径：
+
+    - **判据在库层，不在应用层**。"先查一下有没有、没有再插"不算幂等：两个并发重试会同时
+      读到"没有"，然后各插一行。所以这里是 `INSERT … ON CONFLICT DO NOTHING` + 回读，
+      谁抢到第一次谁就是那条作业行，其余都拿到同一个 `job_id`。
+    - **作用域是用户**，不是全局。回读那条查询的归属谓词由 `access.scope_by_id(user_id, OWNER)`
+      拼进来（判据只有一份，队列文件里手写 `user_id = ?` 会被结构守卫报成第二份实现——
+      这条守卫这次就抓到了我）。唯一索引也是 `(user_id, idempotency_key)`：
+      否则猜到一个别人的键就能拿到别人的 job_id。
+    - **没带键就是没有护栏**，两次相同提问照样建两行——不许把"没带"当成"同一个"。
+      `replayed` 是要如实报给调用方的那一格：一次真实提交与一次重放，用户有权知道差别。
+
+    唯一索引不在的那份库（有人手工建的、跳过迁移的）会在这条 INSERT 上**当场报错**，
+    而不是"看起来幂等其实每次都新建一行"——失败要响，不要静默降级成假护栏。
     """
     execute(
-        "INSERT INTO jobs (job_id, user_id, org_id, question, mode, session_id, pack, status, spec) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-        (job_id, user_id, org_id, question, mode, session_id, pack, json.dumps(spec, ensure_ascii=False, default=str)),
+        "INSERT INTO jobs (job_id, user_id, org_id, question, mode, session_id, pack, status, spec, "
+        "idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?) "
+        "ON CONFLICT (user_id, idempotency_key) DO NOTHING",
+        (
+            job_id,
+            user_id,
+            org_id,
+            question,
+            mode,
+            session_id,
+            pack,
+            json.dumps(spec, ensure_ascii=False, default=str),
+            idempotency_key,
+        ),
     )
+    if not idempotency_key:
+        notify()
+        return {"job_id": job_id, "replayed": False}
+    # 回读这条**不自己写 `user_id = ?`**：归属判据只有一份（`app/access.py`），
+    # 结构守卫会把队列文件里手写的判据当成第二份实现并报红——那条守卫这次就抓到了我。
+    # 用 `scope_by_id(..., OWNER)` 是因为这里要的就是"只有提交者本人能撞自己的键"：
+    # 拼成 SHARED 的话，同企业同事的一个同名键就能把别人的 job_id 回给你。
+    predicate, params = scope_by_id(user_id, OWNER)
+    owner = query_one(
+        f"SELECT job_id FROM jobs WHERE idempotency_key = ?{predicate}", (idempotency_key, *params)
+    )
+    effective = str((owner or {}).get("job_id") or job_id)
+    if effective != job_id:
+        # 重放：一行没新建、一次唤醒也不发（没有新活可干）
+        return {"job_id": effective, "replayed": True}
     notify()
+    return {"job_id": job_id, "replayed": False}
 
 
 def enqueue(job_id: str, spec: dict[str, Any]) -> None:

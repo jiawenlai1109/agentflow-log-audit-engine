@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL DEFAULT 'pending',
     progress INTEGER NOT NULL DEFAULT 0,
     error TEXT,
+    -- 幂等键（P5-1）：客户端为"这一次提交"生成的不透明串。受理进程被杀之后客户端会退避重试
+    -- （P5-2），没有这把锁，重试的最坏后果就是同一次提问变成两个作业、双份上游调用、两份报告。
+    -- 键的作用域是**用户**而不是全局：全局唯一的话，猜到一个别人的键就能拿到别人的 job_id。
+    -- 判据只有一条，落在库层唯一约束上（见 uq_jobs_user_idem）：同一用户带同一个键，只有第一次
+    -- 真的建出作业行。可为空 = 这次提交没带护栏（照旧各建一行），不是"随便重复"的意思。
+    idempotency_key TEXT,
     created_at TEXT DEFAULT (datetime('now', 'localtime')),
     finished_at TEXT
 );
@@ -176,6 +182,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "worker": "TEXT",
         "lease_expires_at": "TEXT",
         "trace_id": "TEXT",
+        # 幂等键（P5-1）：老库补这一列时**不能**带 UNIQUE——SQLite 的 ADD COLUMN 不接受带
+        # 唯一约束的列，会直接报错，症状是"老库上第一次起服务就崩"。唯一性由下面那条
+        # `uq_jobs_user_idem` 索引给（新建与升级两条路径都会建它）。
+        "idempotency_key": "TEXT",
     },
 }
 
@@ -194,6 +204,12 @@ CREATE INDEX IF NOT EXISTS idx_bundles_org ON bundles (org_id, id);
 -- 名字跟着模型与迁移里那份（`ix_jobs_org_status`），不是另起一个：两条路径上出现两个同义索引
 -- 比没有索引更难查。
 CREATE INDEX IF NOT EXISTS ix_jobs_org_status ON jobs (org_id, status);
+-- 幂等键的唯一约束（P5-1）。放在这一段而不是 SCHEMA 的建表里，是因为老库那条路径上
+-- 这一列是 `ALTER TABLE ADD COLUMN` 补出来的，SQLite 不允许 ADD COLUMN 直接带 UNIQUE；
+-- 索引在建列之后才存在，两条路径（新库 / 老库升级）都走到这里，判据只剩这一份。
+-- 键为空的所有行不受影响：NULL 在 SQLite 与 Postgres 的唯一索引里都算"互不相同"，
+-- 所以"没带幂等键"不会被当成"带了同一个键"。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_user_idem ON jobs (user_id, idempotency_key);
 """
 
 

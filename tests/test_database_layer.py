@@ -321,6 +321,11 @@ def test_org_indexes_exist_on_both_schema_paths(tmp_path, monkeypatch):
         # 认领就从 0.006ms 变成几十 ms（实测见 app/db.py 的注释）。模型与迁移里一直写着它，
         # 运行时那份此前没有——正是这条守卫要抓的那种"写了等于建了"。
         "ix_jobs_org_status",
+        # P5-1 幂等键的唯一约束也要走两条 schema 路径。运行时库里没这条索引的话，
+        # `INSERT … ON CONFLICT (user_id, idempotency_key)` 会当场报错（这是刻意的：失败要响，
+        # 不能静默退化成"每次都新建一行"）——更坏的一种是有人为了绕开这个报错把判据搬到
+        # 应用层"先查再插"，那两个并发重试会同时读到"没有"，幂等就没了。
+        "uq_jobs_user_idem",
     }
 
     def index_names(db: Path) -> set[str]:

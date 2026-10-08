@@ -79,7 +79,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { ElMessage } from "element-plus";
-import { api } from "../api";
+import { api, newIdempotencyKey } from "../api";
 import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
@@ -183,20 +183,38 @@ async function submit() {
   streamController = new AbortController();
   running.value = true;
   events.value = [];
+  // 一次用户意图 = 一个幂等键。生成在这里而不是 api 层，是因为"同一次提交"的边界只有界面知道：
+  // 网络抖一下由 api 重试，还是这个按钮被连点两次，对后端来说形状一样，对你是不是同一个作业不一样。
+  const submissionKey = newIdempotencyKey();
   try {
     if (!session_id.value) {
       const { data } = await api.createSession({ title: asked.slice(0, 20), dataset_id: dataset_id.value });
       session_id.value = data.session_id;
       loadSessions();
     }
-    const { data } = await api.analyze({
-      question: asked,
-      dataset_id: dataset_id.value,
-      mode: usedMode,
-      session_id: session_id.value,
-    });
+    const { data } = await api.analyze(
+      {
+        question: asked,
+        dataset_id: dataset_id.value,
+        mode: usedMode,
+        session_id: session_id.value,
+      },
+      { idempotencyKey: submissionKey, signal: streamController.signal }
+    );
     const jobId = data.job_id;
-    await streamJobEvents(jobId, (event) => events.value.push(event), streamController?.signal);
+    if (data.idempotency_replayed) {
+      // 撞回了自己上一次的作业：这不是错误，但必须说出来——不然用户以为这是一次新分析
+      ElMessage.info("这次提交和上一次是同一个请求，沿用的已经是排队中的那条作业");
+    }
+    await streamJobEvents(jobId, (event) => events.value.push(event), streamController?.signal, {
+      onReconnect: ({ attempt, waitMs }) => {
+        if (attempt === 1) {
+          ElMessage.warning(`进度流中断，正在第 ${attempt} 次接回（约 ${Math.round(waitMs / 100) / 10}s）…`);
+        } else {
+          console.warn(`进度流第 ${attempt} 次重连，等待 ${waitMs}ms`);
+        }
+      },
+    });
     const status = await showResult({ question: asked, mode: usedMode }, jobId);
     question.value = "";
     await loadHistory();

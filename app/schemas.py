@@ -138,6 +138,14 @@ class JobOut(BaseModel):
     # gate 是"本进程此刻看到的那一段"。并成一个字典就会让人以为 limit/inflight 也是全局数——
     # 那是把"没测"说成"测过"的同一类错，只是换了一个地方。
     llm_gate: dict[str, Any] | None = None
+    # 幂等键命中的那一格（P5-1）：True = 这次提交没有新建作业，只是撞回了同键的上一次。
+    # 单独一格而不是复用 status：一次真实提交与一次重放在状态上看起来一模一样
+    # （都是 queued/running），但"上游有没有被多打一次"完全不同——压测读的就是这一格。
+    idempotency_replayed: bool | None = None
+    # 这条作业是不是终态。名单只有服务端那一份（`queueing.TERMINAL`）：
+    # 前端自己抄一份的后果是两份名单分叉，多出来的那个终态会被当成"还在跑"，
+    # 于是进度流重连到一个早就结束的作业上。
+    terminal: bool | None = None
 
 
 class DatasetOut(BaseModel):

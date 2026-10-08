@@ -108,6 +108,10 @@ class Job(Base):
         Index("ix_jobs_org_status", "org_id", "status"),
         Index("ix_jobs_user", "user_id", "id"),
         Index("ix_jobs_run", "run_id"),
+        # 幂等键的唯一性判据（P5-1）。名字与运行时那条 `CREATE UNIQUE INDEX` 一字不差：
+        # 两条 schema 路径上出现两个同义索引，比没有索引更难查（`ix_jobs_org_status` 那次就是
+        # "模型与迁移里写了、运行时库里没建"，见 tests/test_database_layer.py 的索引守卫）。
+        Index("uq_jobs_user_idem", "user_id", "idempotency_key", unique=True),
     )
 
     id: Mapped[int] = mapped_column(PkType, primary_key=True)
@@ -130,6 +134,9 @@ class Job(Base):
     # 谁在跑它：多 worker 水平扩之后，"这个 job 归哪个 worker"必须查得回来，
     # 否则 worker 死了没人能把它认领回来（P2 的租约字段）
     worker: Mapped[str | None] = mapped_column(String(64))
+    # 客户端为"这一次提交"带来的不透明串（见 app/db.py 的注释与 app/queueing.accept）。
+    # 可为空：没带键就是没有护栏，两次相同提问照样建两行——不许把"没带"当成"同一个"。
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     trace_id: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime | None] = mapped_column(DateTime(), server_default=func.now())
