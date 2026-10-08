@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import config
 from app.db import init_db
-from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions
+from app.routers import auth, bundles, datasets, jobs, llm, media, packs, reports, sessions, users
 from app.runner import reclaim_at_boot
 
 @asynccontextmanager
@@ -67,3 +67,4 @@ app.include_router(jobs.router)
 app.include_router(sessions.router)
 app.include_router(reports.router)
 app.include_router(media.router)
+app.include_router(users.router)

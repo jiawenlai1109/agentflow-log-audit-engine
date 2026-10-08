@@ -12,6 +12,43 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class AccountCreateRequest(BaseModel):
+    """建号：用户名、口令，以及（可选）当场加入哪家企业。
+
+    `extra="forbid"`：拼错的键（`orgn`、`pasword`）静默通过就等于"管理员以为把人建进企业了，
+    实际那人是未归属"，而这种账号最坏的表现是**默认拒绝**——什么都看不见。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+    org: str | None = None  # 企业 slug 或数字 id；留空 = 未归属（只看得到自己的资源）
+
+
+class AccountOut(BaseModel):
+    id: int
+    username: str
+    org_id: int
+    role: str
+
+
+class OrgOut(BaseModel):
+    id: int
+    slug: str
+    name: str
+
+
+class MemberOut(BaseModel):
+    """成员名单只回"协作需要知道的东西"：谁、在哪家企业、企业内角色、是不是我自己。"""
+
+    user_id: int
+    username: str
+    org_id: int
+    org_role: str
+    is_me: bool
+
+
 class AnalyzeRequest(BaseModel):
     """分析请求：数据源二选一，可选场景包与外部工具批准。
 

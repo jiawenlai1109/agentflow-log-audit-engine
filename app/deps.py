@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 
 from agentflow.core.tools import ensure_within
 from app.db import query_one
@@ -38,6 +38,17 @@ def get_current_user(request: Request) -> dict[str, Any]:
     if payload is None:
         raise INVALID_TOKEN
     return _resolve_user(str(payload["sub"]))
+
+
+def require_admin(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    """建号与企业名单这类"能改变谁能进平台"的接口只给全局 admin。
+
+    403 而不是 404：这里没有"资源归属"可言——权限语义用 403 是可预期的，
+    而资源枚举那类（别人的数据集/作业）仍然一律 404（见 `ensure_run_access` 那条口径）。
+    """
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员身份")
+    return user
 
 
 def get_media_principal(request: Request, run_id: str) -> dict[str, Any]:

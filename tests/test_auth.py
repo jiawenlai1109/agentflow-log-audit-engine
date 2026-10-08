@@ -147,7 +147,11 @@ def test_me_returns_identity(users):
         _login(client, "owner", "owner-pw-1")
         me = client.get("/api/auth/me")
         assert me.status_code == 200
-        assert me.json() == {"username": "owner", "role": "user"}
+        # P3 之后 /me 多带一个 `orgs`：建号时指定企业之后，前端与运维要能一眼看出
+        # 这个人到底有没有归属（空列表 = 未归属，共享读对他默认拒绝）。
+        # 这条断言写死整个形状而不是只查 username，是为了让"接口加了字段"这件事留在测试里，
+        # 而不是变成一次静默的接口变更。
+        assert me.json() == {"username": "owner", "role": "user", "orgs": []}
 
 
 # ---------------------------------------------------------------- token 机制
@@ -433,8 +437,6 @@ def test_ownership_predicate_has_exactly_one_home():
             continue
         source = py.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        if "user_id = ?" in source:
-            bare_predicate.append(py.name)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -460,6 +462,11 @@ def test_ownership_predicate_has_exactly_one_home():
                     continue
                 if not any(re.search(rf"\b{table}\b", text) for table in owned):
                     continue
+                if "user_id = ?" in text:
+                    # 判据被抄进这条语句了（不是从 access 拼进来的）。范围刻意收在碰归属表的
+                    # 语句上：查成员关系那种 SELECT org_id FROM memberships WHERE user_id = ?
+                    # 不是归属判据，一起拦就是误伤（第一版按整个文件扫，误伤了 auth.py 与 users.py）。
+                    bare_predicate.append(f"{py.name}:{node.name}")
                 kind = match.group(1).upper()
                 if kind == "INSERT":
                     writes = True

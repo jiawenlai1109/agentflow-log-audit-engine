@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app.db import query_one
+from app.db import query, query_one
 from app.deps import get_current_user
 from app.schemas import LoginRequest
 from app.security import API_TOKEN_TTL_SECONDS, SCOPE_API, make_token, verify_password
@@ -35,4 +35,13 @@ def login(payload: LoginRequest) -> dict:
 
 @router.get("/me")
 def me(user: dict = Depends(get_current_user)) -> dict:
-    return {"username": user["username"], "role": user.get("role", "user")}
+    """当前身份：除了"我是谁"，还要回答"我在哪家企业"——建号时指定企业之后，
+    前端与运维都要能在不查库的情况下看出这个人到底有没有归属（空列表 = 未归属，
+    共享读对他默认拒绝）。
+    """
+    orgs = query(
+        "SELECT o.id, o.slug, o.name FROM organizations o "
+        "JOIN memberships m ON m.org_id = o.id WHERE m.user_id = ? ORDER BY o.id",
+        (user["id"],),
+    )
+    return {"username": user["username"], "role": user.get("role", "user"), "orgs": orgs}
