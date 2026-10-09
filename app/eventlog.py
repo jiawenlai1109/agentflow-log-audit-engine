@@ -69,6 +69,45 @@ def last_seq(job_id: str) -> int:
     return int(rows[0]["m"]) if rows else 0
 
 
+def first_event_at(job_id: str) -> str | None:
+    """这次运行的**第一条事件**落库时间（P6-4 用它算"排了多久"）。
+
+    为什么不用 `jobs` 上加一列 `claimed_at`：这条表本来就按 `(job_id, seq)` 存了每一次
+    可见的时刻，而"排到什么时候开始动"的第一手证据就是第一条事件——再加一列就是给同一件事
+    第二个答案，两边迟早分叉（认领协议那侧已经有 `worker`/`lease_expires_at` 了）。
+    返回 None 是**有意义的缺席**：这条作业一条事件都还没有（还在排队，或压根没人认领），
+    调用方不许把它读成"等了 0 秒"。
+    """
+    row = query_one(
+        "SELECT created_at FROM job_events WHERE job_id = ? ORDER BY seq ASC LIMIT 1", (job_id,)
+    )
+    return row.get("created_at") if row else None
+
+
+def kind_counts(job_id: str) -> dict[str, int]:
+    """这条作业的事件按类型数一遍（聚合在 SQL 里做，不把整段历史拉进 Python）。"""
+    rows = query("SELECT kind, COUNT(*) AS n FROM job_events WHERE job_id = ? GROUP BY kind", (job_id,))
+    return {str(row["kind"]): int(row["n"]) for row in rows}
+
+
+def payloads_of_kind(job_id: str, kind: str) -> list[dict[str, Any]]:
+    """某一类事件的 payload（P6-4 只把 `llm_gate_wait` 这一类拉出来算上游形状）。
+
+    解不开的那一行**不静默丢**：交出一条 `event_corrupted`，与 `read_after` 同一口径——
+    "库里躺着读不出来的行"说明有别的写法在写这张表。
+    """
+    rows = query("SELECT payload FROM job_events WHERE job_id = ? AND kind = ? ORDER BY seq ASC", (job_id, kind))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            event = json.loads(row.get("payload") or "{}")
+        except json.JSONDecodeError:
+            out.append({"type": "event_corrupted", "kind": kind})
+            continue
+        out.append(event if isinstance(event, dict) else {"type": "event_not_object"})
+    return out
+
+
 def has_events(job_id: str) -> bool:
     return last_seq(job_id) > 0
 

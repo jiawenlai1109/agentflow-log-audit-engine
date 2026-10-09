@@ -455,6 +455,49 @@ async def replay_probe(client: httpx.AsyncClient, base: str, case: dict[str, Any
     }
 
 
+async def trace_lookup(client: httpx.AsyncClient, base: str, case: dict[str, Any]) -> dict[str, Any]:
+    """P6 的退出判据走一次真 HTTP：随便拿这轮压出来的一条作业，凭它的链路标识把五格查回来。
+
+    为什么要在压测尺子里做，而不是只留 TestClient 的用例：TestClient 走的是同一个路由，
+    但它**不经过真库、不经过真 worker**——而这一格要证的恰恰是"排了多久、谁认领的"这种
+    只有现场才有答案的东西。取样的作业是这一轮真实跑完的那条，读数原样落 json。
+    """
+    job_id, token = case.get("job_id"), case.get("token")
+    if not job_id or not token:
+        return {"skipped": True, "reason": "这一轮没有已完成真作业的取样（提交全失败），没得查"}
+    try:
+        conn = sqlite3.connect(str(os.environ["LOAD_DB"]), timeout=10)
+        row = conn.execute("SELECT trace_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+    except sqlite3.Error as exc:
+        # 取不到 trace 与"这条作业没有 trace"是两件事：前者要报出来，不能读成"没链路"
+        return {"error": f"读 trace_id 失败：{type(exc).__name__}: {str(exc)[:120]}"}
+    trace_id = (row or [None])[0]
+    if not trace_id:
+        return {"status_code": None, "reason": "这条作业行上没有链路标识（建行的那一步没接上，是要查的缺陷）"}
+    try:
+        response = await client.get(f"{base}/api/trace/{trace_id}", headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        return {"trace_id": trace_id, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    body = response.json() if response.status_code == 200 else {}
+    entry = (body.get("jobs") or [{}])[0] if body.get("jobs") else {}
+    timing = entry.get("timing") or {}
+    execution = entry.get("execution") or {}
+    upstream = entry.get("upstream") or {}
+    return {
+        "trace_id": trace_id,
+        "status_code": response.status_code,
+        "rows_returned": body.get("count"),
+        # 五格各自"有没有拿到东西"——None 与缺失分开记，因为排队那一格 legitimately 是 None
+        "who_submitted": entry.get("submission", {}).get("actor_username") is not None,
+        "queue_wait_seconds": timing.get("queue_wait_seconds"),
+        "queue_wait_measured": "queue_wait_seconds" in timing,
+        "claimer_field_present": "claimed_by" in execution,
+        "attempts": execution.get("attempts"),
+        "upstream_status": upstream.get("artifact", {}).get("status"),
+    }
+
+
 async def concurrency_probe(db_path: Path, holder: dict[str, int], stop: asyncio.Event) -> None:
     """盯 jobs 表里非终态的行数：这是"同时在跑"的直接证据，比猜 worker 数诚实。"""
     while not stop.is_set():
@@ -750,6 +793,9 @@ async def drive(
     # 那时再发同一个键，才看得见"撞回同一条作业"还是"又建了一行"。
     async with httpx.AsyncClient(timeout=30) as probe_client:
         replay = await replay_probe(probe_client, base, sse_case)
+        # 同一条现场接着查一次链路（P6 的退出判据）：取这一轮真跑完的那条作业，
+        # 凭它的 trace_id 把"谁提交、排了多久、谁认领、几次重试、上游什么形状"取回来。
+        trace_read = await trace_lookup(probe_client, base, sse_case)
 
     return {
         "users": len(users),
@@ -771,6 +817,8 @@ async def drive(
         "kill_clock": holder.get("kill_clock"),
         "rows_at_kill": holder.get("rows_at_kill"),
         "replay_probe": replay,
+        # P6 的退出判据在真 HTTP 上的读数（不是 TestClient）：这一格是"能不能凭一个 id 查回来"的现场证据
+        "trace_lookup": trace_read,
         "claimer_probe": {
             "samples": holder.get("samples", 0),
             "errors": holder.get("claimer_probe_errors", 0),
@@ -831,6 +879,11 @@ def restart_log_path(db_path: Path) -> Path:
 
 
 def main() -> int:
+    # **必须在 argparse 之前**：`--help` 与参数报错都是"先打印再干活"的路径。
+    # 原来这句排在 parse_args() 之后（第 914 行），于是 `load_test.py --help` 在本机 cp936 码页下
+    # 直接 UnicodeEncodeError——一次"我只是想看看怎么用"的调用被报成崩溃，
+    # 与一次真回归完全同形（缺陷 #39 那一族的第三个实例：run_eval → e2e_packs → 这里的 argparse）。
+    harden_streams()
     parser = argparse.ArgumentParser(description="P0 平台负载尺子（mock 模式，不烧上游）")
     parser.add_argument("--users", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=1)
@@ -861,9 +914,6 @@ def main() -> int:
     parser.add_argument("--recover-wait", type=float, default=120.0, help="杀完之后最多等多久看队列自己排空")
     parser.add_argument("--report", default=str(ROOT / ".appdata" / f"load_{int(time.time())}.json"))
     args = parser.parse_args()
-    # Windows 上 stdout 被重定向时按本地码页编码，打印 `⇒`/`✘` 这类字符会在跑完之后炸栈
-    # （缺陷 #39 就是这么来的）。守这条的用例是 tests/test_scripts_encoding.py。
-    harden_streams()
 
     if not CSV.exists():
         raise SystemExit(f"夹具不在：{CSV}")
@@ -1008,6 +1058,7 @@ def main() -> int:
     print(f"  计数器：{json.dumps(result['counters'], ensure_ascii=False)}")
     print(f"  幂等检查（库里）：{json.dumps(result.get('idempotency_check', {}), ensure_ascii=False)}")
     print(f"  重放探针（同一个键再发一次）：{json.dumps(result.get('replay_probe', {}), ensure_ascii=False)}")
+    print(f"  凭一个 id 查回（P6 的退出判据，真 HTTP）：{json.dumps(result.get('trace_lookup', {}), ensure_ascii=False)}")
     print(f"  客户端形状 = {result.get('client_shape')}（off 一次都不重试，on 按退避重试且重试带同一个幂等键）")
     print(f"  受理层何时回来 = {result.get('server_back_at_s')} 秒（None = 这一轮没人帮忙重启，P2 那种形状）")
     if "durability" in result:

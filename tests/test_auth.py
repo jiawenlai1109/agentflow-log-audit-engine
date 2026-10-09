@@ -106,6 +106,7 @@ PROTECTED = [
     ("get", "/api/queue"),
     ("get", "/api/jobs/job_nope"),
     ("get", "/api/jobs/job_nope/events"),
+    ("get", "/api/trace/any-chain-1"),
     ("get", "/api/sessions"),
     ("post", "/api/sessions"),
     ("get", "/api/sessions/session_nope/messages"),

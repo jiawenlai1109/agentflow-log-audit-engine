@@ -14,9 +14,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app import access, config, eventlog, llm_gate, queueing, quota
+from app import access, config, eventlog, llm_gate, paths, queueing, quota
 from app.runner import Dispatcher, dispatch_form, web_dispatch_enabled
-from app.db import query_one
+from app.db import query, query_one
 from app.deps import get_current_user
 from app.jobs import JobManager
 from app.routers.bundles import load_bundle_for_analysis
@@ -380,6 +380,158 @@ def queue_state(user: dict = Depends(get_current_user)) -> dict:
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
     return _visible_job(job_id, user)
+
+
+def _seconds_between(start: Any, end: Any) -> float | None:
+    """两个本地时间串之间的秒数。**解不开就返回 None，不许当 0**。
+
+    这条口径是 P5 收尾那一轮立下的："0"有两种读法——"量到的是 0"与"没量到"。
+    排队时长这一格尤其贵：把"这条作业一条事件都还没有"报成 `queue_wait_seconds: 0`，
+    运维读到的是"排得真快"，而真相是"没人认领"。
+    """
+    if not start or not end:
+        return None
+    try:
+        first = datetime.strptime(str(start), "%Y-%m-%d %H:%M:%S")
+        second = datetime.strptime(str(end), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return round((second - first).total_seconds(), 3)
+
+
+def _upstream_shape(row: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """"上游返回了什么形状"这一格：闸门等待从库里的事件算，产物侧从 `evaluation.json` 取。
+
+    三种缺席分开写，不许都写成 0 或不写：没有 run_id（这条作业还没落过产物）、
+    产物文件不在（被清理或换机）、文件在但读不开。最后一种必须报"读不开"，
+    因为它意味着有别的写法在写那个文件——那是缺陷不是空值。
+    """
+    waits = eventlog.payloads_of_kind(str(row["job_id"]), "llm_gate_wait")
+    durations = [event.get("waited_ms") for event in waits if isinstance(event.get("waited_ms"), (int, float))]
+    last = waits[-1] if waits else {}
+    out: dict[str, Any] = {
+        "mode": row.get("mode"),  # mock 那两格描述的是本地假客户端，不是真上游——别让读数冒充
+        "gate_waits": len(waits),
+        "max_gate_wait_ms": max(durations) if durations else None,
+        "gate_limit": last.get("limit"),
+        "gate_limit_source": last.get("limit_source"),
+    }
+    run_id = row.get("run_id")
+    if not run_id:
+        out["artifact"] = {"status": "no_run_id", "reason": "这条作业还没跑出 run_id，产物侧没有可对的东西"}
+        return out
+    path = paths.run_dir_for_row(row, str(run_id)) / "evaluation.json"
+    if not path.exists():
+        out["artifact"] = {"status": "absent", "run_id": run_id, "reason": "产物目录里没有 evaluation.json"}
+        return out
+    try:
+        evaluation = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        out["artifact"] = {
+            "status": "unreadable",
+            "run_id": run_id,
+            "reason": f"{type(exc).__name__}：文件在但读不出来，说明有别的写法在写它",
+        }
+        return out
+    # 只取形状与计数，不取正文：产物里那些 results/report 正文不是这个读数该搬的东西
+    out["artifact"] = {
+        "status": "present",
+        "run_id": run_id,
+        "run_status": evaluation.get("status"),
+        "llm_calls": evaluation.get("llm_calls"),
+        "duration_seconds": evaluation.get("duration_seconds"),
+        "models_used": evaluation.get("models_used"),
+        "empty_content_shapes": len(evaluation.get("llm_empty_content") or []),
+        "degraded_reason": evaluation.get("degraded_reason"),
+    }
+    return out
+
+
+def _trace_job(row: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    """一条作业行 → "凭一个 id 查回"的那五格。
+
+    作业详情那一侧**复用 `_visible_job`**，不在这里再拼一份：状态、队列深度、闸门读数、
+    终态与否、执行形态都已经有唯一的一份算法，抄第二份的下场是两边迟早给两个答案
+    （P5-3 那次就是为这句话加的守卫）。这里只补作业详情**没有**的那几格。
+    """
+    spec = queueing.get_spec(row)
+    origin = spec.get("run_origin") or {}
+    job_id = str(row["job_id"])
+    first_event_at = eventlog.first_event_at(job_id)
+    claimed_by = row.get("claimed_by")
+    is_admin = user.get("role") == "admin"
+    return {
+        "detail": _visible_job(job_id, user),
+        # 谁提交的：行上的 user_id + 受理那一刻记下的经手人。别人的 user_id 不外泄（P3 的口径），
+        # 所以给一个 is_mine 让读者知道自己是不是那个"谁"。
+        "submission": {
+            "user_id": row.get("user_id"),
+            "is_mine": int(row.get("user_id") or 0) == int(user["id"]),
+            "actor_username": origin.get("actor_username"),
+            "org_id": row.get("org_id"),
+            "pack": row.get("pack"),
+            "question": row.get("question"),
+            "source_ref": spec.get("source_ref"),
+        },
+        # 排了多久：算法写在读数里，不让读者猜这个数是按哪两列减出来的
+        "timing": {
+            "created_at": row.get("created_at"),
+            "first_event_at": first_event_at,
+            "finished_at": row.get("finished_at"),
+            "queue_wait_seconds": _seconds_between(row.get("created_at"), first_event_at),
+            # 算法与**分辨率**都写进读数：这两列都是秒级（SQLite 的 `datetime('now','localtime')`
+            # 不带小数），所以 `0.0` 的意思是"不到一秒"，不是"没有排队"。这一格不给分辨率，
+            # 下一个读它的人就会把 0.0 抄成"排队时间为零"——P5 收尾那轮立下的"0 有两种读法"，
+            # 这一次是我自己的新读数里差点犯的那一种。
+            "queue_wait_basis": "jobs.created_at → 这条作业第一条 job_events.created_at（两列都是秒级，故本数是秒级量化）",
+            "total_seconds": _seconds_between(row.get("created_at"), row.get("finished_at")),
+        },
+        # 谁认领的：`claimed_by` 是本机 主机名:进程号:尾，属内部标识（P5-3 定的口径），
+        # 因此**只给 admin**；普通读者拿到的是布尔 + 一句这一格为什么是 null。
+        "execution": {
+            "attempts": int(row.get("attempts") or 0),
+            "claimed": bool(claimed_by),
+            "claimed_by": claimed_by if is_admin else None,
+            "claimed_by_scope": "admin_only" if claimed_by else "none",
+            "run_id": row.get("run_id"),
+        },
+        "upstream": _upstream_shape(row, spec),
+    }
+
+
+@router.get("/trace/{trace_id}")
+def trace_readout(trace_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """P6 的退出判据：任一次线上请求，凭一个 id 查回"谁提交的、排了多久、谁认领的、
+    几次重试、上游返回了什么形状"。
+
+    三条口径是这一格能不能被信任的关键：
+
+    1. **`trace_id` 不是权限凭据**。查询照拼 `access.scope(user)` 那条谓词（判据只有一份，
+       住在 `app/access.py`）：带别人那条串查回来的是 404，与"这条链路不存在"**同一个形状**——
+       区分二者就等于给了一个枚举入口。
+    2. **一条链路可以挂着多条作业行**。入站那个串是客户端自带的，同一个人复用同一个 id 连发
+       两次是合法形状（没带幂等键就是两行）。所以这里交回**列表**而不是"那一条"，
+       把"一次提交 = 一行"这个假设藏在返回形状里。
+    3. **没量到的那格不许写成 0**：排队时长在"一条事件都还没有"时是 None，
+       上游产物分"没有 run_id / 文件不在 / 文件读不开"三种缺席。
+    """
+    if not trace.is_usable(trace_id):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"trace_id 形状不对：要 1-{trace.MAX_LEN} 位字母、数字、- 或 _，不收空格与控制字符。"
+                "这一格是从作业行上查回来的，不是自由文本——形状摆对了，「查得着」与「查不着」才是两种确定的读数。"
+            ),
+        )
+    sql, params = access.scope(user)
+    rows = query(
+        "SELECT job_id, user_id, org_id, status, mode, pack, question, run_id, attempts, claimed_by, "
+        "created_at, finished_at, spec FROM jobs WHERE trace_id = ?" + sql + " ORDER BY id ASC",
+        (trace_id, *params),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="没有这条链路的可见记录（不存在，或不在你能看的范围里）")
+    return {"trace_id": trace_id, "count": len(rows), "jobs": [_trace_job(row, user) for row in rows]}
 
 
 TERMINAL_STATUSES = set(queueing.TERMINAL)  # 名单只有一份（queueing.TERMINAL），这里不另立

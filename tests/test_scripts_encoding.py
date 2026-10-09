@@ -87,3 +87,60 @@ def test_shared_helper_actually_survives_a_gbk_pipe():
     )
     assert probe.returncode == 0, probe.stderr[-300:]
     assert "全过" in probe.stdout
+def test_scripts_harden_their_streams_before_argparse_runs():
+    """下限从"调了 harden_streams"升到"**在会打印的那些语句之前**调"。
+
+    这条是被实测逼出来的：`load_test.py` 一直调着这个函数，但调在 `parse_args()` 之后，
+    于是 `load_test.py --help` 在本机码页（cp936）下直接 `UnicodeEncodeError`——
+    "我只是看看怎么用"被报成一次崩溃，而它的形状与一次真回归完全一样。
+    判据（按源码行序，不按 AST 位置）：在 `main()` 里，**第一次出现 `harden_streams(` 的行号**
+    必须早于第一次出现 `parse_args(`、`print(` 的行号。写成"必须是 main() 第一句"过严——
+    有的脚本 main() 开头是 `global`，那不是打印路径。
+    """
+    checked: list[str] = []
+    for script in SCRIPTS:
+        source = script.read_text(encoding="utf-8")
+        if "harden_streams(" not in source:
+            continue
+        lines = source.split(chr(10))
+        starts = next(i for i, line in enumerate(lines) if line.startswith("def main("))
+        body = lines[starts:]
+        stop = next((i for i, line in enumerate(body[1:], 1) if line.startswith("def ") or line.startswith("class ")), len(body))
+        body = body[:stop]
+        def first_call(name: str) -> int:
+            for i, line in enumerate(body):
+                if line.lstrip().startswith("#"):
+                    continue
+                if name in line:
+                    return i
+            return len(body) + 1
+
+        hardened = first_call("harden_streams(")
+        assert hardened < first_call("parse_args("), f"{script.name}：harden_streams 排在 parse_args 之后"
+        assert hardened < first_call("print("), f"{script.name}：harden_streams 排在第一次 print 之后"
+        checked.append(script.name)
+    assert {"load_test.py", "run_eval.py"} <= set(checked), f"这两个脚本没被这条下限看到：{checked}"
+
+
+def test_load_test_help_survives_a_gbk_console():
+    """活体：强制 GBK 码页跑 `load_test.py --help`，要求退出码 0 且打印出用法。
+
+    只断"没崩"会放行"没崩但也没输出"，所以两条一起断（与 #39 那条回归用例同一形状）。
+    环境用**继承 + 覆盖一个键**而不是整份替换：这个脚本 import asyncio，
+    只给 SYSTEMROOT 的最小环境会让 `_overlapped` 在 Winsock 初始化上炸
+    （WinError 10106），那种红在脚手架上、与被测无关。
+    """
+    import os
+    import subprocess
+    import sys
+
+    probe = subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "load_test.py"), "--help"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": LOCAL_CODEPAGE},
+    )
+    assert probe.returncode == 0, (probe.stdout[-300:], probe.stderr[-500:])
+    assert "usage" in probe.stdout.lower(), probe.stdout[-300:]
