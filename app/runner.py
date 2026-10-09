@@ -141,8 +141,13 @@ def resolve_sources(spec: dict[str, Any], user_id: int) -> Any:
     raise RuntimeError(f"spec 里没有可识别的数据源引用：{ref!r}")
 
 
-def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
-    """跑掉一个已认领的 job，返回它的终态。"""
+def execute_job(claim: dict[str, Any], manager: JobManager, *, lease_heartbeat_s: float = 20.0) -> str:
+    """跑掉一个已认领的 job，返回它的终态。
+
+    `lease_heartbeat_s` 是续租间隔，默认 20s（生产值）。做成参数而不是把 20.0 硬写在循环里，
+    理由是可观测性：**"租约被收走时那一行日志念不念得出链路标识"这条性质必须能在秒级被测到**，
+    否则没人会为了验一行日志等 20 秒，它就变成"写了但没人验"的那一类。
+    """
     job_id = str(claim["job_id"])
     user_id = int(claim["user_id"])
     worker = str(claim["worker"])
@@ -164,6 +169,13 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
             session_org = org_id
         sessions_root = config.sessions_root(session_org)
     last = {"status": "failed", "run_id": None, "error": None}
+    # 一次运行绑在同一条链路上（P6-2）。权威是**库里那列**（`jobs.trace_id`，受理那一刻写的），
+    # spec 里的副本只是给"这列还没补上的老库"留的退路。两样都没有（P6-1 之前建的老作业）就
+    # 什么都不绑：认领循环是长命线程，留着上一个作业的值会把两次运行写成同一条链路，
+    # 那是假关联，比"这一段没链路"更难查（口径见 `agentflow.core.trace` 的文件头）。
+    # 取在**这里**而不是取在 `with` 那一行：续租那条日志住在另一个线程里，那个线程不继承
+    # contextvar，它只能读这个闭包捕获的值（见下面 `keep_lease`）。
+    chain = claim.get("trace_id") or spec.get("trace_id")
 
     def on_event(event: dict[str, Any]) -> None:
         _publish(manager, job_id, event)
@@ -176,18 +188,18 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
     lease_stop = threading.Event()
 
     def keep_lease() -> None:
-        while not lease_stop.wait(20.0):
+        while not lease_stop.wait(lease_heartbeat_s):
             if not queueing.heartbeat(job_id, worker):
-                logger.warning("job %s 的租约被收走，本次运行结果不再回写", job_id)
+                # 这一行用捕获来的 `chain`，不用 `trace.describe()`：续租线程是新起的，
+                # 不继承发起方的 contextvar，在那里读到的永远是 "-"——写在这里才会让人
+                # 以为"这条链路丢了"，而实际是读的人站错了线程。
+                logger.warning(
+                    "job %s（trace=%s）的租约被收走，本次运行结果不再回写", job_id, chain or "-"
+                )
                 return
 
     lease = threading.Thread(target=keep_lease, name=f"lease-{job_id}", daemon=True)
     lease.start()
-    # 一次运行绑在同一条链路上（P6-2）。权威是**库里那列**（`jobs.trace_id`，受理那一刻写的），
-    # spec 里的副本只是给"这列还没补上的老库"留的退路。两样都没有（P6-1 之前建的老作业）就
-    # 什么都不绑：认领循环是长命线程，留着上一个作业的值会把两次运行写成同一条链路，
-    # 那是假关联，比"这一段没链路"更难查（口径见 `agentflow.core.trace` 的文件头）。
-    chain = claim.get("trace_id") or spec.get("trace_id")
     with trace.bind(chain):
         try:
             result = run_analysis(
@@ -210,7 +222,10 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
             reason = f"{type(exc).__name__}: {str(exc)[:400]}"
             queueing.finish(job_id, worker, "failed", error=reason)
             _publish(manager, job_id, {"type": "error", "error": str(exc)[:500]})
-            logger.warning("job %s 失败：%s", job_id, reason)
+            # trace 念出来的是**绑定本身**（不是再取一次行里的值）：这一行就在绑定块里面，
+            # 它要是打印 "-"，就说明绑定那一环丢了——那正是要在日志里直接看得见的读数，
+            # 而不是"这条日志恰好没写链路标识"。
+            logger.warning("job %s（trace=%s）失败：%s", job_id, trace.describe(), reason)
             return "failed"
         finally:
             lease_stop.set()

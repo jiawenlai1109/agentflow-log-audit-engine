@@ -613,3 +613,38 @@ def test_external_evidence_predicate_checks_local_audit_not_server_words():
     failed = json.loads(json.dumps(evidence))
     failed["evaluation"]["external_evidence"][0].update({"status": "failed", "reason": "越权"})
     assert not _p_external_evidence(failed, params, "mock")[0]
+def test_the_chain_stops_at_our_side_of_the_pipe(tmp_path, monkeypatch):
+    """链路标识停在我们这一侧：外部 server 一个字节都收不到，而本地审计收得到（P6-3 的决定）。
+
+    两条方向都要断言，缺一条这条用例就是空的：
+    - **本地**：`mcp_outbound` 那条审计必须带着本次链路（用的是真的 `TranscriptWriter`，
+      盖章住在 `write()` 那一处，所以这里验的是"P6-2 的盖章确实罩住了外部工具这一路"）；
+    - **外部**：发给 server 的每一帧（走 `_send` 这一个漏斗）里搜不到 trace 这个串。
+      它是内部链路标识，第三方拿到没有收益，只多一个可推测的拓扑面。
+    """
+    from agentflow.core import mcp as mcp_module
+    from agentflow.core import trace
+    from agentflow.core.transcript import TranscriptWriter
+
+    chain = "mcplocalchain00000000000000000ab"
+    frames: list[str] = []
+    original = mcp_module.StdioMcpClient._send
+
+    def spy(self, payload):
+        frames.append(json.dumps(payload, ensure_ascii=False))
+        return original(self, payload)
+
+    monkeypatch.setattr(mcp_module.StdioMcpClient, "_send", spy)
+    path = tmp_path / "transcript.jsonl"
+    hub = _hub(transcript=TranscriptWriter(path))
+    with trace.bind(chain):
+        hub.invoke("soc_intel", "query", {"sql": "SELECT host FROM intel ORDER BY host LIMIT 2"}, agent_name="explorer")
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    outbound = [record for record in records if record.get("event") == "mcp_outbound"]
+    assert outbound, f"这次调用没写下 mcp_outbound 审计：{[r.get('event') for r in records]}"
+    assert all(record.get("trace_id") == chain for record in outbound), outbound
+
+    assert frames, "spy 一帧都没收到，那条'不外传'的断言就是空转"
+    leaked = [frame for frame in frames if "trace" in frame.lower()]
+    assert not leaked, f"这些发给外部 server 的帧里带了链路标识：{leaked}"

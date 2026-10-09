@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentflow.core import trace
+
 
 # 静态预扫描拒绝的高风险模式（安全与隔离设计 §5.1，v1.2 增补写逃逸与相对路径逃逸）
 _WRITE_TO_PATTERN = r"\.\s*(?:to_csv|to_excel|to_parquet|to_pickle|to_sql|to_json)\s*\("
@@ -98,6 +100,16 @@ class LocalBackend(ExecutionBackend):
         env = {key: os.environ[key] for key in self.ALLOWED_ENV_KEYS if key in os.environ}
         env.update(extra)
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        # 链路标识交给沙箱子进程（P6-3）：代码里 print 出来的东西、崩在哪个脚本，
+        # 要能对回"是哪次提交跑的"。这一格**不从 `os.environ` 继承**，所以 `ALLOWED_ENV_KEYS`
+        # 那条"不传任何密钥"的白名单一个字都没动——传的是本次运行自己的标识，不是宿主环境。
+        # 而且**调用方传的不算数**（先无条件撤掉）：这条串的含义是"本次运行的链路"，
+        # 由执行侧说了算；留着让上层字典覆盖，等于任何拼 env 的地方都能伪造一条链路，
+        # 而伪造出来的串在按 trace 反查时会把人带到别的作业上。
+        env.pop(trace.ENV_KEY, None)
+        chain = trace.current()
+        if chain:
+            env[trace.ENV_KEY] = chain
         return env
 
     def execute(
