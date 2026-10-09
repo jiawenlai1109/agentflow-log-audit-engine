@@ -151,6 +151,10 @@ class JobOut(BaseModel):
     # `WEB_DISPATCH=off` 而外部 worker 没起时，queue.running 恒为 0，接口一切正常、作业永远排队。
     # 这个读数只描述**处理这次请求的进程**，与 `llm_gate` 同口径（局部量不与全局量合成一个字典）。
     dispatch: dict[str, Any] | None = None
+    # 这次提交的链路标识（P6-1）。给出去是有意的：用户报"我 15:07 那次分析没出报告"时，
+    # 运维要能凭这一个串查回作业行、事件与产物，而不是靠时间在两份日志里对齐。
+    # 它**不是**权限凭据——归属判据仍只有 access 那一份，带别人的 trace 也查不到别人的东西。
+    trace_id: str | None = None
 
 
 class DatasetOut(BaseModel):

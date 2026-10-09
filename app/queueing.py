@@ -86,6 +86,7 @@ def accept(
     pack: str | None,
     spec: dict[str, Any],
     idempotency_key: str | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """受理 = **一条 INSERT 就写完可认领状态**；带幂等键时由库层的唯一约束决定谁是真的。
 
@@ -110,10 +111,16 @@ def accept(
 
     唯一索引不在的那份库（有人手工建的、跳过迁移的）会在这条 INSERT 上**当场报错**，
     而不是"看起来幂等其实每次都新建一行"——失败要响，不要静默降级成假护栏。
+
+    `trace_id`（P6-1）由**调用方**生成（`agentflow.core.trace.adopt`），这里只负责把它写进
+    作业行。这一列和 `spec["trace_id"]` 是同一件事的两个副本吗？不是：库里那列是**运维查的**
+    （`WHERE trace_id = ?` 一次拿到整条链路的作业行），spec 那份是**执行侧读的**（认领到作业后
+    要能把同一个 id 绑回引擎）。所以重放时两处分叉都不发生——`ON CONFLICT DO NOTHING` 让第二次
+    提交连行都不碰，于是第二次提交虽然自己起了新 trace，作业行上留的仍是第一次那条。
     """
     execute(
         "INSERT INTO jobs (job_id, user_id, org_id, question, mode, session_id, pack, status, spec, "
-        "idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?) "
+        "idempotency_key, trace_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?) "
         "ON CONFLICT (user_id, idempotency_key) DO NOTHING",
         (
             job_id,
@@ -125,6 +132,7 @@ def accept(
             pack,
             json.dumps(spec, ensure_ascii=False, default=str),
             idempotency_key,
+            trace_id,
         ),
     )
     if not idempotency_key:

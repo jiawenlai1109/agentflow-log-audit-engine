@@ -19,6 +19,7 @@ from app.schemas import (
     SessionCreateRequest,
     SessionOut,
 )
+from agentflow.core import trace
 from agentflow.core.context import SessionContext
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
@@ -100,6 +101,7 @@ def post_message(
     payload: MessageCreateRequest,
     user: dict = Depends(get_current_user),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    inbound_trace: str | None = Header(None, alias=trace.HEADER),
 ) -> dict:
     # 会话续轮也要有幂等键：它是**第二个会创建作业的入口**，只在 /api/analyze 上装护栏
     # 等于"重试不会重复"这条承诺只对一半的请求成立（判据本身仍只有一份，在 queueing.accept）。
@@ -124,6 +126,9 @@ def post_message(
         # 会话行自己的 org 算（见 app/paths.py）。两条各管各的，谁也不覆盖谁。
         org_id=access.primary_org(user),
         idempotency_key=key,
+        # 第二个入口也要能沿用链路：网关把 X-Trace-Id 带进来时，会话续轮与 /api/analyze
+        # 走的是同一个生成点（submit_analysis），这里只是把入站那一格原样递下去。
+        inbound_trace=inbound_trace,
     )
     job_id = submitted["job_id"]
     sql, params = access.scope(user, access.OWNER)
@@ -136,7 +141,7 @@ def post_message(
     # 别人在同一企业里跑的作业不会串到这条会话的时间线里。
     job_sql, job_params = access.scope(user, access.OWNER)
     row = query_one(
-        "SELECT job_id, status, progress, run_id, error, question FROM jobs "
+        "SELECT job_id, status, progress, run_id, error, question, trace_id FROM jobs "
         f"WHERE job_id = ?{job_sql}",
         (job_id, *job_params),
     )

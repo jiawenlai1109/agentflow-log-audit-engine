@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from datetime import datetime
@@ -20,6 +21,7 @@ from app.deps import get_current_user
 from app.jobs import JobManager
 from app.routers.bundles import load_bundle_for_analysis
 from app.schemas import AnalyzeRequest, JobOut
+from agentflow.core import trace
 from agentflow.core.mcp import load_mcp_config, partition_approvals
 from agentflow.core.pack import (
     available_columns,
@@ -30,6 +32,9 @@ from agentflow.core.pack import (
 from agentflow.pipeline import as_bundle
 
 router = APIRouter(prefix="/api", tags=["jobs"])
+# 受理层的日志名与 quota/ratelimit 共用一个（`agentflow.accept`）：运维查"这次提交发生了什么"
+# 时不该在三个 logger 名之间找。可见性由 app.main 的 ensure_operator_visible_logging 负责。
+logger = logging.getLogger("agentflow.accept")
 manager = JobManager(sink=eventlog.append_event)
 # 建对象与启动分开：import 时起线程会让测试与 `--help` 都偷偷开跑线程。
 # 启动点在 app/main.py 的 lifespan——进程活着才当认领者，退出时收。
@@ -40,7 +45,7 @@ dispatcher = Dispatcher(manager)
 # 那时往上加才不伤登录。真正的上游并发由 P4 的全局闸门管，这里不把"线程多"伪装成"上游扛得住"。
 
 # 阶段→进度的映射住在 app/runner.py（执行那侧），路由不再自己算一份
-_JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question, pack"
+_JOB_FIELDS = "job_id, user_id, status, progress, run_id, error, question, pack, trace_id"
 
 
 def _visible_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
@@ -203,6 +208,8 @@ def submit_analysis(
     # 幂等键（P5-1）：同一个人带同一个键，只有第一次真的建出作业行。判据在库层，
     # 这里只负责把它原样递下去——路由不自己判"是不是重放"，那会有第二份答案。
     idempotency_key: str | None = None,
+    # 入站的链路标识（P6-1，`X-Trace-Id`）。两个创建作业的入口都汇到这里，所以生成点只有一处。
+    inbound_trace: str | None = None,
 ) -> dict[str, Any]:
     """sources 可以是文件路径，也可以是 Bundle——pipeline 里 `as_bundle` 会归一化。
 
@@ -217,8 +224,27 @@ def submit_analysis(
     返回值是 `{"job_id": …, "replayed": 是否只是重放}`，不是裸的 job_id：
     "我这次提交排上了一个活"与"我这次提交撞回了自己上一次那条"对用户是两种结果，
     界面与压测读数都要能分开这两件事。
+
+    `trace_id`（P6-1）在这里生成、在这里落库，**两个创建作业的入口都汇到这一个函数**：
+    `/api/analyze` 与会话续轮如果各写一条生成逻辑，"凭一个 id 查回整条链路"就只对一半的请求成立
+    ——这和幂等键当初必须装在 `queueing.accept` 而不是装在路由里是同一个理由。
+    重放时库里那条作业行没被碰过（`ON CONFLICT DO NOTHING`），所以行上留的仍是第一次的 trace；
+    第二次提交自己的 trace 只出现在那一条 warning/日志里，不会冒充行上的链路。
     """
     job_id = f"job_{uuid.uuid4().hex[:12]}"
+    # 链路标识生在**受理这一跳**（P6-1），不是生在 HTTP 中间件里：一次 HTTP 请求与一次分析
+    # 不是一一对应——带幂等键的重试是第二个请求、撞回同一个作业。把 trace 定在"提交"上，
+    # 才有"凭一个 id 查回这次分析排了多久、谁认领、重试几次"这句话的落点。
+    # 入站带了 `X-Trace-Id` 且形状对就沿用（网关已经起过一条链路时不该在受理层断掉），
+    # 形状不对就另起一条并把这件事**说出来**：静默改写客户端的链路标识，等于让它以为自己那条贯穿到底。
+    trace_id, reused = trace.adopt(inbound_trace)
+    if inbound_trace and not reused:
+        logger.warning(
+            "入站 %s 形状不对（要 1-%d 位字母数字/-/_，不收空格与控制字符），本次提交另起一条链路：job_id=%s",
+            trace.HEADER,
+            trace.MAX_LEN,
+            job_id,
+        )
 
     # 提交 = 入队，而且是一行写完就已是可认领状态（参数以**引用**形式进 spec：
     # bundle:<id> / dataset:<id>，绝对路径不进 jobs 表——那既可外泄位置（#15），
@@ -233,6 +259,9 @@ def submit_analysis(
         "mcp_approvals": mcp_approvals or {},
         "run_origin": run_origin or {},
         "source_ref": source_ref,
+        # 执行侧读的那一份（认领之后由 app/runner 绑回引擎）。作业行上还有同一列，
+        # 那份是给运维 `WHERE trace_id = ?` 反查用的——两个读者、一个值，不是两个事实源。
+        "trace_id": trace_id,
     }
     accepted = queueing.accept(
         job_id=job_id,
@@ -247,6 +276,7 @@ def submit_analysis(
         pack=pack,
         spec=spec,
         idempotency_key=idempotency_key,
+        trace_id=trace_id,
     )
     # Web 进程自己也是认领者（默认形态）。独立 worker 进程起来后这只是多一个消费者，
     # 不是第二条执行路径——认领是原子的，一个 job 只会被一个认领者拿到。
@@ -263,6 +293,7 @@ def analyze(
     payload: AnalyzeRequest,
     user: dict = Depends(get_current_user),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    inbound_trace: str | None = Header(None, alias=trace.HEADER),
 ) -> dict:
     # 顺序是有意的：最便宜的校验先做（读目录、读一份小配置），资源解析放后面。
     # 把"包名写错"排在解析 Bundle 之后，等于让一个必然失败的请求先去读盘。
@@ -323,6 +354,7 @@ def analyze(
         },
         source_ref=source_ref,
         idempotency_key=key,
+        inbound_trace=inbound_trace,
     )
     visible = _visible_job(job["job_id"], user)
     # "这次真的排上了一个活"与"这次只是撞回我自己上一次那条"，客户端有权知道：
