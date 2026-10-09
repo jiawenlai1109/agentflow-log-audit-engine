@@ -331,6 +331,20 @@ def analyze(
     return visible
 
 
+@router.get("/queue")
+def queue_state(user: dict = Depends(get_current_user)) -> dict:
+    """平台读数的独立入口：队列深度（库里的全局事实）+ 闸门与形态（本进程的局部量）。
+
+    为什么单独一条：这三份数原来只挂在**作业详情**与**进度流首帧**上，于是"我还没提交任何
+    作业"的时候界面无处可问——而那时恰好是分进程形态下最该看的一眼（有没有人在认领）。
+    数据一条都不新算：三个函数就是作业详情与首帧用的那三份，权威还是各自那一处。
+
+    刻意**不含入口限流的额度**。P4-3 定过"429 的响应里不写限额与已试次数"（那等于替试探者
+    标定天花板），一个匿名可猜的 GET 把整份吐出去，就是从侧门把那条决定撤掉。
+    """
+    return {"queue": queueing.stats(), "gate": llm_gate.snapshot(), "dispatch": dispatch_form()}
+
+
 @router.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: str, user: dict = Depends(get_current_user)) -> dict:
     return _visible_job(job_id, user)

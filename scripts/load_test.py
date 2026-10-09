@@ -70,6 +70,10 @@ RETRY_BASE_S = 0.5
 RETRY_CAP_S = 15.0
 RETRY_MAX_ATTEMPTS = 8
 RETRY_JITTER_RATIO = 0.3
+# `--kill-when submit-in-flight` 的开杀条件：现场至少几个提交正在路上。
+# 要 ≥2 是因为"只有一个在途"时，那一轮要么成功要么失败，看不出**重发**撞回同一条作业；
+# 两个以上在途被同一刀打断，才会有"第一次已经落库、第二次重发拿到 replayed"这种形状。
+SUBMIT_INFLIGHT_TO_KILL = 2
 
 
 def retriable(exc: BaseException | None = None, status: int | None = None) -> bool:
@@ -277,6 +281,8 @@ async def one_user(
         for _round in range(rounds):
             phase = "submit"
             started = time.perf_counter()
+            # 杀点的触发器（`--kill-when first-submit`）：记录"第一个提交发出"的那一刻。
+            counters.setdefault("first_submit_at", round(started, 3))
             # 韧性开的时候才带幂等键：**一次用户意图一个键，重试带同一个**。
             # 没有这把锁，"会重连的客户端"本身就是放大器——受理层被杀的那几秒里，
             # 一次提问会变成两个作业、双份上游调用。裸客户端那轮不带头（就是改造前的形状）。
@@ -290,7 +296,13 @@ async def one_user(
                     headers=submit_headers,
                 )
 
-            submit = await resilient_call(_submit, enabled=resilient, ledger=counters)
+            counters["submit_inflight"] = counters.get("submit_inflight", 0) + 1
+            try:
+                submit = await resilient_call(_submit, enabled=resilient, ledger=counters)
+            finally:
+                # 这是**实时**计数（跑完归零，报告里那个 0 是收尾时刻的快照，不是"从没在途过"）：
+                # `--kill-when submit-in-flight` 就是靠它决定"现在就杀，正有几个提交在路上"
+                counters["submit_inflight"] -= 1
             metrics["submit"].append(time.perf_counter() - started)
             if submit.status_code != 200:
                 counters["submit_failed"] += 1
@@ -302,6 +314,9 @@ async def one_user(
             if sse_case is not None and sse_case.get("job_id") is None:
                 sse_case["job_id"] = job_id
                 sse_case["token"] = token  # 只有一个用户负责把事件流跑一遍，见 read_stream
+                # 重放探针要用**同一个键**再发一次，所以把这一发的键与数据集一起记下来
+                sse_case["key"] = key
+                sse_case["dataset_id"] = dataset_id
 
             phase = "poll"
             waited = 0.0
@@ -406,6 +421,40 @@ async def read_stream(base: str, token: str, job_id: str) -> dict[str, Any]:
     }
 
 
+async def replay_probe(client: httpx.AsyncClient, base: str, case: dict[str, Any]) -> dict[str, Any]:
+    """跑完补一枪：**已经用过的幂等键再发一次**，看它撞回哪条作业。
+
+    为什么不靠"杀在提交那一瞬"去撞：那条路要的是"第一次已经落库、响应正好丢了"这个毫秒级
+    窗口，五轮实验里 `rows_at_kill` 最大才到 0（那一刀落下时库里一行都还没有），
+    `submit_replays` 一直是 0 —— 那不是承诺没生效，是**没打到那一瞬**。所以这一格改成
+    主动探针：它测的是同一件事（同一个键不产生第二个作业），但走的是真 HTTP、真库、
+    刚被压过的现场，而不是 TestClient。
+    """
+    key, token, dataset_id = case.get("key"), case.get("token"), case.get("dataset_id")
+    if not key or not token or not dataset_id:
+        return {"skipped": True, "reason": "这一轮没有带键的提交（裸客户端形状），没有可复用的键"}
+    before = idempotency_reading(Path(os.environ["LOAD_DB"]))
+    try:
+        response = await client.post(
+            f"{base}/api/analyze",
+            json={"question": QUESTION, "dataset_id": dataset_id, "mode": "mock", "pack": PACK},
+            headers={"Authorization": f"Bearer {token}", "Idempotency-Key": key},
+        )
+    except httpx.HTTPError as exc:
+        return {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    after = idempotency_reading(Path(os.environ["LOAD_DB"]))
+    body = response.json() if response.status_code == 200 else {}
+    return {
+        "status_code": response.status_code,
+        "same_job_id": body.get("job_id") == case.get("job_id"),
+        "flagged_replayed": body.get("idempotency_replayed"),
+        "rows_before": before.get("rows"),
+        "rows_after": after.get("rows"),
+        "rows_unchanged": before.get("rows") == after.get("rows"),
+        "duplicates": after.get("duplicates"),
+    }
+
+
 async def concurrency_probe(db_path: Path, holder: dict[str, int], stop: asyncio.Event) -> None:
     """盯 jobs 表里非终态的行数：这是"同时在跑"的直接证据，比猜 worker 数诚实。"""
     while not stop.is_set():
@@ -453,7 +502,45 @@ def _pid_in_name(name: str) -> str:
     return parts[1] if len(parts) >= 2 and parts[1].isdigit() else ""
 
 
-def claim_attribution(db_path: Path, server_log: Path, worker_logs: list[Path]) -> dict[str, Any]:
+def idempotency_reading(db_path: Path) -> dict[str, Any]:
+    """库里"同一个幂等键对应几行作业"的直接检查——P5-1 那句承诺在负载形态下的读数。
+
+    单元层已经验过并发重试只建一行，但那是一个受控的小场景；这里要的是**另一件事**：
+    受理层真的被打断过（提交在途时被杀）、客户端真带同一个键重发过之后，
+    库里仍然没有第二个作业。`rows_with_key > distinct_pairs` 就是"重试产生了第二个作业"的直接证据。
+
+    **比的单位是 `(用户, 键)` 这一对，不是键本身**：幂等键的作用域是用户（库层唯一索引就建在
+    这两列上），只按键去重的话，两个人各用 `k1` 提交两次会被算成"重复了一行"——那是把
+    别人的合法提交读成自己的放大，与"拿列位置当身份"同族。
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        rows, keyed = conn.execute(
+            "SELECT COUNT(*), COUNT(idempotency_key) FROM jobs"
+        ).fetchone()
+        pairs = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT user_id, idempotency_key FROM jobs "
+            "WHERE idempotency_key IS NOT NULL GROUP BY user_id, idempotency_key)"
+        ).fetchone()[0]
+        worst = conn.execute(
+            "SELECT user_id, idempotency_key, COUNT(*) AS n FROM jobs WHERE idempotency_key IS NOT NULL "
+            "GROUP BY user_id, idempotency_key ORDER BY n DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    except sqlite3.Error as exc:
+        return {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    return {
+        "rows": int(rows or 0),
+        "rows_with_key": int(keyed or 0),
+        "distinct_user_key_pairs": int(pairs or 0),
+        # 一个 (用户, 键) 最多对应几行：1 = 承诺成立；>1 = 重发造出了第二个作业
+        "max_rows_per_pair": int(worst[2]) if worst else 0,
+        "worst_pair": (f"user {worst[0]} / {worst[1]}" if worst else None),
+        "duplicates": max(0, int(keyed or 0) - int(pairs or 0)),
+    }
+
+
+def claim_attribution(db_path: Path, server_logs: list[Path], worker_logs: list[Path]) -> dict[str, Any]:
     """把 `jobs.worker` 里那些名字**归到具体进程**上，回答"这批 job 是谁认领的"。
 
     为什么不能拿 `Popen.pid` 判：这台机器上 `python.exe` 是启动器，真正的解释器是它的子进程
@@ -465,12 +552,16 @@ def claim_attribution(db_path: Path, server_log: Path, worker_logs: list[Path]) 
     连单进程那一轮都被念成"受理进程认领 0 个"，而那是假的）。`claimed_by` 是留痕，跑完还在。
     """
     pids: dict[str, str] = {}
-    try:
-        match = _SERVER_PID_RE.search(server_log.read_text(encoding="utf-8", errors="replace"))
-        if match:
-            pids[match.group(1)] = "web_process"
-    except OSError:
-        pass
+    # **每一份**受理层日志都要读：`--restart-server-after` 之后那座塔写的是另一个日志文件，
+    # 只读第一份的话，重启后的认领者会被归成 `unknown`（今天实测到 `{"unknown": 2}`，
+    # 那不是有个来路不明的进程在吃作业，是重启后的受理层没被认出来——同一角色，两份日志）。
+    for server_log in server_logs:
+        try:
+            match = _SERVER_PID_RE.search(server_log.read_text(encoding="utf-8", errors="replace"))
+            if match:
+                pids[match.group(1)] = "web_process"
+        except OSError:
+            pass
     for index, path in enumerate(worker_logs):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -540,6 +631,8 @@ async def drive(
     victim=None,
     resilient: bool = False,
     restart_server_after_s: float | None = None,
+    kill_on_submit_inflight: bool = False,
+    submit_inflight_to_kill: int = SUBMIT_INFLIGHT_TO_KILL,
 ):
     metrics: dict[str, list[float]] = {"login": [], "upload": [], "submit": [], "e2e": []}
     counters = {
@@ -584,12 +677,38 @@ async def drive(
             窗口里回来**，否则两种客户端形状都会耗尽 8 次重试，读出来是"韧性没用"——
             第一版就是这么读的（`transport_failed` 两边都是 39，而 retries=312）。
             那不是系统没恢复，是**服务根本没回来**。默认不重启，保持 P2 那种"没人帮忙"的形状。
+
+            `kill_on_submit_inflight` 解决另一件事：按秒排的"第 N 秒杀"打不到我要的那一段。
+            今天想测"提交在途时被杀 ⇒ 客户端带同一个幂等键重发"，试了第 2 秒杀（37 次失败全在
+            **上传**）、又试了"第一个提交之后 +1s"（那 10 个提交早就落库完了，剩下的人还在上传），
+            `submit_replays` 两次都是 0——那不是"不会重发"，是**没打到那一瞬**。
+            所以杀点改成等事件本身：**现场有 ≥2 个提交正在路上**那一刻起算 `kill_after_s` 秒。
             """
             if kill_after_s is None:
                 return
+            if kill_on_submit_inflight:
+                waited = 0.0
+                while counters.get("submit_inflight", 0) < submit_inflight_to_kill and waited < 90:
+                    await asyncio.sleep(0.02)
+                    waited += 0.02
+                inflight = counters.get("submit_inflight", 0)
+                holder["kill_clock"] = (
+                    f"现场 {inflight} 个提交在途时开杀（等了 {round(waited, 2)}s，再延后 {kill_after_s}s）"
+                    if inflight >= submit_inflight_to_kill
+                    else f"等不到 {submit_inflight_to_kill} 个提交同时在途（90s 超时，现场 {inflight} 个）"
+                )
             await asyncio.sleep(kill_after_s)
             holder["killed_at_s"] = 1
             holder["non_terminal_at_kill"] = non_terminal(Path(os.environ["LOAD_DB"]))
+            # 杀的那一刻库里已经有几行作业。没有这一格，"重放那格是 0"就有两种读法：
+            # 一种是"没有提交来得及落库"（那是没打到），另一种是"落库了但响应也丢了，
+            # 重发新建了一行"（那是承诺破了）。两者必须分得开。
+            try:
+                probe = sqlite3.connect(os.environ["LOAD_DB"], timeout=5)
+                holder["rows_at_kill"] = int(probe.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+                probe.close()
+            except sqlite3.Error:
+                holder["rows_at_kill"] = -1  # -1 = 取不到，不许当成 0
             target = victim if victim is not None else server
             if target is not None and target.poll() is None:
                 target.kill()
@@ -627,6 +746,11 @@ async def drive(
         stream = await read_stream(base, sse_case["token"], sse_case["job_id"])
     stream["job_completed_first"] = True
 
+    # 重放探针（跑完之后补一枪）。放在整轮结束之后是因为它要的是"现场已被压过、库里已有行"，
+    # 那时再发同一个键，才看得见"撞回同一条作业"还是"又建了一行"。
+    async with httpx.AsyncClient(timeout=30) as probe_client:
+        replay = await replay_probe(probe_client, base, sse_case)
+
     return {
         "users": len(users),
         "rounds": rounds,
@@ -642,6 +766,11 @@ async def drive(
         # 服务什么时候回来的（没有重启就是 None）：**这一格决定"客户端没扛住"该归给谁**——
         # 服务根本没回来时，两种客户端形状的读数本来就该一样。
         "server_back_at_s": holder.get("server_back_at_s"),
+        # 杀点是由时钟定的还是由事件定的：`--kill-after 2` 这种秒数会打中上传而不是提交，
+        # 那时"没触发"是**没打到**，不是"不会发生"——不写这一格，下一次还会把 0 读成结论。
+        "kill_clock": holder.get("kill_clock"),
+        "rows_at_kill": holder.get("rows_at_kill"),
+        "replay_probe": replay,
         "claimer_probe": {
             "samples": holder.get("samples", 0),
             "errors": holder.get("claimer_probe_errors", 0),
@@ -721,6 +850,13 @@ def main() -> int:
                         help="杀掉受理层之后过几秒把它再拉起来（默认不拉，保持 P2 那种"
                              "『没人帮忙』的形状）。P5-4 的对照必须给一个数：服务不在客户端"
                              "还在退避的窗口里回来，两种形状的读数会一模一样")
+    parser.add_argument("--kill-when", choices=("timer", "submit-in-flight"), default="timer",
+                        help="第 N 秒杀是按秒算的时钟，还是等现场有 --kill-inflight 个提交正在路上时开杀。"
+                             "想测'提交在途时被杀 ⇒ 带同一个幂等键重发'必须用 first-submit："
+                             "按秒的时钟会打中上传（今天实测 37 次失败全在 upload），"
+                             "于是 submit_replays=0 被误读成'不会重发'")
+    parser.add_argument("--kill-inflight", type=int, default=SUBMIT_INFLIGHT_TO_KILL,
+                        help="配合 --kill-when submit-in-flight：现场至少几个提交在途才开杀。太少先后各一，看不见重放撞回同一条作业")
     parser.add_argument("--lease-seconds", type=int, default=30, help="租约时长；测试里压短，否则要等满 90s")
     parser.add_argument("--recover-wait", type=float, default=120.0, help="杀完之后最多等多久看队列自己排空")
     parser.add_argument("--report", default=str(ROOT / ".appdata" / f"load_{int(time.time())}.json"))
@@ -776,6 +912,7 @@ def main() -> int:
             drive(
                 names, base, args.rounds, args.concurrency or args.users, process,
                 args.kill_after, victim, args.resilient_client == "on", args.restart_server_after,
+                args.kill_when == "submit-in-flight", args.kill_inflight,
             )
         )
         # 客户端形状跟着读数落盘：同一把尺两种形状跑出来的两份报告，只有带着这一格才能对上账
@@ -823,9 +960,14 @@ def main() -> int:
             item[1].flush()
             result[f"worker_{index}_locked_lines"] = harvest_locks(data_dir / f"worker_{index}.log")
         # 谁认领了这批 job：按 pid 点名，不按"distinct 名字数"猜（见 claim_attribution 的说明）。
+        server_logs = [log_path]
+        if args.restart_server_after:
+            server_logs.append(restart_log_path(db_path))
         result["claim_attribution"] = claim_attribution(
-            db_path, log_path, [data_dir / f"worker_{index}.log" for index in range(len(workers))]
+            db_path, server_logs, [data_dir / f"worker_{index}.log" for index in range(len(workers))]
         )
+        # P5-1 那句"重复提交不会变成两个作业"在负载形态下的直接检查（提交在途被杀那一轮尤其要看）
+        result["idempotency_check"] = idempotency_reading(db_path)
         # 启动那三行读数**有没有真的到达运维眼前**。这一格是 2026-10-08 那轮分进程压测里
         # 补的：`logger.info` 在 uvicorn 下面根本没 handler 接，写进日志 ≠ 有人能读到。
         server_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
@@ -864,6 +1006,8 @@ def main() -> int:
     print(f"  口令哈希一次 = {result['password_hash_ms']}ms")
     print(f"  事件流：{json.dumps(result['sse'], ensure_ascii=False)}")
     print(f"  计数器：{json.dumps(result['counters'], ensure_ascii=False)}")
+    print(f"  幂等检查（库里）：{json.dumps(result.get('idempotency_check', {}), ensure_ascii=False)}")
+    print(f"  重放探针（同一个键再发一次）：{json.dumps(result.get('replay_probe', {}), ensure_ascii=False)}")
     print(f"  客户端形状 = {result.get('client_shape')}（off 一次都不重试，on 按退避重试且重试带同一个幂等键）")
     print(f"  受理层何时回来 = {result.get('server_back_at_s')} 秒（None = 这一轮没人帮忙重启，P2 那种形状）")
     if "durability" in result:

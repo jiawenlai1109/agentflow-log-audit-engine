@@ -392,3 +392,41 @@ def test_the_idempotency_judgement_has_exactly_one_home():
                 if "ON CONFLICT" in text.upper() and "idempotency_key" in text and py.name != "queueing.py":
                     offenders.append(f"{py.name}:{node.lineno}")
     assert not offenders, "幂等判据出现了第二份实现：\n" + "\n".join(offenders)
+
+
+def test_the_load_harness_counts_pairs_not_keys(env):
+    """压测尺子那格 `idempotency_check` 的算术：比的单位是 `(用户, 键)`，不是键本身。
+
+    唯一索引建在 `user_id, idempotency_key` 两列上 ⇒ 幂等的作用域是**用户**。只按键去重的话，
+    两个人各用同一个 `k1` 提交一次会被读成"重复了一行"——那是把别人的合法提交当成自己的放大
+    （与"拿列位置当身份"同族）。这里用真库摆三种形状：没带键的行、两人同键、以及
+    **把索引摘掉之后**真出现的第二行——第三种要能被抓出来，否则这格永远是 0 也没人知道。
+    """
+    from scripts.load_test import idempotency_reading
+
+    db = env / "appdata" / "app.db"
+    uid = int(query_one("SELECT id FROM users WHERE username = 'admin'")["id"])
+    execute("INSERT INTO users (username, password_hash, role) VALUES ('idem_u2', 'no-hash', 'user')")
+    other = int(query_one("SELECT id FROM users WHERE username = 'idem_u2'")["id"])
+
+    def _row(job_id: str, owner: int, key: str | None) -> None:
+        execute(
+            "INSERT INTO jobs (job_id, user_id, question, mode, status, idempotency_key) "
+            "VALUES (?, ?, 'q', 'mock', 'queued', ?)",
+            (job_id, owner, key),
+        )
+
+    _row("job_nokey", uid, None)          # 没带护栏的一行：不许进分母
+    _row("job_a", uid, "shared-key")      # 同企业另一个人用同一个键：合法，两行不是重复
+    _row("job_b", other, "shared-key")
+
+    reading = idempotency_reading(db)
+    assert reading["rows"] == 3 and reading["rows_with_key"] == 2, reading
+    assert reading["duplicates"] == 0 and reading["max_rows_per_pair"] == 1, reading
+
+    # 把库层那把锁摘掉，"同一个人同一个键两行"才可能出现——这格必须抓得到
+    execute("DROP INDEX uq_jobs_user_idem")
+    _row("job_c", uid, "shared-key")
+    reading = idempotency_reading(db)
+    assert reading["duplicates"] == 1, f"第二个作业出现了而这格说没有：{reading}"
+    assert reading["max_rows_per_pair"] == 2 and "shared-key" in str(reading["worst_pair"]), reading

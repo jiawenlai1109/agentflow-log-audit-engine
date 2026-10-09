@@ -262,6 +262,28 @@ def test_the_claimer_survives_the_finished_job(env):
     assert "claimed_by" not in payload, "内部进程标识漏进了接口响应"
 
 
+def test_queue_endpoint_carries_the_three_readings_and_no_rate_limits(env):
+    """`GET /api/queue`：没提交过作业时界面也能问到这三份数，且**不**带限流额度。
+
+    三份数各用一个函数（`queueing.stats` / `llm_gate.snapshot` / `dispatch_form`），
+    这里断言的是"三格都在、且没有第四格从侧门出去"。`ratelimit` 的额度刻意排除：
+    P4-3 定过 429 响应里不写限额（那等于替试探者标定天花板），一个登录用户可读的 GET
+    把整份吐出去，就是从侧门把那条决定撤掉——所以这条断言按"整份 json 里搜不到那些键"来写，
+    而不是只检查"我没返回它"。
+    """
+    with TestClient(app) as client:
+        _login(client)
+        body = client.get("/api/queue").json()
+    assert set(body) == {"queue", "gate", "dispatch"}, body
+    assert {"queued", "running", "stale_pending"} <= set(body["queue"]), body["queue"]
+    assert body["gate"]["limit"] >= 1 and "limit_source" in body["gate"], body["gate"]
+    assert body["dispatch"]["llm_gate_scope"] == "per_process", body["dispatch"]
+    flat = json.dumps(body, ensure_ascii=False)
+    for leak in ("login_per_user", "login_per_source", "account_create_per_actor", "evictions"):
+        assert leak not in flat, f"入口限流的读数从 /api/queue 漏出去了：{leak}"
+    assert TestClient(app).get("/api/queue").status_code == 401, "匿名可读"
+
+
 # ---------------------------------------------------------------- worker 那一侧
 
 ROOT = Path(__file__).resolve().parents[1]

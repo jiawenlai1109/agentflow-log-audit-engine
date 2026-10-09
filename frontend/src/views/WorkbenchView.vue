@@ -31,6 +31,19 @@
       :title="`real 模式将使用 ${llmInfo?.configured?.model || '未知型号'}：${llmDetail}`"
     />
 
+    <el-alert
+      v-if="platformWarn"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 12px"
+      :title="platformWarn"
+    />
+    <div class="platform-strip">
+      <span>{{ platformSummary }}</span>
+      <span v-if="platform?.dispatch">｜形态：{{ platform.dispatch.shape }}（本进程认领循环 {{ platform.dispatch.claim_loops }}）</span>
+    </div>
+
     <el-input
       v-model="question"
       type="textarea"
@@ -137,6 +150,52 @@ async function loadLlmStatus() {
   }
 }
 
+// 平台读数：队列深度（库里的事实）、上游闸门（本进程的量）、执行形态（本进程吃不吃作业）。
+// 三个数各来自服务端唯一的出处，界面不自己算——尤其"哪些状态算终态""这个进程几个循环"这类，
+// 抄一份就地分叉（P5-2/P5-3 各为这句话付过一次学费）。
+const platform = ref<any | null>(null);
+
+const GATE_SOURCE_TEXT: Record<string, string> = {
+  env: "运维定档",
+  measured: "实测定档",
+  unmeasured_fallback: "占位值·没人量过",
+  explicit: "本次显式配置",
+};
+
+async function loadPlatform() {
+  try {
+    const { data } = await api.queue();
+    platform.value = data;
+  } catch {
+    platform.value = null; // 拿不到就说"没读到"，不拿旧值冒充现状
+  }
+}
+
+const platformSummary = computed(() => {
+  const p = platform.value;
+  if (!p) return "平台读数未取得（服务不可达或未登录）";
+  const q = p.queue || {};
+  const g = p.gate || {};
+  return `排队 ${q.queued ?? "?"} ｜ 在跑 ${q.running ?? "?"} ｜ 没人认领的旧行 ${q.stale_pending ?? 0} ｜ 上游 ${g.inflight ?? "?"}/${g.limit ?? "?"} 路（${GATE_SOURCE_TEXT[g.limit_source] || g.limit_source || "来源未知"}）`;
+});
+
+// 分进程形态下最该说的一句话：这个进程不认领作业，而 worker 没起时作业会一直排队——
+// 接口全绿、每个请求都 200，唯一能看出来的是这条读数。不显示出来，值班的人只能猜。
+const platformWarn = computed(() => {
+  const dispatch = platform.value?.dispatch;
+  if (!dispatch) return "";
+  if (!dispatch.dispatch_in_web && (platform.value?.queue?.running ?? 0) === 0) {
+    return `本进程不认领作业（${dispatch.shape}）：${dispatch.note}`;
+  }
+  if ((platform.value?.queue?.stale_pending ?? 0) > 0) {
+    return `有 ${platform.value.queue.stale_pending} 行没人能认领也没人负责（不是"还在排队"）`;
+  }
+  if (platform.value?.gate?.limit_source === "unmeasured_fallback") {
+    return `上游闸门用的是占位值 ${platform.value.gate.limit} 路，没量过这台站的并发形状（重测：scripts/preflight_llm.py --concurrency）`;
+  }
+  return "";
+});
+
 // 切换视图或重复提交时取消上一条进度流，避免旧流回调写进新结果
 let streamController: AbortController | null = null;
 
@@ -206,15 +265,24 @@ async function submit() {
       // 撞回了自己上一次的作业：这不是错误，但必须说出来——不然用户以为这是一次新分析
       ElMessage.info("这次提交和上一次是同一个请求，沿用的已经是排队中的那条作业");
     }
-    await streamJobEvents(jobId, (event) => events.value.push(event), streamController?.signal, {
-      onReconnect: ({ attempt, waitMs }) => {
-        if (attempt === 1) {
-          ElMessage.warning(`进度流中断，正在第 ${attempt} 次接回（约 ${Math.round(waitMs / 100) / 10}s）…`);
-        } else {
-          console.warn(`进度流第 ${attempt} 次重连，等待 ${waitMs}ms`);
-        }
+    await streamJobEvents(
+      jobId,
+      (event) => {
+        events.value.push(event);
+        // 进度流第一帧就带着队列/闸门/形态，比再发一次 GET 更新：这一条流活着的时候读数就是活的
+        if (event?.type === "queue") platform.value = { queue: event, gate: event.gate, dispatch: event.dispatch };
       },
-    });
+      streamController?.signal,
+      {
+        onReconnect: ({ attempt, waitMs }) => {
+          if (attempt === 1) {
+            ElMessage.warning(`进度流中断，正在第 ${attempt} 次接回（约 ${Math.round(waitMs / 100) / 10}s）…`);
+          } else {
+            console.warn(`进度流第 ${attempt} 次重连，等待 ${waitMs}ms`);
+          }
+        },
+      },
+    );
     const status = await showResult({ question: asked, mode: usedMode }, jobId);
     question.value = "";
     await loadHistory();
@@ -227,8 +295,15 @@ async function submit() {
     }
   } catch (err: any) {
     if (err?.name !== "CanceledError" && err?.name !== "AbortError") {
-      messages.value.push({ question: asked, mode: usedMode, error: err?.message || "提交失败" });
-      ElMessage.error(err?.message || "提交失败");
+      const status = err?.response?.status;
+      const reason = err?.message || "提交失败";
+      // 429 是一种**结果**，不是崩溃：走到这里说明客户端已按服务端的 Retry-After 重试过还是被拒。
+      // 混进"提交失败"里，值班看到的是一处故障，而实际是配额或入口限流在起作用。
+      const label = status === 429 ? `被拦下（配额或入口限流，已按建议重试过）：${reason}` : reason;
+      messages.value.push({ question: asked, mode: usedMode, error: label });
+      if (status === 429) ElMessage.warning(label);
+      else ElMessage.error(label);
+      loadPlatform(); // 被拦下时顺便回读一次平台读数：是排队满了还是闸门满了，界面要能说得出
     }
   } finally {
     running.value = false;
@@ -241,6 +316,7 @@ onMounted(async () => {
   datasets.value = data;
   if (data.length > 0) dataset_id.value = data[0].id;
   await loadLlmStatus();
+  await loadPlatform();
   await loadSessions();
   await loadHistory();
 });
@@ -249,6 +325,14 @@ onBeforeUnmount(() => streamController?.abort());
 </script>
 
 <style scoped>
+.platform-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 12px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 .message-card {
   margin-bottom: 12px;
 }

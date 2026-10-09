@@ -42,6 +42,8 @@ export const api = {
   listDatasets: () => client.get("/api/datasets"),
   /** 型号可用性的只读预检结论。页面只看不动上游——一次真实调用只能由预检脚本发起。 */
   llmModels: () => client.get("/api/llm/models"),
+  /** 平台读数（队列深度 / 上游闸门 / 执行形态）。也是只读：界面不动队列，也不动闸门。 */
+  queue: () => client.get("/api/queue"),
   uploadDataset: (file: File) => {
     const form = new FormData();
     form.append("file", file);

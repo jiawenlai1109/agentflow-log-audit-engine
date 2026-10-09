@@ -253,6 +253,24 @@ def test_the_accept_layer_comes_back_inside_the_retry_window():
     assert "wait_ready(base, restarted" in source, "拉起来 ≠ 可用：不等它就绪就会把服务没起来算进客户端账上"
 
 
+def test_the_harness_records_the_replay_probe_and_the_kill_window():
+    """跑完补的那一枪与"杀的那一刻库里有几行"都必须落盘，否则 0 有两种读法。
+
+    `submit_replays=0` 可能是**第一次提交根本没落库**（没打到那一瞬），也可能是
+    **落库了而重发又建了一行**（承诺破了）。`rows_at_kill` 就是把这两者分开的那一格；
+    它取不到时必须是 -1 而不是 0——把"没读到"写成 0，就是让一句未知冒充一句结论。
+    """
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "load_test.py").read_text(encoding="utf-8")
+    killer = source[source.index("async def killer_task") : source.index("def harvest_locks")]
+    assert '"replay_probe": replay' in source, "重放探针的结果不落盘，跑完就查不到出处"
+    assert '"rows_at_kill": holder.get("rows_at_kill")' in source, "杀那一刻的行数不落盘"
+    assert "holder[\"rows_at_kill\"] = -1" in killer, (
+        "取不到要记 -1：0 是一个有意义的读数（库里真的还没有行），不能拿来当失败值"
+    )
+    reading = source[source.index("def idempotency_reading") : source.index("def claim_attribution")]
+    assert "sqlite3.Error" in reading, "读数函数不许把库错误吞成空字典（吞了就等于说「没有重复」）"
+
+
 def test_the_resilience_counters_exist_even_when_nothing_happened():
     """缺键与零是两件事：这四格必须**先建好**再记账。
 
