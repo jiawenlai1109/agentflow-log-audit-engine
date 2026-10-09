@@ -15,6 +15,8 @@
     python scripts/load_test.py --users 20 --rounds 2 --kill-mid   # 顺带测持久性
     python scripts/load_test.py --users 20 --web-dispatch off --extra-workers 2
                                                                    # 分进程形态（P5-3）：受理层不吃作业
+    python scripts/load_test.py --users 40 --kill-after 8 --kill-target server --resilient-client on
+                                                                   # 杀受理层 + 会重连的客户端（P5-4）
 
 不碰开发机的真库：默认把 `APP_DATA_DIR` / `OUTPUTS_ROOT` 指到临时目录再拉起 uvicorn。
 """
@@ -25,6 +27,7 @@ import argparse
 import asyncio
 import json
 import os
+import random as _random
 import re
 import socket
 import sqlite3
@@ -55,6 +58,87 @@ NON_TERMINAL_WHERE = "status NOT IN (" + ", ".join(f"'{state}'" for state in TER
 CSV = ROOT / "demo" / "data" / "login_auth.csv"
 QUESTION = "对2026-09-05的登录日志做安全审计，列出失败次数最高的账号"
 PACK = "login_audit"
+
+# ---------------------------------------------------------------- 韧性客户端（P5-4）
+#
+# 这份策略的**权威住在 `frontend/src/api/backoff.js`**——真客户端在那儿。压测里这一份是**镜像**：
+# 尺子要回答"受理层被杀之后用户到底拿不拿得到结果"，就必须用同一个可重试集合与同一组退避参数，
+# 否则"扛住了"是 Python 那半份自己扛的，与浏览器无关。两条相等守卫在 `tests/test_resilient_client.py`
+# 上（按文本读回 backoff.js 的常量与集合）——镜像不配守卫迟早分叉，而分叉之后这份读数就是假的。
+RETRIABLE_STATUS = frozenset({429, 502, 503, 504})
+RETRY_BASE_S = 0.5
+RETRY_CAP_S = 15.0
+RETRY_MAX_ATTEMPTS = 8
+RETRY_JITTER_RATIO = 0.3
+
+
+def retriable(exc: BaseException | None = None, status: int | None = None) -> bool:
+    """这次失败值不值得再来一次。
+
+    两条口径与 `shouldRetry` 逐字对齐：**没有状态**（连不上、被 reset）正是这一片要扛的那一类；
+    401/403/404/422 一次都不重试——重试不会变好，只会把队列与上游再打一遍。
+    """
+    if status is None and exc is not None:
+        return not isinstance(exc, asyncio.CancelledError)
+    if status is None:
+        return True
+    return status in RETRIABLE_STATUS
+
+
+def next_delay_s(attempt: int, rng: Any = None) -> float:
+    """第 attempt 次失败之后等多久：指数增长 + 封顶 + 抖动（`rng` 让用例能钉住确定性值）。"""
+    growth = RETRY_BASE_S * 2 ** max(0, attempt - 1)
+    capped = min(RETRY_CAP_S, growth)
+    random = rng.random if rng is not None else _random.random
+    return round(capped + capped * RETRY_JITTER_RATIO * random(), 3)
+
+
+def retry_after_s(response: Any) -> float:
+    """服务端给的 `Retry-After` 优先于我们自己算的：限流与配额那两格知道还要等多久，我们不知道。"""
+    if response is None:
+        return 0.0
+    raw = (response.headers.get("retry-after") or "").strip()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(60.0, seconds)) if raw else 0.0
+
+
+async def resilient_call(task: Any, *, enabled: bool, sleep: Any = asyncio.sleep, ledger: dict | None = None):
+    """按镜像策略重试一次异步调用；`enabled=False` 就是改造前的形状（一次不重试）。
+
+    `task(attempt)` 必须**可安全重入**：对"创建作业"这类请求，这意味着重试带同一个幂等键
+    （调用方负责生成一次），否则这个 helper 自己就是"把一次提问变成两个作业"的放大器。
+    """
+    attempt = 0
+    while True:
+        try:
+            result = await task(attempt)
+        except Exception as exc:  # noqa: BLE001 - 分类交给 retriable，最后原样抛回去
+            if ledger is not None:
+                ledger["retries"] = ledger.get("retries", 0) + 1
+                kinds = ledger.setdefault("retry_kinds", {})
+                kinds[type(exc).__name__] = kinds.get(type(exc).__name__, 0) + 1
+            if not enabled or attempt + 1 >= RETRY_MAX_ATTEMPTS or not retriable(exc=exc):
+                if ledger is not None:
+                    ledger["abandoned"] = ledger.get("abandoned", 0) + 1
+                raise
+            attempt += 1
+            response = getattr(exc, "response", None)
+            await sleep(retry_after_s(response) or next_delay_s(attempt))
+            continue
+        status = getattr(result, "status_code", None)
+        if not enabled or status is None or status < 400 or not retriable(status=status):
+            return result
+        if attempt + 1 >= RETRY_MAX_ATTEMPTS:  # 次数有顶：没有顶的退避就是无限重试
+            return result
+        if ledger is not None:
+            ledger["retries"] = ledger.get("retries", 0) + 1
+            kinds = ledger.setdefault("retry_kinds", {})
+            kinds[f"http_{status}"] = kinds.get(f"http_{status}", 0) + 1
+        attempt += 1
+        await sleep(retry_after_s(result) or next_delay_s(attempt))
 
 
 def free_port() -> int:
@@ -151,11 +235,16 @@ async def one_user(
     counters: dict[str, int],
     jobs_out: list[dict[str, Any]],
     sse_case: dict[str, Any] | None,
+    resilient: bool = False,
 ) -> None:
     """一个用户的一轮：登录 → 上传 → 提交 → 轮询到终态。
 
     每一步都计时（失败也计时才有意义），传输层异常按"死在哪一步"记账——
     100 并发下服务端会 reset 连接，那是一条读数，不该让压测崩在栈上。
+
+    `resilient` 决定这一轮用的是哪种客户端：off = 改造前的形状（一次都不重试，
+    受理层被杀就等于这一轮观测中断）；on = 按 `backoff.js` 那份策略退避重试，并且
+    **重试带同一个幂等键**。两种形状同一把尺各跑一遍，才叫 before/after。
     """
     phase = "login"
     try:
@@ -185,18 +274,30 @@ async def one_user(
             return
         dataset_id = upload.json()["id"]
 
-        for _ in range(rounds):
+        for _round in range(rounds):
             phase = "submit"
             started = time.perf_counter()
-            submit = await client.post(
-                f"{base}/api/analyze",
-                json={"question": QUESTION, "dataset_id": dataset_id, "mode": "mock", "pack": PACK},
-                headers=headers,
-            )
+            # 韧性开的时候才带幂等键：**一次用户意图一个键，重试带同一个**。
+            # 没有这把锁，"会重连的客户端"本身就是放大器——受理层被杀的那几秒里，
+            # 一次提问会变成两个作业、双份上游调用。裸客户端那轮不带头（就是改造前的形状）。
+            key = f"load_{username}_{_round}" if resilient else None
+            submit_headers = {**headers, "Idempotency-Key": key} if key else headers
+
+            async def _submit(_attempt: int):
+                return await client.post(
+                    f"{base}/api/analyze",
+                    json={"question": QUESTION, "dataset_id": dataset_id, "mode": "mock", "pack": PACK},
+                    headers=submit_headers,
+                )
+
+            submit = await resilient_call(_submit, enabled=resilient, ledger=counters)
             metrics["submit"].append(time.perf_counter() - started)
             if submit.status_code != 200:
                 counters["submit_failed"] += 1
                 continue
+            if submit.json().get("idempotency_replayed"):
+                # 这一格就是"重试没有产生第二个作业"的直接证据，不靠数日志
+                counters["submit_replays"] = counters.get("submit_replays", 0) + 1
             job_id = submit.json()["job_id"]
             if sse_case is not None and sse_case.get("job_id") is None:
                 sse_case["job_id"] = job_id
@@ -206,15 +307,25 @@ async def one_user(
             waited = 0.0
             status = "unknown"
             while waited < 600:
-                poll = await client.get(f"{base}/api/jobs/{job_id}", headers=headers)
+                poll = await resilient_call(
+                    lambda _attempt: client.get(f"{base}/api/jobs/{job_id}", headers=headers),
+                    enabled=resilient,
+                    ledger=counters,
+                )
                 status = poll.json().get("status") or "unknown"
-                if status in ("success", "partial", "degraded", "failed", "error"):
+                # 终态名单用队列那一份（`TERMINAL_STATUSES`）：原来这里硬编码五个字面量、
+                # 漏了 cancelled，于是被取消的 job 在读数里永远"在跑"。
+                if status in TERMINAL_STATUSES:
                     break
                 await asyncio.sleep(0.2)
                 waited += 0.2
             metrics["e2e"].append(waited if waited else 0.2)
             if status in ("failed", "error"):
                 counters["jobs_failed"] += 1
+            if status not in TERMINAL_STATUSES:
+                # 到 600s 还没落到终态：这是一笔**结果**，不是"没测到"。裸客户端那轮
+                # （受理层被杀、没人重连）就应当记在这里。
+                counters["jobs_unresolved"] = counters.get("jobs_unresolved", 0) + 1
             jobs_out.append({"job_id": job_id, "status": status, "user": username})
     except httpx.HTTPError as exc:
         counters["transport_failed"] += 1
@@ -222,6 +333,12 @@ async def one_user(
         by_phase[phase] = by_phase.get(phase, 0) + 1
         kinds = counters.setdefault("transport_kinds", {})
         kinds[type(exc).__name__] = kinds.get(type(exc).__name__, 0) + 1
+        if phase == "poll":
+            # 退避用完还没读到终态 ⇒ 这一轮**用户没拿到结果**，那是一笔结果。
+            # 第一版只在"轮询循环正常跑完但状态非终态"那条记 `jobs_unresolved`，
+            # 于是最该记的一群（放弃在重试上）反而没进账——那是把"丢了"读成"没测"。
+            counters["jobs_unresolved"] = counters.get("jobs_unresolved", 0) + 1
+            jobs_out.append({"job_id": None, "status": f"unresolved_in_{phase}", "user": username})
         return
 
 
@@ -413,11 +530,24 @@ def non_terminal(db_path: Path) -> int:
         conn.close()
 
 
-async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None, victim=None):
+async def drive(
+    users,
+    base,
+    rounds,
+    concurrency,
+    server=None,
+    kill_after_s=None,
+    victim=None,
+    resilient: bool = False,
+    restart_server_after_s: float | None = None,
+):
     metrics: dict[str, list[float]] = {"login": [], "upload": [], "submit": [], "e2e": []}
     counters = {
         "login_failed": 0, "upload_failed": 0, "submit_failed": 0, "jobs_failed": 0,
         "transport_failed": 0,
+        # 这几格先建好再记账：**缺键与零是两件事**——缺键会被读成"这一轮没测"，
+        # 而零才是"测了，一次都没发生"。韧性对照的核心证据全在这里。
+        "retries": 0, "abandoned": 0, "submit_replays": 0, "jobs_unresolved": 0,
     }
     jobs_out: list[dict[str, Any]] = []
     sse_case: dict[str, Any] = {"job_id": None, "token": None}
@@ -440,7 +570,7 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
 
         async def guarded(name: str) -> None:
             async with semaphore:
-                await one_user(client, base, name, rounds, metrics, counters, jobs_out, sse_case)
+                await one_user(client, base, name, rounds, metrics, counters, jobs_out, sse_case, resilient)
 
         async def killer_task() -> None:
             """中途杀进程：测的是持久性，不是速度——快的系统也可以永远丢结果。
@@ -449,6 +579,11 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
             这正是 P0 那条读数（28 个 job 永远停在非终态）的形态。
             计数必须在**杀之前一刻**取：等到整轮 gather 结束再取，那时用户都走完了，
             非终态必然是 0——"恢复了"就变成一句平凡真，而不是证据。
+
+            `restart_server_after_s` 是给 P5-4 那一对照加的：**受理层必须在客户端还在退避的
+            窗口里回来**，否则两种客户端形状都会耗尽 8 次重试，读出来是"韧性没用"——
+            第一版就是这么读的（`transport_failed` 两边都是 39，而 retries=312）。
+            那不是系统没恢复，是**服务根本没回来**。默认不重启，保持 P2 那种"没人帮忙"的形状。
             """
             if kill_after_s is None:
                 return
@@ -458,6 +593,17 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
             target = victim if victim is not None else server
             if target is not None and target.poll() is None:
                 target.kill()
+            if restart_server_after_s and target is server:
+                await asyncio.sleep(restart_server_after_s)
+                port = int(os.environ["LOAD_PORT"])
+                restarted, restart_log = spawn_server(
+                    port, Path(os.environ["APP_DATA_DIR"]), restart_log_path(Path(os.environ["LOAD_DB"]))
+                )
+                # 等它真的能接请求再记账：拉起来 ≠ 可用，早一秒重试都会撞上"连接被拒"，
+                # 于是把"服务还没起来"混进"客户端不会重连"里。
+                wait_ready(base, restarted, timeout_s=40)
+                holder["server_back_at_s"] = round(kill_after_s + restart_server_after_s, 1)
+                holder["restarted_process"] = (restarted, restart_log)
 
         await asyncio.gather(
             *(guarded(name) for name in users),
@@ -466,6 +612,15 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
         stop.set()
         if probe_task:
             await probe_task
+    # 这一轮被 killer_task 拉回来的那座塔要收掉：它不属于 `main()` 的清理名单，
+    # 留在后台就会污染下一次跑（端口相同 ⇒ 下一次直接连到上一轮的进程上）。
+    restarted = holder.get("restarted_process")
+    if restarted:
+        restarted[0].kill()
+        try:
+            restarted[1].close()
+        except OSError:
+            pass
 
     stream = {"skipped": True}
     if sse_case.get("job_id") and sse_case.get("token"):
@@ -484,6 +639,9 @@ async def drive(users, base, rounds, concurrency, server=None, kill_after_s=None
         "max_live_after_kill": holder.get("max_live_after_kill", 0),
         "last_live_after_kill": holder.get("last_live_after_kill"),
         "claimers": holder.get("claimers", []),
+        # 服务什么时候回来的（没有重启就是 None）：**这一格决定"客户端没扛住"该归给谁**——
+        # 服务根本没回来时，两种客户端形状的读数本来就该一样。
+        "server_back_at_s": holder.get("server_back_at_s"),
         "claimer_probe": {
             "samples": holder.get("samples", 0),
             "errors": holder.get("claimer_probe_errors", 0),
@@ -555,6 +713,14 @@ def main() -> int:
     parser.add_argument("--web-dispatch", choices=("on", "off"), default="on",
                         help="Web 进程要不要自己认领作业：off = P5-3 的分进程形态（受理层只受理，"
                              "执行只在 --extra-workers 起的那些进程里）")
+    parser.add_argument("--resilient-client", choices=("on", "off"), default="off",
+                        help="驱动客户端会不会退避重试：off = 改造前的形状（受理层被杀就等于这一轮"
+                             "观测中断），on = 按 frontend/src/api/backoff.js 那份策略重试且"
+                             "重试带同一个幂等键。P5-4 的 before/after 就是这两个形状各跑一遍")
+    parser.add_argument("--restart-server-after", type=float, default=None,
+                        help="杀掉受理层之后过几秒把它再拉起来（默认不拉，保持 P2 那种"
+                             "『没人帮忙』的形状）。P5-4 的对照必须给一个数：服务不在客户端"
+                             "还在退避的窗口里回来，两种形状的读数会一模一样")
     parser.add_argument("--lease-seconds", type=int, default=30, help="租约时长；测试里压短，否则要等满 90s")
     parser.add_argument("--recover-wait", type=float, default=120.0, help="杀完之后最多等多久看队列自己排空")
     parser.add_argument("--report", default=str(ROOT / ".appdata" / f"load_{int(time.time())}.json"))
@@ -607,8 +773,14 @@ def main() -> int:
         if args.kill_after and args.kill_target == "worker":
             victim = workers[0][0]
         result = asyncio.run(
-            drive(names, base, args.rounds, args.concurrency or args.users, process, args.kill_after, victim)
+            drive(
+                names, base, args.rounds, args.concurrency or args.users, process,
+                args.kill_after, victim, args.resilient_client == "on", args.restart_server_after,
+            )
         )
+        # 客户端形状跟着读数落盘：同一把尺两种形状跑出来的两份报告，只有带着这一格才能对上账
+        # （否则下一天翻到这两份 json，谁也不知道哪份是"会重连的"）。
+        result["client_shape"] = args.resilient_client
         result["processes"] = {
             "server": process.pid,
             "workers": [item[0].pid for item in workers],
@@ -628,6 +800,15 @@ def main() -> int:
                 at_kill=result.get("non_terminal_at_kill"),
             )
             result["durability"]["killed_after_s"] = args.kill_after
+            # 这一轮**有没有人帮忙重启**必须写在持久性那一格里：`drained_without_help` 这个名字
+            # 说的就是"没人帮"，而 P5-4 的对照为了量客户端韧性是故意帮了一把的。
+            # 不把这一格写明白，将来翻到这两份 json 会把"重启后排空"读成 P2 那条"无人帮忙排空"。
+            result["durability"]["help"] = (
+                f"受理层在 +{result.get('server_back_at_s')}s 被脚本重新拉起（这一轮量的是客户端韧性，"
+                "不是无人帮忙的排空）"
+                if result.get("server_back_at_s")
+                else "没人帮忙：全程没有重启任何进程"
+            )
             result["durability"]["reclaim_curve"] = {
                 "at_kill": result.get("non_terminal_at_kill"),
                 "max_after_kill": result.get("max_live_after_kill"),
@@ -683,6 +864,8 @@ def main() -> int:
     print(f"  口令哈希一次 = {result['password_hash_ms']}ms")
     print(f"  事件流：{json.dumps(result['sse'], ensure_ascii=False)}")
     print(f"  计数器：{json.dumps(result['counters'], ensure_ascii=False)}")
+    print(f"  客户端形状 = {result.get('client_shape')}（off 一次都不重试，on 按退避重试且重试带同一个幂等键）")
+    print(f"  受理层何时回来 = {result.get('server_back_at_s')} 秒（None = 这一轮没人帮忙重启，P2 那种形状）")
     if "durability" in result:
         print(f"  持久性：{json.dumps(result['durability'], ensure_ascii=False)}")
     print(f"\n报告：{report}")
