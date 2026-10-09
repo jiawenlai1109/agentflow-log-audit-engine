@@ -1,0 +1,83 @@
+/**
+ * 界面令牌层：只放"跨 view 共用、且必须一致"的量。
+ *
+ * 为什么要有这个文件：src 下原先一份全局样式都没有，四个 view 各自在 scoped 块里写
+ * `#909399`、`#e6a23c`，同一件事（二级说明文字）就有四份色值，改一处漏三处；而
+ * `App.vue`/`ReportsView.vue`/`LoginView.vue` 用的又是非 scoped 的 `<style>`，
+ * 等于三份互不可见的全局规则。这里收成一个入口，view 只引用令牌不发明颜色。
+ *
+ * 每个色值都是量出来的，判据 WCAG 2.1 AA 常规字 4.5:1（`scripts/contrast_report.py`，
+ * 读数在 `.appdata/contrast_before.txt`）：
+ *   #909399 on #ffffff = 3.08:1  ✗   —— EP 的 --el-text-color-secondary 原样不合格
+ *   #606266 on #ffffff = 6.11:1  ✓   —— 改用 --el-text-color-regular
+ *   #e6a23c on #ffffff = 2.19:1  ✗   —— EP 的 --el-color-warning 直接当正文色
+ *   #b88230 (warning-dark-2) = 3.35:1 ✗ —— 所以"换 EP 的深一档令牌"这条不够，另取
+ *   #a15c00 on #ffffff = 5.19:1  ✓
+ *   #5c5f66 on #f4f4f5 = 5.82:1  ✓   info 浅底 Tag 文字
+ *   #a03b3b on #fef0f0 = 5.95:1  ✓   danger 浅底 Tag 文字
+ *   #3f7a22 on #f0f9eb = 4.84:1  ✓   success 浅底 Tag 文字
+ */
+:root {
+  /* 说明文字：不用 EP 的 secondary（3.08:1），用 regular（6.11:1）。 */
+  --af-text-secondary: var(--el-text-color-regular);
+  /* 语义色一律"用作正文时取深一档"：浅色那几个是图形/底色，不是文字色。 */
+  --af-text-warning: #a15c00;
+  --af-border: var(--el-border-color-lighter);
+}
+
+/* Tag 默认效果（light/plain）的文字色。src 里没有任何 `effect="dark"` 的 Tag
+ * （grep 过），所以这里不改深色效果那一套：改了会把白字压在有底色上，反而更看不清。
+ *
+ * 选择器必须写成 `.el-tag.el-tag--x` 两段：EP 自己的规则就是这个形状（0,2,0），
+ * 只写 `.el-tag--x`（0,1,0）的话导入顺序再靠后也赢不了——这一条是**在实跑的页面上
+ * 量出来的**（`getComputedStyle` 读到的 `--el-tag-text-color` 当时仍是 #e6a23c）。 */
+.el-tag.el-tag--warning {
+  --el-tag-text-color: var(--af-text-warning);
+}
+.el-tag.el-tag--info {
+  --el-tag-text-color: #5c5f66;
+}
+.el-tag.el-tag--danger,
+.el-tag.el-tag--error {
+  --el-tag-text-color: #a03b3b;
+}
+.el-tag.el-tag--success {
+  --el-tag-text-color: #3f7a22;
+}
+
+/* 键盘可达性：EP 自带焦点样式，但自定义的可点元素（link 按钮之外）一处都没有。
+ * 统一一条可见焦点环，别每个 view 自己想起来一次。 */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 2px;
+}
+
+/* 中文长句与 run_id 这类无空格长 token：宁可折行，不许把容器撑破。
+ * 这条是"固定宽度 + 无 overflow-wrap"那一族的兜底（src 里原先一处都没有）。 */
+:where(.el-main, .el-dialog__body, .el-card__body) {
+  overflow-wrap: anywhere;
+}
+
+/* 三个报告/预览对话框分别写死 720px、70%、60%：窄屏上 720px 直接顶出视口。
+ * 一处兜底，不改各个对话框的写法（对话框内容宽度仍由调用方决定）。 */
+.el-dialog {
+  max-width: calc(100vw - 24px);
+}
+
+/* 每个页面一个标题。原先五个 view 一进门就是表单或表格：视觉上没有一个"你在哪"的锚点，
+ * 读屏里第一句话直接是控件名。规则收在这里，别让五个 view 各写一遍同款字号。 */
+.page-title {
+  margin: 0 0 12px;
+  font-size: var(--el-font-size-large);
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+}
+
+/* 页内分节标题：h2 配 .page-title(h1) 才是连续的层级（原先是 h1 缺失 + h3/h4 随便起）。
+ * 字号必须一起管：裸 h2 在浏览器默认样式下比页面标题还大，层级就倒过来了。 */
+.section-title {
+  margin: 16px 0 8px;
+  font-size: var(--el-font-size-medium);
+  font-weight: 700;
+  color: var(--el-text-color-primary);
+}

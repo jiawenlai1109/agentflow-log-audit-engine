@@ -1,5 +1,6 @@
 <template>
   <div>
+    <h1 class="page-title">成员与企业</h1>
     <el-alert
       v-if="auth.unassigned"
       type="warning"
@@ -16,7 +17,7 @@
       <span class="hint">同企业成员之间共享数据集与报告；会话与删除仍是个人的。</span>
     </el-card>
 
-    <h3>成员名单</h3>
+    <h2 class="section-title">成员名单</h2>
     <el-table :data="members" v-loading="loadingMembers">
       <el-table-column prop="username" label="账号" min-width="160">
         <template #default="{ row }">
@@ -34,7 +35,7 @@
 
     <template v-if="auth.isAdmin">
       <el-divider />
-      <h3>建号（管理员）</h3>
+      <h2 class="section-title">建号（管理员）</h2>
       <el-form :model="form" label-width="90px" style="max-width: 520px">
         <el-form-item label="用户名">
           <el-input v-model="form.username" placeholder="3-32 位字母、数字或 _ . -" />
@@ -66,7 +67,7 @@
         :title="error"
       />
 
-      <h3 style="margin-top: 20px">企业名单</h3>
+      <h2 class="section-title">企业名单</h2>
       <el-table :data="orgs" v-loading="loadingOrgs">
         <el-table-column prop="id" label="id" width="70" />
         <el-table-column prop="slug" label="slug" width="160" />
@@ -162,7 +163,8 @@ onMounted(async () => {
 
 <style scoped>
 .hint {
-  color: #909399;
-  font-size: 12px;
+  /* 与全站其它说明文字同一色：原先这里写死 #909399（实测 3.08:1，不达 AA）。 */
+  color: var(--af-text-secondary);
+  font-size: var(--el-font-size-extra-small);
 }
 </style>

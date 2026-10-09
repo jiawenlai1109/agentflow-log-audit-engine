@@ -1,10 +1,11 @@
 <template>
   <div>
-    <el-button type="primary" @click="create">新建会话</el-button>
+    <h1 class="page-title">会话管理</h1>
+    <el-button type="primary" :loading="creating" @click="create">新建会话</el-button>
     <el-table :data="sessions" style="margin-top: 16px">
-      <el-table-column prop="session_id" label="session_id" width="220" />
-      <el-table-column prop="title" label="标题" />
-      <el-table-column prop="turn_count" label="轮次" width="80" />
+      <el-table-column prop="session_id" label="session_id" min-width="200" />
+      <el-table-column prop="title" label="标题" min-width="160" />
+      <el-table-column prop="turn_count" label="轮次" min-width="80" />
       <el-table-column label="操作" width="220">
         <template #default="{ row }">
           <el-button link type="primary" @click="continueSession(row)">继续对话</el-button>
@@ -36,6 +37,7 @@ const sessions = ref<any[]>([]);
 const messages = ref<any[]>([]);
 const messagesVisible = ref(false);
 const current = ref<any>(null);
+const creating = ref(false);
 const router = useRouter();
 
 async function refresh() {
@@ -44,9 +46,18 @@ async function refresh() {
 }
 
 async function create() {
-  const { data } = await api.createSession({ title: `会话 ${Date.now()}` });
-  ElMessage.success("已创建，前往工作台提问");
-  router.push({ path: "/", query: { session: data.session_id } });
+  creating.value = true;
+  try {
+    // 标题原先是 `会话 ${Date.now()}`：把一串 epoch 当名字存进库里，之后在会话下拉、
+    // 历史页、工作台每一处都要读"会话 1759... "。名字给人看，就按人读得懂的方式给。
+    const { data } = await api.createSession({ title: `未命名会话（${new Date().toLocaleString("zh-CN", { hour12: false })}）` });
+    ElMessage.success("已创建，前往工作台提问");
+    router.push({ path: "/", query: { session: data.session_id } });
+  } catch (caught: any) {
+    ElMessage.error(caught?.message || "新建会话失败");
+  } finally {
+    creating.value = false;
+  }
 }
 
 function continueSession(row: any) {
@@ -61,9 +72,19 @@ async function viewMessages(row: any) {
 }
 
 async function remove(row: any) {
-  await ElMessageBox.confirm("确定删除该会话？", "提示");
-  await api.deleteSession(row.session_id);
-  refresh();
+  // "取消"是这条对话框的一个正常出口：点取消时 ElMessageBox 是 reject 的，
+  // 原先没有接住 ⇒ 一次无害的操作变成一条未处理的 Promise 拒绝。
+  const confirmed = await ElMessageBox.confirm(`删除会话“${row.title}”？该会话的历史记录会一并移除。`, "确认删除", {
+    type: "warning",
+  }).catch(() => false);
+  if (!confirmed) return;
+  try {
+    await api.deleteSession(row.session_id);
+    ElMessage.success("已删除");
+    await refresh();
+  } catch (caught: any) {
+    ElMessage.error(caught?.message || "删除失败");
+  }
 }
 
 onMounted(refresh);

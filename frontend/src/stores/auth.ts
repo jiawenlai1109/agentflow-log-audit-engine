@@ -43,8 +43,10 @@ export const useAuthStore = defineStore("auth", {
     async login(username: string, password: string) {
       const { data } = await api.login(username, password);
       this.setSession(data);
-      // 登录响应不带企业（token 只证明你是谁）。归属要从 /me 取，取失败也不挡登录。
-      await this.fetchMe();
+      // /me 读不到 **不等于登录失败**：token 已经到手，企业归属这一份只是显示用的副本。
+      // 原来这里直接抛出去，症状是"明明登进去了还停在登录页"，而再点一次登录就撞限流。
+      // 归属由 App.vue 每次进页回读，这里不必把一条附属读数升级成一次失败。
+      await this.fetchMe().catch(() => undefined);
     },
     /** 刷新身份与企业归属。角色以这里为准：本地那份只是副本，服务端才是判据。 */
     async fetchMe() {

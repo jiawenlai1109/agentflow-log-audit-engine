@@ -1,18 +1,19 @@
 <template>
   <div>
-    <el-form inline>
+    <h1 class="page-title">分析工作台</h1>
+    <el-form inline class="submit-form">
       <el-form-item label="数据集">
-        <el-select v-model="dataset_id" placeholder="选择数据集" style="width: 260px">
+        <el-select v-model="dataset_id" placeholder="选择数据集" class="f-dataset">
           <el-option v-for="d in datasets" :key="d.id" :label="`${d.filename}（${d.row_count}行）`" :value="d.id" />
         </el-select>
       </el-form-item>
       <el-form-item label="会话">
-        <el-select v-model="session_id" placeholder="选择会话（默认新建）" clearable style="width: 220px">
+        <el-select v-model="session_id" placeholder="选择会话（默认新建）" clearable class="f-session">
           <el-option v-for="s in sessions" :key="s.session_id" :label="s.title" :value="s.session_id" />
         </el-select>
       </el-form-item>
       <el-form-item label="模式">
-        <el-select v-model="mode" style="width: 110px">
+        <el-select v-model="mode" class="f-mode">
           <el-option label="mock" value="mock" />
           <el-option label="real" value="real" />
         </el-select>
@@ -39,25 +40,31 @@
       style="margin-bottom: 12px"
       :title="platformWarn"
     />
-    <div class="platform-strip">
+    <div class="platform-strip" role="status">
       <span>{{ platformSummary }}</span>
-      <span v-if="platform?.dispatch">｜形态：{{ platform.dispatch.shape }}（本进程认领循环 {{ platform.dispatch.claim_loops }}）</span>
+      <span v-if="platform?.dispatch">｜形态：{{ platform.dispatch.shape }}（本进程认领循环 {{ num(platform.dispatch.claim_loops) }}）</span>
+      <span>｜读数于 {{ readoutAt }}</span>
+      <el-button link type="primary" :loading="refreshing" @click="reloadPlatform">回读一次</el-button>
     </div>
 
     <el-input
       v-model="question"
       type="textarea"
       :rows="3"
+      aria-label="业务问题"
       placeholder="输入你的业务问题，例如：总销售额是多少？最近7天销售额走势如何？"
     />
-    <div style="margin-top: 12px">
+    <div class="submit-row">
       <el-button type="primary" :loading="running" @click="submit">提交分析</el-button>
+      <!-- 中止的是"这条进度流"，不是作业：后端没有取消接口（那是另一片），
+           按钮必须说清楚它停的是哪一半，否则用户以为作业也没了。 -->
+      <el-button v-if="running" @click="stopWatching">停止接进度</el-button>
     </div>
 
     <el-divider />
 
     <div v-if="running">
-      <h4>Agent 执行进度</h4>
+      <h2 class="section-title">Agent 执行进度</h2>
       <AgentProgress :events="events" />
     </div>
 
@@ -71,16 +78,21 @@
           :description="item.error"
           show-icon
           :closable="false"
-          style="margin: 8px 0"
+          class="inline-alert"
         />
+        <!-- 重跑按钮不许放进 el-alert 的默认插槽：那个插槽渲染进 `.el-alert__description`，
+             会把失败原因整段顶掉（实跑页面上量到的就是这个形状——红色卡片上一句"为什么"都没有）。 -->
+        <div v-if="item.error" class="inline-alert">
+          <el-button size="small" @click="rerun(item)">按这一问法重跑</el-button>
+        </div>
         <el-alert
           v-if="item.mode === 'mock' && !item.error"
           type="info"
           title="mock 模式为离线演示结果，复杂/精确问题请使用 real 模式"
           :closable="false"
-          style="margin: 8px 0"
+          class="inline-alert"
         />
-        <el-tag v-if="item.run_id" size="small" style="margin: 8px 0">{{ item.run_id }}</el-tag>
+        <el-tag v-if="item.run_id" size="small" class="inline-alert">{{ item.run_id }}</el-tag>
         <ReportViewer v-if="item.report" :content="item.report" />
         <div v-else>{{ item.answer_summary }}</div>
       </el-card>
@@ -96,6 +108,7 @@ import { api, newIdempotencyKey } from "../api";
 import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
+import { num } from "../ui/readout";
 
 const route = useRoute();
 const datasets = ref<any[]>([]);
@@ -154,6 +167,10 @@ async function loadLlmStatus() {
 // 三个数各来自服务端唯一的出处，界面不自己算——尤其"哪些状态算终态""这个进程几个循环"这类，
 // 抄一份就地分叉（P5-2/P5-3 各为这句话付过一次学费）。
 const platform = ref<any | null>(null);
+// 读数是什么时候取的，必须和读数一起显示：一个不动的数字与一个"当前是 0"是两件事。
+// 原先这里只有数，页面挂十分钟不动，值班看到的仍是"排队 0"。
+const readoutAt = ref("尚未回读");
+const refreshing = ref(false);
 
 const GATE_SOURCE_TEXT: Record<string, string> = {
   env: "运维定档",
@@ -166,9 +183,26 @@ async function loadPlatform() {
   try {
     const { data } = await api.queue();
     platform.value = data;
+    readoutAt.value = clock(new Date());
   } catch {
     platform.value = null; // 拿不到就说"没读到"，不拿旧值冒充现状
+    readoutAt.value = "回读失败";
   }
+}
+
+async function reloadPlatform() {
+  refreshing.value = true;
+  try {
+    await loadPlatform();
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+/** 只在显示处格式化，存的是 Date：把 toLocaleTimeString() 存在响应式变量里，
+ *  就又回到"印一个会过期的现在"——那正是进度流时间戳那一处刚修掉的毛病。 */
+function clock(at: Date): string {
+  return at.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
 const platformSummary = computed(() => {
@@ -176,7 +210,9 @@ const platformSummary = computed(() => {
   if (!p) return "平台读数未取得（服务不可达或未登录）";
   const q = p.queue || {};
   const g = p.gate || {};
-  return `排队 ${q.queued ?? "?"} ｜ 在跑 ${q.running ?? "?"} ｜ 没人认领的旧行 ${q.stale_pending ?? 0} ｜ 上游 ${g.inflight ?? "?"}/${g.limit ?? "?"} 路（${GATE_SOURCE_TEXT[g.limit_source] || g.limit_source || "来源未知"}）`;
+  // 四格同口径：谁没测到就都说"未取得"。原先这行是 `queued ?? "?"` 配 `stale_pending ?? 0`，
+  // 于是"库里读不到"在最后一格里显示成"没有没人认领的旧行"——那是个结论，不是没结论。
+  return `排队 ${num(q.queued)} ｜ 在跑 ${num(q.running)} ｜ 没人认领的旧行 ${num(q.stale_pending)} ｜ 上游 ${num(g.inflight)}/${num(g.limit)} 路（${GATE_SOURCE_TEXT[g.limit_source] || g.limit_source || "来源未知"}）`;
 });
 
 // 分进程形态下最该说的一句话：这个进程不认领作业，而 worker 没起时作业会一直排队——
@@ -268,9 +304,15 @@ async function submit() {
     await streamJobEvents(
       jobId,
       (event) => {
-        events.value.push(event);
+        // 到页时刻在这里捕获一次，随事件带着走。渲染期取 new Date() 的话，
+        // 每来一帧整个列表的时间都会变成"现在"（断线续读补发的旧帧尤其明显）。
+        events.value.push({ ...event, seen_at: Date.now() });
         // 进度流第一帧就带着队列/闸门/形态，比再发一次 GET 更新：这一条流活着的时候读数就是活的
-        if (event?.type === "queue") platform.value = { queue: event, gate: event.gate, dispatch: event.dispatch };
+        if (event?.type === "queue") {
+          platform.value = { queue: event, gate: event.gate, dispatch: event.dispatch };
+          // 首帧没有游标（它是这条流自己造的，不是库里的事件行）：那就说"首帧"，别显示"第 ? 帧"。
+          readoutAt.value = event.seq ? `流内第 ${event.seq} 帧` : `进度流首帧 ${clock(new Date())}`;
+        }
       },
       streamController?.signal,
       {
@@ -284,8 +326,13 @@ async function submit() {
       },
     );
     const status = await showResult({ question: asked, mode: usedMode }, jobId);
-    question.value = "";
+    // 只有真跑完才清问题输入。原先是无条件清：失败那一支把用户刚打的问法一起抹掉，
+    // 而错误卡上又没有任何重跑入口——等于"失败了，我把你的现场也收走了"。
+    if (status === "success") question.value = "";
     await loadHistory();
+    // 跑完之后必须再回读一次：这条带子上的"在跑 1"是从进度流里来的，作业已经结束了，
+    // 留着旧数就是"界面显示着一个已经不存在的世界面"。
+    await loadPlatform();
     if (status === "pending" || status === "running") {
       ElMessage.warning("进度流已中断，任务仍在后台执行，请到历史与报告页查看结果");
     } else if (status === "success") {
@@ -311,6 +358,20 @@ async function submit() {
   }
 }
 
+/** 手动停止接进度。作业不受影响——后端没有取消接口（那是另一片要单独决定的事），
+ *  所以这句话必须说准：停的是"这一页还在盯着看"，不是"这件事被中止了"。 */
+function stopWatching() {
+  streamController?.abort();
+  ElMessage.info("已停止接进度。作业仍在队列里跑，可到「历史与报告」页看结果");
+}
+
+/** 重跑 = 一次新的用户意图，所以走一条新的幂等键（P5-1 的口径：同一个键才是同一件事）。 */
+function rerun(item: any) {
+  question.value = item.question;
+  if (item.mode) mode.value = item.mode;
+  submit();
+}
+
 onMounted(async () => {
   const { data } = await api.listDatasets();
   datasets.value = data;
@@ -325,13 +386,39 @@ onBeforeUnmount(() => streamController?.abort());
 </script>
 
 <style scoped>
+/* 提交区四个下拉原先是 `style="width: 260px"` 这类固定宽度：窄屏上它们不换行、
+ * 也压不下长文件名，于是横向溢出。改成 min/max 之间自适应。
+ * 深度选择器只用于 el-form-item 的直接控件容器，不越过一层。 */
+.submit-form :deep(.el-form-item) {
+  margin-right: 16px;
+  margin-bottom: 8px;
+}
+.f-dataset,
+.f-session {
+  width: min(260px, 100%);
+  min-width: 10rem;
+}
+.f-mode {
+  width: 7rem;
+}
+.submit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.inline-alert {
+  margin: 8px 0;
+}
 .platform-strip {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin: -4px 0 12px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
+  font-size: var(--el-font-size-extra-small);
+  /* 原先这条带的字色没写，继承正文色；而同类"说明文字"在别的 view 里是 #909399（3.08:1）。
+   * 现在统一走令牌：同一件事（次级说明）全站一个色，且这个色是量过达标的。 */
+  color: var(--af-text-secondary);
 }
 .message-card {
   margin-bottom: 12px;

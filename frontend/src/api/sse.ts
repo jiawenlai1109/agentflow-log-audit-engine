@@ -84,7 +84,10 @@ async function readOnce(
       const event = JSON.parse(parsed.data) as JobEvent & { seq?: number };
       // 服务端把游标放在 `id:` 行里；帧内再带一份 `seq` 时以协议为准、顺手核对
       if (typeof event.seq === "number" && !parsed.id) cursor = String(event.seq);
-      onEvent(event);
+      // 游标顺手挂回事件上：界面要显示"第几帧"（服务端权威顺序），而它原本只存在于协议行里，
+      // 消费方拿不到就只能自己数本页收到过几条——重连续读之后那个数一定是错的。
+      const frameSeq = parsed.id && /^\d+$/.test(parsed.id) ? Number(parsed.id) : undefined;
+      onEvent(frameSeq !== undefined && typeof event.seq !== "number" ? { ...event, seq: frameSeq } : event);
     }
   }
   return cursor;
