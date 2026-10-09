@@ -146,6 +146,11 @@ class JobOut(BaseModel):
     # 前端自己抄一份的后果是两份名单分叉，多出来的那个终态会被当成"还在跑"，
     # 于是进度流重连到一个早就结束的作业上。
     terminal: bool | None = None
+    # 本进程的执行形态（P5-3）：受理层有没有自己认领作业、本进程几个认领循环。
+    # 单进程部署下它一直是 on，加上不影响任何人；分进程部署下它是"点了没反应"唯一的解释——
+    # `WEB_DISPATCH=off` 而外部 worker 没起时，queue.running 恒为 0，接口一切正常、作业永远排队。
+    # 这个读数只描述**处理这次请求的进程**，与 `llm_gate` 同口径（局部量不与全局量合成一个字典）。
+    dispatch: dict[str, Any] | None = None
 
 
 class DatasetOut(BaseModel):

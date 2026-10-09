@@ -117,8 +117,10 @@ def test_tenancy_and_durability_columns_are_really_there(temp_db: Path):
     def columns(table: str) -> set[str]:
         return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    # P3 的可见性靠 org_id；P2 的可恢复靠 worker/lease；P6 的可追靠 trace_id
-    assert {"org_id", "worker", "lease_expires_at", "trace_id"} <= columns("jobs"), columns("jobs")
+    # P3 的可见性靠 org_id；P2 的可恢复靠 worker/lease；P6 的可追靠 trace_id；
+    # P5-3 的执行归因靠 claimed_by（`worker` 跑完就清空，分进程部署下"谁执行了这批 job"
+    # 只能问这一列——少了它，压测归因得到的是空表，见 scripts/load_test.py 的 claim_attribution）
+    assert {"org_id", "worker", "claimed_by", "lease_expires_at", "trace_id"} <= columns("jobs"), columns("jobs")
     for table in ("datasets", "sessions", "bundles", "bundle_files", "bundle_tables"):
         assert "org_id" in columns(table), f"{table} 少了 org_id——这一张表还会漏在租户边界外"
     assert {"organizations", "memberships", "job_events", "org_quotas"} <= set(

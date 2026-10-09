@@ -180,6 +180,12 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         # 认领三件套：谁拿着、租约到什么时候、这条链路是哪个 trace_id（P6 从受理第一跳开始记）
         "worker": "TEXT",
+        # `claimed_by` 是**留痕**那份："这个 job 最后在哪个进程里跑的"。`worker` 跑完会被清空
+        # （它是租约协议的当前持有者），所以"分进程形态下到底是谁在执行"这个问题在作业结束后
+        # 只能靠这一列回答——P5-3 的压测归因就是靠它，不然只能趁那几秒采样，采样漏了就得到
+        # 一份空表并把单进程那一轮也报成"受理进程认领 0 个"。
+        # 只给运维在库里查，不进任何接口响应：里面是本机 `主机名:进程号:随机尾`。
+        "claimed_by": "TEXT",
         "lease_expires_at": "TEXT",
         "trace_id": "TEXT",
         # 幂等键（P5-1）：老库补这一列时**不能**带 UNIQUE——SQLite 的 ADD COLUMN 不接受带

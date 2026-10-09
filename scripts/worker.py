@@ -8,12 +8,14 @@
   WORKER_CONCURRENCY  这个进程里几个认领循环（默认 2）
   JOB_LEASE_SECONDS   租约时长；进程被杀后最迟这么久 job 会被别人重新认领
   JOB_MAX_ATTEMPTS    一个 job 最多被认领几次，超了判 failed 并写清原因
+
+配套的部署口径（P5-3 定型）：Web 侧设 `WEB_DISPATCH=off` 才是"受理层不吃作业"的形态；
+两边都吃也安全（认领是原子的），只是那时上游拿到的是**两个进程各自的闸门**之和。
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import signal
 import sys
 import time
@@ -25,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agentflow.core.streams import harden_streams  # noqa: E402
 
-from app import queueing  # noqa: E402
+from app import llm_gate, queueing  # noqa: E402
 from app.db import init_db  # noqa: E402
 from app.jobs import JobManager  # noqa: E402
 from app.runner import Dispatcher, execute_job, reclaim_at_boot  # noqa: E402
@@ -49,6 +51,17 @@ def main() -> int:
     args = parser.parse_args()
 
     init_db()
+    # 闸门在**这个进程**也定一次档，与 Web 的 lifespan 同一份策略（app/llm_gate.apply_for_process）。
+    # 少了这一句，real 作业在这里就只能走 `get_gate()` 的懒建路径，而那条路径故意不读预检缓存
+    # （读缓存是策略不是机制）——于是"实测 16 路"在分进程部署下静默退成占位 4 路：
+    # 作业不报错，只是每条都比预期慢，而且排队发生在没人看的那一侧。这是 P2 建 worker 时
+    # 漏下的一格，本轮定型时实测出来的。
+    gate_view = llm_gate.apply_for_process()
+    print(
+        f"LLM 闸门：{gate_view.get('limit')} 路（来源={gate_view.get('limit_source')}）｜范围=每进程各一份"
+        f"{'｜' + str(gate_view.get('note')) if gate_view.get('limit_source') != 'env' else ''}",
+        flush=True,
+    )
     recovered = reclaim_at_boot()
     if recovered:
         print(f"启动时收回 {len(recovered)} 个失去 worker 的 job：{', '.join(recovered[:5])}", flush=True)

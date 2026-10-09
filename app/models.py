@@ -134,6 +134,11 @@ class Job(Base):
     # 谁在跑它：多 worker 水平扩之后，"这个 job 归哪个 worker"必须查得回来，
     # 否则 worker 死了没人能把它认领回来（P2 的租约字段）
     worker: Mapped[str | None] = mapped_column(String(64))
+    # 留痕：最后一次认领它的进程标识。`worker` 在跑完时被清空（那是租约协议的"当前持有者"），
+    # 这一列不清 —— "分进程形态下这批 job 是谁执行的"必须能在作业结束很久之后回答，
+    # 而不是靠趁那几秒采样（采样漏了就得到一份空表，见 scripts/load_test.py 的 claim_attribution）。
+    # 不给接口：里面是本机 `主机名:进程号:随机尾`，属内部标识。
+    claimed_by: Mapped[str | None] = mapped_column(String(64))
     # 客户端为"这一次提交"带来的不透明串（见 app/db.py 的注释与 app/queueing.accept）。
     # 可为空：没带键就是没有护栏，两次相同提问照样建两行——不许把"没带"当成"同一个"。
     idempotency_key: Mapped[str | None] = mapped_column(String(200))

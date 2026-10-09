@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 
@@ -35,6 +36,64 @@ PHASE_PROGRESS: dict[str, int] = {
     "review": 75,
     "report": 90,
 }
+
+# ---------------------------------------------------------------- 部署形态（P5-3）
+
+WEB_DISPATCH_ENV = "WEB_DISPATCH"
+_ON = {"", "1", "true", "on", "yes", "web", "both"}
+_OFF = {"0", "false", "off", "no", "external", "worker"}
+
+
+def web_dispatch_enabled() -> bool:
+    """受理进程要不要**自己认领作业**。默认 on = 今天这套能直接跑的形状（一个进程就够）。
+
+    为什么默认是"关不掉也行"：这个仓库现在就是单进程在跑，把默认改成 off 等于要求用户改环境
+    才能让系统动起来——那是把形态切换的代价推给他。分进程部署是**加**一个 worker 进程并把
+    Web 那侧的认领关掉，两步都是显式的。
+
+    认不出来的值一律按 on 处理并打一条 warning：**静默把执行关掉**的表现是"作业永远排队、
+    接口一切正常"，那是最难查的一类故障；宁可多打一行日志。
+    只在调用时读环境变量：形态是部署的事，不是 import 时刻的事实（与路径同一口径）。
+    """
+    raw = (os.getenv(WEB_DISPATCH_ENV) or "").strip().lower()
+    if raw in _ON:
+        return True
+    if raw in _OFF:
+        return False
+    logger.warning(
+        "%s=%r 认不出来，按 on 处理（这个进程仍会认领作业）。可接受：on/1/true/yes 或 off/0/false/external",
+        WEB_DISPATCH_ENV,
+        raw,
+    )
+    return True
+
+
+def dispatch_form() -> dict[str, Any]:
+    """这个进程的执行形态，给运维读数用（`/api/jobs` 的 `dispatch` 字段、SSE 首帧与启动日志）。
+
+    `claim_loops` 是**本进程**的认领循环数：off 时它是 0（不是 `WORKER_CONCURRENCY` 那个数）。
+    不报这个就会把"这个进程有几个循环"读成"平台有几个循环"——分进程部署下两者差着进程数。
+
+    `llm_gate_scope` 明写"每进程各一份"：这是这个形态**已知没做**的那一格（不是配额系统，
+    上游并发总量在分进程后是 `limit × 调用方进程数`）。写进读数而不是藏在注释里，是因为
+    "认得但不生效"的口径一旦没人说，运维就会把两个进程各 16 路读成"平台还是 16 路"——
+    而那台网关实测 32 路要出 429。显式收敛的办法是每进程设 `LLM_MAX_CONCURRENCY=limit/进程数`。
+    """
+    enabled = web_dispatch_enabled()
+    loops = queueing.default_worker_concurrency() if enabled else 0
+    return {
+        "dispatch_in_web": enabled,
+        "shape": "单进程（受理 + 执行）" if enabled else "分进程（Web 只受理，执行在外部 worker）",
+        "claim_loops": loops,
+        "llm_gate_scope": "per_process",
+        "note": (
+            "本进程自己认领作业；要拆成独立 worker：起 `python scripts/worker.py` 并把本进程设成 "
+            f"{WEB_DISPATCH_ENV}=off"
+            if enabled
+            else "本进程不认领作业。若没有任何外部 worker 在跑，作业会一直停在队列里——"
+            "这是配置意图，不是故障；`queue.running` 会一直是 0"
+        ),
+    }
 
 
 def _publish(manager: JobManager, job_id: str, event: dict[str, Any]) -> None:

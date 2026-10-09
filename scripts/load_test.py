@@ -13,6 +13,8 @@
 
     python scripts/load_test.py --users 100 --rounds 1            # 自己起一座临时的塔
     python scripts/load_test.py --users 20 --rounds 2 --kill-mid   # 顺带测持久性
+    python scripts/load_test.py --users 20 --web-dispatch off --extra-workers 2
+                                                                   # 分进程形态（P5-3）：受理层不吃作业
 
 不碰开发机的真库：默认把 `APP_DATA_DIR` / `OUTPUTS_ROOT` 指到临时目录再拉起 uvicorn。
 """
@@ -23,6 +25,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import socket
 import sqlite3
 import statistics
@@ -323,6 +326,68 @@ async def concurrency_probe(db_path: Path, holder: dict[str, int], stop: asyncio
         await asyncio.sleep(0.2)
 
 
+_SERVER_PID_RE = re.compile(r"Started server process \[(\d+)\]")
+_WORKER_ID_RE = re.compile(r"worker 起跑：(\S+)")
+
+
+def _pid_in_name(name: str) -> str:
+    """`主机:进程号:随机尾` 里取那个进程号。取不到就回空串，让调用方按"认不出来"处理。"""
+    parts = str(name or "").split(":")
+    return parts[1] if len(parts) >= 2 and parts[1].isdigit() else ""
+
+
+def claim_attribution(db_path: Path, server_log: Path, worker_logs: list[Path]) -> dict[str, Any]:
+    """把 `jobs.worker` 里那些名字**归到具体进程**上，回答"这批 job 是谁认领的"。
+
+    为什么不能拿 `Popen.pid` 判：这台机器上 `python.exe` 是启动器，真正的解释器是它的子进程
+    （实测 Popen.pid=24208，而 uvicorn 自己报 "Started server process [30168]"）。
+    原来那行摘要按"distinct 名字数 > 1 才算多进程"来判，于是 **`WEB_DISPATCH=off` + 一个外部
+    worker** 这一轮正是要看的形态被念成"只有受理进程"——名字确实只有一个，而那一个恰恰不是受理进程。
+    判据因此改成按 pid 点名，并且数的是 **`claimed_by`** 这一列而不是 `worker`：后者是租约的
+    当前持有者，作业跑完就清空（实测：压测结束后按 `worker` 归因得到的是一份空表，
+    连单进程那一轮都被念成"受理进程认领 0 个"，而那是假的）。`claimed_by` 是留痕，跑完还在。
+    """
+    pids: dict[str, str] = {}
+    try:
+        match = _SERVER_PID_RE.search(server_log.read_text(encoding="utf-8", errors="replace"))
+        if match:
+            pids[match.group(1)] = "web_process"
+    except OSError:
+        pass
+    for index, path in enumerate(worker_logs):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in _WORKER_ID_RE.finditer(text):
+            pid = _pid_in_name(match.group(1))
+            if pid:
+                pids[pid] = f"worker_{index}"
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        rows = conn.execute(
+            "SELECT claimed_by, COUNT(*) FROM jobs WHERE claimed_by IS NOT NULL GROUP BY claimed_by"
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        rows = []
+    by_actor: dict[str, int] = {}
+    unknown: list[str] = []
+    for name, count in rows:
+        actor = pids.get(_pid_in_name(name))
+        if actor is None:
+            unknown.append(str(name))
+            actor = "unknown"
+        by_actor[actor] = by_actor.get(actor, 0) + int(count)
+    return {
+        "jobs_by_actor": by_actor,
+        "process_pids": pids,
+        "unattributed_names": unknown,
+        # 受理进程一次都没认领 = 拆分真的生效了。`web_process` 出现在这里就说明"拆了没拆干净"。
+        "web_process_claimed": by_actor.get("web_process", 0),
+    }
+
+
 def wait_for_drain(db_path: Path, wait_s: float) -> dict[str, Any]:
     """杀进程之后不重启任何人，看队列能不能自己排空。
 
@@ -487,6 +552,9 @@ def main() -> int:
     parser.add_argument("--kill-target", choices=("server", "worker"), default="server",
                         help="杀掉谁：server=受理层，worker=执行层（P2 的崩溃恢复测的是后者）")
     parser.add_argument("--extra-workers", type=int, default=0, help="另起几个独立 worker 进程（scripts/worker.py）")
+    parser.add_argument("--web-dispatch", choices=("on", "off"), default="on",
+                        help="Web 进程要不要自己认领作业：off = P5-3 的分进程形态（受理层只受理，"
+                             "执行只在 --extra-workers 起的那些进程里）")
     parser.add_argument("--lease-seconds", type=int, default=30, help="租约时长；测试里压短，否则要等满 90s")
     parser.add_argument("--recover-wait", type=float, default=120.0, help="杀完之后最多等多久看队列自己排空")
     parser.add_argument("--report", default=str(ROOT / ".appdata" / f"load_{int(time.time())}.json"))
@@ -508,6 +576,13 @@ def main() -> int:
     # 租约与认领上限走环境变量：子进程（uvicorn 与 scripts/worker.py）读的就是同一份口径，
     # 这里压到 30s 是为了让"崩溃→收回→重认领"在一次压测里可读，而不是等满默认 90s。
     os.environ["JOB_LEASE_SECONDS"] = str(args.lease_seconds)
+    # 形态也走环境变量：子进程（uvicorn）里的 `app.runner.web_dispatch_enabled()` 读的就是这一份，
+    # 压测脚本不在自己进程里判形态——两处各判一次，迟早出现"脚本以为拆了、服务其实没拆"。
+    os.environ["WEB_DISPATCH"] = args.web_dispatch
+    if args.web_dispatch == "off" and args.extra_workers < 1:
+        # 不拦：这恰好是要能测的一格（受理层活着、没人认领）。但读数必须带着它是什么形态，
+        # 否则将来看到"作业全停在 queued"会被当成队列的缺陷，而它是这次配置的形状。
+        print("  ⚠ --web-dispatch off 且没起外部 worker：作业会一直停在队列里（这是形态，不是故障）")
     log_path = data_dir / "server.log"
 
     print(f"负载尺子 ｜ 用户 {args.users} ｜ 每人 {args.rounds} 次 ｜ 端口 {port} ｜ 数据目录 {data_dir}")
@@ -538,6 +613,9 @@ def main() -> int:
             "server": process.pid,
             "workers": [item[0].pid for item in workers],
             "worker_concurrency_per_process": int(os.getenv("WORKER_CONCURRENCY", "2")),
+            # 这一轮的形态要跟着读数落盘。没有它，一份"queued 一直涨、running 恒为 0"的报告
+            # 会被下一个人读成系统坏了，而不是"这一轮就是关掉受理层认领跑的"。
+            "web_dispatch": args.web_dispatch,
         }
         result["claimers_seen"] = result.get("claimers", [])
         if args.kill_after:
@@ -563,6 +641,16 @@ def main() -> int:
         for index, item in enumerate(workers):
             item[1].flush()
             result[f"worker_{index}_locked_lines"] = harvest_locks(data_dir / f"worker_{index}.log")
+        # 谁认领了这批 job：按 pid 点名，不按"distinct 名字数"猜（见 claim_attribution 的说明）。
+        result["claim_attribution"] = claim_attribution(
+            db_path, log_path, [data_dir / f"worker_{index}.log" for index in range(len(workers))]
+        )
+        # 启动那三行读数**有没有真的到达运维眼前**。这一格是 2026-10-08 那轮分进程压测里
+        # 补的：`logger.info` 在 uvicorn 下面根本没 handler 接，写进日志 ≠ 有人能读到。
+        server_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        result["startup_lines_seen"] = {
+            key: key in server_text for key in ("执行形态", "LLM 闸门", "入口限流")
+        }
     finally:
         for item in workers:
             item[0].kill()
@@ -586,8 +674,11 @@ def main() -> int:
         print(f"  {key:<12} p50={result[key]['p50']:>9} p95={result[key]['p95']:>9} "
               f"p99={result[key]['p99']:>9} max={result[key]['max']:>9} n={result[key]['n']}")
     print(f"  同时在跑 job 峰值 = {result['max_live_jobs']}")
-    print(f"  看到过的认领者 = {len(result.get('claimers_seen', []))} 岔："
-          f"{'（多进程消费）' if len(result.get('claimers_seen', [])) > 1 else '（只有受理进程）'}")
+    attribution = result.get("claim_attribution") or {}
+    print(f"  认领归属（按 pid 点名）= {json.dumps(attribution.get('jobs_by_actor', {}), ensure_ascii=False)}"
+          f"｜受理进程认领了 {attribution.get('web_process_claimed')} 个 job"
+          f"｜形态 WEB_DISPATCH={result.get('processes', {}).get('web_dispatch')}")
+    print(f"  启动读数是否真打出来 = {json.dumps(result.get('startup_lines_seen', {}), ensure_ascii=False)}")
     print(f"  服务端 'database is locked' 行数 = {result['server_locked_lines']}")
     print(f"  口令哈希一次 = {result['password_hash_ms']}ms")
     print(f"  事件流：{json.dumps(result['sse'], ensure_ascii=False)}")

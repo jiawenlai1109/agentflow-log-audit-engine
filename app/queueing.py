@@ -180,9 +180,16 @@ def claim(worker: str, lease_s: int = LEASE_SECONDS) -> dict[str, Any] | None:
         return None
     lease_until = _iso(_now() + timedelta(seconds=lease_s))
     changed = execute(
-        "/*queue-internal*/ UPDATE jobs SET status='running', worker=?, lease_expires_at=?, progress=1 "
+        # `claimed_by` 与 `worker` 是两件事：`worker` 是**当前持有租约的人**，跑完就清空（认领协议
+        # 靠它判"这个人还在不在"）；`claimed_by` 是留痕——"这个 job 最后在哪个进程里跑的"。
+        # 少了后者，"分进程形态下到底是谁在执行"只能在作业还在跑的那几秒采样，跑完就查不到
+        # （实测：压测结束后 `worker` 全为 NULL，按它归因得到一份空表，还把单进程那一轮也报成 0）。
+        # 这一列**不给客户端**：里面是本机的 `主机名:进程号:随机尾`，属于内部标识（与 #15 撤掉
+        # `report_path`、#23 撤掉别人的 `user_id` 同一条口径），只给运维在库里查。
+        "/*queue-internal*/ UPDATE jobs SET status='running', worker=?, claimed_by=?, "
+        "lease_expires_at=?, progress=1 "
         "WHERE job_id=? AND status='queued' AND worker IS NULL",
-        (worker, lease_until, candidate["job_id"]),
+        (worker, worker, lease_until, candidate["job_id"]),
     )
     # `changed` 是 lastrowid，不是行数——认领必须用"改动了几行"判，所以这里回读确认。
     owner = query_one(

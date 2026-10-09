@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from app import config as app_config
 from app.db import execute, init_db, query_one
 from app.jobs import JobManager
 from app.main import app
+from app.routers import jobs as jobs_route
 from app.security import hash_password
 
 
@@ -185,6 +187,87 @@ def test_sse_replays_nothing_after_the_clients_last_id():
         assert "id: 3" in resumed.text and "id: 1" not in resumed.text, resumed.text[:400]
         assert _frames(resumed.text)[-1]["type"] == "job_status"
     finally:
+        client.close()
+        _clean(uid=uid)
+
+
+def _read_stream(client: TestClient, job_id: str, within_s: float = 10.0) -> str:
+    """在限定时间内把进度流读完，读不完就**报红**。
+
+    为什么不直接 `client.get(...).text`：那种写法下"流永不结束"这种缺陷的表现是整片测试挂住，
+    而挂住不算抓到（P4 那次一条位点把测试卡了 600 秒，最后只能靠超时才知道它"被抓了"）。
+    红要落在断言上：这里落的是"10 秒内它自己结束了没有"。
+    """
+    holder: dict[str, str] = {}
+
+    def _reader() -> None:
+        try:
+            holder["body"] = client.get(f"/api/jobs/{job_id}/events").text
+        except Exception as exc:  # noqa: BLE001 - 带回主线程再判，不在子线程里静默
+            holder["error"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    reader = threading.Thread(target=_reader, name=f"stream-{job_id}", daemon=True)
+    reader.start()
+    reader.join(timeout=within_s)
+    assert not reader.is_alive(), (
+        f"{within_s}s 内这条流没自己结束——那正是「降级那条分支从不查库、也从不退出」的形状"
+    )
+    assert "error" not in holder, holder["error"]
+    return holder.get("body", "")
+
+
+def test_a_stream_that_never_got_events_still_ends_when_the_job_is_terminal():
+    """一条"事件从没落库"的流也必须自己结束——那条降级分支以前**从不查库，也从不退出**。
+
+    复现路径是摆好的而不是竞态：作业行直接建成 `running`、库里一行事件都没有，然后把它改成
+    终态再读流。改造前这条流每 0.5s 空转一次、永不结束（`continue` 那一支绕过了状态查询）。
+    P5-3 那条 SSE 用例是靠竞态撞上它的——那种用例本身不稳，所以这里给一条前置条件确定的；
+    而这条缺陷在 P5-2 之后变贵了：前端现在会自动重连，一条永不结束的流就是一条无限重连。
+    """
+    uid = _user()
+    _job(uid, status="running")
+    execute("UPDATE jobs SET status = 'success' WHERE job_id = 'job_evt'", ())
+    client = TestClient(app)
+    try:
+        _login(client, "evt-user")
+        body = _read_stream(client, "job_evt")
+        frames = _frames(body)
+        assert [frame["type"] for frame in frames[:2]] == ["queue", "events_not_persisted"], frames[:3]
+        assert frames[-1] == {"type": "job_status", "status": "success"}, frames[-3:]
+    finally:
+        client.close()
+        _clean(uid=uid)
+
+
+def test_the_degraded_buffer_does_not_replay_the_same_events():
+    """降级那条路也要**只发一次**：缓冲游标每次传 0，就是每轮把同一段过程重发一遍。
+
+    把 sink 摘掉是让"库里没有事件、缓冲里却有"这个状态**摆出来**而不是等竞态；作业先留非终态，
+    1.2s 之后由计时器落终态 ⇒ 这条流至少走两轮降级，重放与否才看得见。
+    """
+    uid = _user()
+    _job(uid, status="running")
+    client = TestClient(app)
+    original_sink = jobs_route.manager.sink
+    jobs_route.manager.sink = None
+    try:
+        for index in range(3):
+            jobs_route.manager.publish("job_evt", {"type": "phase", "index": index})
+        _login(client, "evt-user")
+        flipper = threading.Timer(
+            1.2, lambda: execute("UPDATE jobs SET status = 'success' WHERE job_id = 'job_evt'", ())
+        )
+        flipper.start()
+        try:
+            frames = _frames(_read_stream(client, "job_evt", within_s=15.0))
+        finally:
+            flipper.cancel()
+        indices = [frame.get("index") for frame in frames if frame.get("type") == "phase"]
+        assert indices == [0, 1, 2], f"过程事件被重发了：{indices}"
+    finally:
+        jobs_route.manager.sink = original_sink
+        with jobs_route.manager._lock:
+            jobs_route.manager._events.pop("job_evt", None)
         client.close()
         _clean(uid=uid)
 

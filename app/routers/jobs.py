@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app import access, config, eventlog, llm_gate, queueing, quota
-from app.runner import Dispatcher
+from app.runner import Dispatcher, dispatch_form, web_dispatch_enabled
 from app.db import query_one
 from app.deps import get_current_user
 from app.jobs import JobManager
@@ -65,6 +65,10 @@ def _visible_job(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     # 让前端自己抄一份"哪些状态算完了"的下场是两份名单分叉：多出来的那个终态会被
     # 当成"还在跑"，客户端就一直重连一条早就结束的流。
     job["terminal"] = str(job.get("status")) in TERMINAL_STATUSES
+    # 执行形态与闸门读数同口径：**本进程**的局部量，单独一个字段。
+    # 分进程部署下没有这一格，运维面对的就是"作业全在排队、每个接口都返回 200"，
+    # 而唯一的线索（这个进程不认领作业）只写在启动日志里。
+    job["dispatch"] = dispatch_form()
     return job
 
 
@@ -246,7 +250,11 @@ def submit_analysis(
     )
     # Web 进程自己也是认领者（默认形态）。独立 worker 进程起来后这只是多一个消费者，
     # 不是第二条执行路径——认领是原子的，一个 job 只会被一个认领者拿到。
-    dispatcher.start()
+    # 这一句要过形态判据：`WEB_DISPATCH=off` 时提交路径**照样**开循环的话，
+    # "拆进程"就变成一个只在 lifespan 生效的开关——第一次有人点提交就把它绕过去了，
+    # 而绕过去的表现不是报错，是 Web 进程偷偷开始吃 CPU（正是 P0 那笔登录 p95 的账）。
+    if web_dispatch_enabled():
+        dispatcher.start()
     return accepted
 
 
@@ -356,33 +364,46 @@ async def job_events(job_id: str, request: Request, user: dict = Depends(get_cur
         sql, params = access.scope(user)
         # 第一帧报队列深度：用户在"点了没反应"与"排在第几"之间看到的必须是后者。
         # 数从库里读（queueing.stats）而不是读本进程簿记——job 可能被另一个进程的 worker 认领。
-        # 首帧同时给两份深度：库里的队列深度（全局）与本进程的闸门读数（局部）。
+        # 首帧给三份读数：库里的队列深度（全局）、本进程的闸门量（局部）、本进程的执行形态（局部）。
         # 只给前者，"上游 16 路全在飞、还有 9 个作业在等槽位"这件事在读数上就是隐形的，
         # 用户看到的仍是"点了没反应"——那正是 P4 要消掉的那格。
-        yield _sse({"type": "queue", **queueing.stats(), "gate": llm_gate.snapshot()})
+        # `dispatch` 补的是同一族的另一格：分进程形态下 `WEB_DISPATCH=off` 而 worker 没起时，
+        # queued 会一直涨、running 一直是 0，接口全绿——"没人认领"这件事只有这一帧会说。
+        yield _sse({"type": "queue", **queueing.stats(), "gate": llm_gate.snapshot(), "dispatch": dispatch_form()})
         cursor = start
+        buffered = 0  # 过程内缓冲那条路的"已发条数"，与库里的 seq 不是一个数，不共用变量
         while True:
             rows = eventlog.read_after(job_id, cursor)
+            finished_in_buffer = False
             if not rows and not eventlog.has_events(job_id):
                 # 事件没落库（sink 写失败过）⇒ 退化成过程内缓冲，与改造前等价。
                 # 降级可以，静默不行：明着发一条 events_not_persisted。
                 yield _sse({"type": "events_not_persisted", "job_id": job_id})
-                events, _total, expired = manager.snapshot(job_id, 0)
+                events, _total, expired = manager.snapshot(job_id, buffered)
+                # 游标要往前走：原来每次传 0，于是同一段缓冲每轮**重发一遍**——
+                # 那条降级路自己就是把"补齐而不是重放"这句话弄反了。
+                buffered += len(events)
                 for event in events:
                     yield _sse(event)
-                if expired or manager.is_done(job_id):
-                    break
-                await asyncio.sleep(0.5)
-                continue
-            for seq, event in rows:
-                cursor = seq
-                yield _sse(event, seq)
+                finished_in_buffer = bool(expired or manager.is_done(job_id))
+            else:
+                for seq, event in rows:
+                    cursor = seq
+                    yield _sse(event, seq)
+            # 两条路都要问一次库里的状态。原来只有"落库那条"问：一条"事件从没落库、而行已被
+            # 改成终态"的作业会把这条流**永远挂住**——P5-3 那条 SSE 用例实测撞到了，而它同时
+            # 是那三次变异位点 TIMEOUT 420s 的真因（挂住的是被测端点，不是量具）。
+            # 这条缺陷在 P5-2 之后变贵了：前端现在会自动重连，一条永不结束的流就是一条无限重连。
             row = query_one(
                 f"SELECT status FROM jobs WHERE job_id = ?{sql}", (job_id, *params)
             )
             state = (row or {}).get("status")
             if state in TERMINAL_STATUSES:
                 yield _sse({"type": "job_status", "status": state})
+                break
+            if finished_in_buffer:
+                # 缓冲那条路自己判的"结束"（回收过 / 本进程跑完了），而库里还不是终态：
+                # 可以收流，但**不许编一条 job_status**——那等于把"还没落到终态"说成结束了。
                 break
             await asyncio.sleep(0.5)
 
