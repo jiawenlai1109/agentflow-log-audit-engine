@@ -91,6 +91,12 @@ class RunContext:
     mcp: Any = None  # 外部工具门面（McpHub）：None = 本次一个外部 server 都没接
     mcp_approvals: dict[str, bool] = field(default_factory=dict)  # 请求侧签字（由 hub 按 grantable 名单过滤）
     run_origin: dict[str, Any] = field(default_factory=dict)  # 这次运行从哪来、谁批准的：只用于留痕，不参与判定
+    # 这次运行所属的**链路标识**（P6-2，口径见 `core/trace.py`）。运行侧的产物（transcript 每行、
+    # evaluation.json）都记这一个值，于是"凭一个 id 查回产物"不需要猜时间戳。
+    # 没带就是 None，并由写产物的那几处**省略这一格**而不是补一个空串——空串与 None 在读数上
+    # 是同一种意思，但一个来自评测夹具（本来就没链路），另一个来自受理层（该有而没有），
+    # 混在一起就查不出"是哪一路漏了"。
+    trace_id: str | None = None
     external_evidence: list[dict[str, Any]] = field(default_factory=list)  # 外部证据（只作证据，不进数字来源）
     clarify: dict[str, Any] | None = None  # v1.2：非阻塞澄清请求
     join_preflight: dict[str, Any] = field(default_factory=dict)  # M2-3：派发前 join 预检留痕

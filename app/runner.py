@@ -25,6 +25,7 @@ from app.jobs import JobManager
 # `run_analysis` 在模块顶层导入，不在函数里延迟导：执行路径搬到这一份代码之后，
 # 全局只剩**一个**可替换的跑批缝隙。缝隙有两处（这里 + routers/jobs.py）迟早出现
 # "改了 A 处桩、跑的是 B 处"，而受理层本来就已经 import 了 pipeline，延迟没有省下什么。
+from agentflow.core import trace
 from agentflow.pipeline import run_analysis
 
 logger = logging.getLogger("agentflow.worker")
@@ -97,6 +98,13 @@ def dispatch_form() -> dict[str, Any]:
 
 
 def _publish(manager: JobManager, job_id: str, event: dict[str, Any]) -> None:
+    # 事件是"这条链路上发生过什么"的观测面，所以链路标识在这里盖一次，而不是让每个
+    # 生产者各自记一句（生产者有十几处，漏一处的症状是那一类事件在按 trace 查时凭空消失）。
+    # 没有绑定就不写这一格：省略读起来是"这次运行没有链路"，而 `null` 也读起来是——
+    # 但把上一个作业的串留在这一条上，读起来是"这两次运行是同一条链路"，那才是会骗人的写法。
+    chain = trace.current()
+    if chain:
+        event.setdefault("trace_id", chain)
     manager.publish(job_id, event)
 
 
@@ -175,30 +183,37 @@ def execute_job(claim: dict[str, Any], manager: JobManager) -> str:
 
     lease = threading.Thread(target=keep_lease, name=f"lease-{job_id}", daemon=True)
     lease.start()
-    try:
-        result = run_analysis(
-            question=str(spec.get("question") or ""),
-            sources=sources,
-            mode=str(spec.get("mode") or "mock"),
-            outputs_root=config.org_outputs_root(org_id),
-            session_id=session_id,
-            sessions_root=sessions_root,
-            on_event=on_event,
-            pack=spec.get("pack"),
-            mcp_approvals=spec.get("mcp_approvals") or None,
-            run_origin=spec.get("run_origin") or None,
-        )
-        status = str(result.get("status") or last["status"])
-        queueing.finish(job_id, worker, status, run_id=result.get("run_id") or last["run_id"])
-        return status
-    except Exception as exc:  # noqa: BLE001 - 一次运行失败不该带走宿主
-        reason = f"{type(exc).__name__}: {str(exc)[:400]}"
-        queueing.finish(job_id, worker, "failed", error=reason)
-        _publish(manager, job_id, {"type": "error", "error": str(exc)[:500]})
-        logger.warning("job %s 失败：%s", job_id, reason)
-        return "failed"
-    finally:
-        lease_stop.set()
+    # 一次运行绑在同一条链路上（P6-2）。权威是**库里那列**（`jobs.trace_id`，受理那一刻写的），
+    # spec 里的副本只是给"这列还没补上的老库"留的退路。两样都没有（P6-1 之前建的老作业）就
+    # 什么都不绑：认领循环是长命线程，留着上一个作业的值会把两次运行写成同一条链路，
+    # 那是假关联，比"这一段没链路"更难查（口径见 `agentflow.core.trace` 的文件头）。
+    chain = claim.get("trace_id") or spec.get("trace_id")
+    with trace.bind(chain):
+        try:
+            result = run_analysis(
+                question=str(spec.get("question") or ""),
+                sources=sources,
+                mode=str(spec.get("mode") or "mock"),
+                outputs_root=config.org_outputs_root(org_id),
+                session_id=session_id,
+                sessions_root=sessions_root,
+                on_event=on_event,
+                pack=spec.get("pack"),
+                mcp_approvals=spec.get("mcp_approvals") or None,
+                run_origin=spec.get("run_origin") or None,
+                trace_id=chain,
+            )
+            status = str(result.get("status") or last["status"])
+            queueing.finish(job_id, worker, status, run_id=result.get("run_id") or last["run_id"])
+            return status
+        except Exception as exc:  # noqa: BLE001 - 一次运行失败不该带走宿主
+            reason = f"{type(exc).__name__}: {str(exc)[:400]}"
+            queueing.finish(job_id, worker, "failed", error=reason)
+            _publish(manager, job_id, {"type": "error", "error": str(exc)[:500]})
+            logger.warning("job %s 失败：%s", job_id, reason)
+            return "failed"
+        finally:
+            lease_stop.set()
 
 
 def reclaim_at_boot() -> list[str]:

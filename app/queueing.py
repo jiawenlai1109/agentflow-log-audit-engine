@@ -178,7 +178,7 @@ def claim(worker: str, lease_s: int = LEASE_SECONDS) -> dict[str, Any] | None:
     现在把它列进必查名单。认领是 worker 每秒都在做的事，几十毫秒就是它每秒都在付的钱。
     """
     candidate = query_one(
-        "/*queue-internal*/ SELECT job_id, user_id, org_id, spec, attempts FROM jobs j "
+        "/*queue-internal*/ SELECT job_id, user_id, org_id, spec, attempts, trace_id FROM jobs j "
         "WHERE j.status='queued' "
         "ORDER BY (SELECT COUNT(*) FROM jobs r "
         "          WHERE r.status='running' AND r.org_id=j.org_id) ASC, j.id ASC "

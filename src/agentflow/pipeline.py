@@ -17,6 +17,7 @@ from agentflow.agents import (
     ReporterAgent,
     VisualizerAgent,
 )
+from agentflow.core import trace
 from agentflow.core.budget import BudgetCounter
 from agentflow.core.config import load_config
 from agentflow.core.context import SessionContext
@@ -241,6 +242,7 @@ def run_analysis(
     mcp_approvals: dict[str, bool] | None = None,
     run_origin: dict[str, Any] | None = None,
     sessions_root: str | Path | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """端到端运行一次分析，返回 {run_id, outputs_dir, status, report, task_states}。
 
@@ -291,6 +293,9 @@ def run_analysis(
         session = SessionContext(session_id=session_id, session_dir=session_dir)
 
     budget = BudgetCounter(int(config["execution"]["max_llm_calls"]))
+    # 链路标识：调用方显式给的那一条优先，其次是"当前执行上下文里绑着的那一条"
+    # （Web 侧 `execute_job` 会绑；CLI 与评测夹具两者都没有 ⇒ None，不猜、也不留一个空串）。
+    chain = trace_id or trace.current()
     llm.budget = budget  # v1.2：预算计数点下沉到 LLM 层（每次真实 API 调用计 1）
     # 事件出口跟着客户端走（P4 的排队留痕要用）。必须在 `build_agents` **之前**挂上，
     # 否则按角色克隆出来的那些客户端（`_agent_llm`）拿不到 sink——症状是"换型号的那个
@@ -317,15 +322,21 @@ def run_analysis(
         mcp=mcp,
         mcp_approvals=mcp_approvals,
         run_origin=run_origin,
+        trace_id=chain,
     )
     bundle = as_bundle(sources, outputs_root)
-    result = orchestrator.run(
-        question=question,
-        bundle=bundle,
-        outputs_root=outputs_root,
-        session=session,
-        pack=pack_obj,
-    )
+    # 绑在这里而不是只把值传下去：一次运行产生的记录有三分之二不是从 `run()` 那一层
+    # 直接写的——各角色的转录走 `BaseAgent._transcribe(ctx)`、工具审计走 `ToolRegistry._audit(ctx)`，
+    # 它们读的是 ctx；而 LLM 层的留痕（空正文、降级、闸门排队）走的是 `event_sink`，**拿不到 ctx**。
+    # 绑定 + ctx 两条都铺，才不会出现"evaluation.json 里有 trace 而 transcript 里没 trace"这种半条链路。
+    with trace.bind(chain):
+        result = orchestrator.run(
+            question=question,
+            bundle=bundle,
+            outputs_root=outputs_root,
+            session=session,
+            pack=pack_obj,
+        )
     if session:
         _persist_session(session, question, result, llm=llm)
     return result

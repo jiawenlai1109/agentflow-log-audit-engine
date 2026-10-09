@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agentflow.core import dataset_scope, gate
+from agentflow.core import dataset_scope, gate, trace
 from agentflow.core.budget import BudgetCounter
 from agentflow.core.context import RunContext, new_run_id
 from agentflow.core.messages import AgentMessage
@@ -86,6 +86,7 @@ class Orchestrator:
         mcp: Any = None,
         mcp_approvals: dict[str, Any] | None = None,
         run_origin: dict[str, Any] | None = None,
+        trace_id: str | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -99,6 +100,9 @@ class Orchestrator:
         # 就有两个解释，而这类分歧最后都是靠读代码猜的。
         self.mcp_approvals = dict(mcp_approvals or {})
         self.run_origin = dict(run_origin or {})
+        # 链路标识（P6-2）：调用方显式给的那一条优先，其次才是"当前执行上下文里绑着的那一条"
+        # （worker 进程在 `execute_job` 里绑，CLI/评测那两条路没绑也没有 ⇒ 就是 None，不猜）。
+        self.trace_id = trace_id or trace.current()
         self._commit_lock = threading.Lock()
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -139,6 +143,7 @@ class Orchestrator:
             mcp=self.mcp,
             mcp_approvals=dict(self.mcp_approvals),
             run_origin=dict(self.run_origin),
+            trace_id=self.trace_id,
         )
         self._record_capabilities(ctx, pack)
         started = time.monotonic()
@@ -372,8 +377,13 @@ class Orchestrator:
             pending -= set(ready)
             if to_run:
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    # `trace.wrap` 包的是**提交处**而不是任务单元内部（P6-2）。
+                    # `ThreadPoolExecutor.submit` 不复制 contextvar（只有 asyncio 的任务会），
+                    # 所以不包的话：主线程有的链路标识，到了并发执行那一层就是 None——
+                    # 而工具调用、沙箱子进程、每个任务的转录全发生在那一层，
+                    # 症状不是报错而是"按 trace 查回来的记录只覆盖了流水线的前三段"。
                     futures = {
-                        pool.submit(self._task_unit, ctx, task_by_id[tid]): tid
+                        pool.submit(trace.wrap(self._task_unit), ctx, task_by_id[tid]): tid
                         for tid in to_run
                     }
                     for future in as_completed(futures):
@@ -878,6 +888,10 @@ class Orchestrator:
         chart_success = sum(1 for figure in figures.values() if figure.get("file_path"))
         evaluation = {
             "run_id": ctx.run_id,
+            # 链路标识（P6-2）：评测层与运维靠这一格把"这份产物"接回"那次提交"。
+            # 没有链路（CLI 单跑、评测夹具）时**整格缺席**而不是写 null——
+            # `null` 与缺席在读数上是两种意思：前者是"这次运行该有而没有"，后者是"这条路本来就没有"。
+            **({"trace_id": ctx.trace_id} if ctx.trace_id else {}),
             "question": ctx.question,
             "status": status,
             "duration_seconds": duration,
