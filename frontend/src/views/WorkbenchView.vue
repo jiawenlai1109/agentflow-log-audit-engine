@@ -149,6 +149,10 @@
         />
         <el-tag v-if="item.run_id" size="small" class="inline-alert">{{ item.run_id }}</el-tag>
         <ReportViewer v-if="item.report" :content="item.report" />
+        <p v-if="item.report" class="evidence-note" role="note">{{ evidenceSummary(item.evidence) }}</p>
+        <ul v-if="item.evidence && item.evidence.length" class="evidence-list">
+          <li v-for="(line, index) in item.evidence" :key="index">{{ evidenceLine(line) }}</li>
+        </ul>
         <div v-else>{{ item.answer_summary }}</div>
       </el-card>
     </div>
@@ -164,6 +168,7 @@ import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
 import { num } from "../ui/readout";
+import { evidenceLine, evidenceSummary } from "../ui/externalEvidence";
 import { NO_PACK, brokenPackNote, packFacts, packLabel, packPayload } from "../ui/packChoice";
 import {
   SOURCE_KINDS,
@@ -387,7 +392,15 @@ async function showResult(entry: any, jobId: string) {
   const ran = { pack: job.pack ?? null, packKnown: true };
   if (job.run_id) {
     const { data: report } = await api.getReport(job.run_id);
-    messages.value.push({ ...entry, ...ran, run_id: job.run_id, answer_summary: "", report: report.content });
+    messages.value.push({
+      ...entry,
+      ...ran,
+      run_id: job.run_id,
+      answer_summary: "",
+      report: report.content,
+      // null = 这份产物里没读到这个字段；[] = 确实没引用外部数据。两种"没有"要分开说。
+      evidence: report.external_evidence ?? null,
+    });
     return job.status;
   }
   messages.value.push({ ...entry, ...ran, error: job.error || "分析失败（无详细信息）" });
@@ -602,5 +615,17 @@ onBeforeUnmount(() => streamController?.abort());
   font-size: var(--el-font-size-extra-small);
   color: var(--af-text-secondary);
   font-weight: 400;
+}
+.evidence-note {
+  margin: 8px 0 4px;
+  font-size: var(--el-font-size-small);
+  color: var(--af-text-secondary);
+}
+.evidence-list {
+  margin: 0 0 8px;
+  padding-left: 1.2em;
+  font-size: var(--el-font-size-extra-small);
+  color: var(--af-text-secondary);
+  overflow-wrap: anywhere;
 }
 </style>

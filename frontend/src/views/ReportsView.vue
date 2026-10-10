@@ -49,6 +49,12 @@
       </el-table-column>
       <el-table-column prop="llm_calls" label="LLM调用" min-width="90" />
       <el-table-column prop="duration_seconds" label="耗时(s)" min-width="90" />
+      <el-table-column label="外部数据" min-width="100">
+        <template #default="{ row }">
+          <!-- 列表这一格只有计数；完整那一份要打开报告才读（产物里那一条带了路径与列名）。 -->
+          {{ countText(row.external_count) }}
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="120">
         <template #default="{ row }">
           <el-button link type="primary" @click="openReport(row)">查看报告</el-button>
@@ -58,6 +64,10 @@
 
     <el-dialog v-model="dialogVisible" title="报告" width="70%">
       <ReportViewer :content="reportContent" />
+      <p class="evidence-note" role="note">{{ evidenceSummary(reportEvidence) }}</p>
+      <ul v-if="reportEvidence && reportEvidence.length" class="evidence-list">
+        <li v-for="(item, index) in reportEvidence" :key="index">{{ evidenceLine(item) }}</li>
+      </ul>
       <p class="scope-note">
         <template v-if="mediaMinutes">
           图片地址带一枚只读媒体 token，约 {{ mediaMinutes }} 分钟有效；
@@ -78,11 +88,15 @@ import { api } from "../api";
 import ReportViewer from "../components/ReportViewer.vue";
 import { num, seconds } from "../ui/readout";
 import { label, tone, tooltip } from "../ui/status";
+import { countText, evidenceLine, evidenceSummary } from "../ui/externalEvidence";
 
 const runs = ref<any[]>([]);
 const summary = ref<any>({});
 const dialogVisible = ref(false);
 const reportContent = ref("");
+// 这一格三态：undefined/null = 这份产物里没读到（界面说"未取得"），[] = 确实没引用外部数据。
+// 打开新报告时先清成 undefined，免得上一份的证据列表留在这一份下面。
+const reportEvidence = ref<any>(undefined);
 // 媒体 token 的有效期由后端随报告一起给（`media_expires_in`），前端不抄一份常数：
 // 抄了之后服务端改时长，界面上那句话就成了没人背书的旧话。
 const mediaExpiresIn = ref<number | null>(null);
@@ -127,6 +141,7 @@ async function openReport(row: any) {
   const { data } = await api.getReport(row.run_id);
   reportContent.value = data.content;
   mediaExpiresIn.value = data.media_expires_in ?? null;
+  reportEvidence.value = data.external_evidence ?? null;
   dialogVisible.value = true;
 }
 
@@ -136,6 +151,18 @@ onMounted(refresh);
 <style scoped>
 .stats {
   margin-bottom: 12px;
+}
+.evidence-note {
+  margin: 0 0 6px;
+  font-size: var(--el-font-size-small);
+  color: var(--af-text-secondary);
+}
+.evidence-list {
+  margin: 0 0 10px;
+  padding-left: 1.2em;
+  font-size: var(--el-font-size-extra-small);
+  color: var(--af-text-secondary);
+  overflow-wrap: anywhere;
 }
 .stat {
   display: flex;

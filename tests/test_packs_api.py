@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from app import paths
 from app.db import execute, query, query_one
 from app.main import app
+from app.routers.reports import evidence_view
 from app.security import hash_password
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -201,6 +202,21 @@ def test_bundle_plus_pack_runs_the_triage_scenario_end_to_end(workspace, owner):
         assert evaluation["pack"]["rule_ids"] == ["T1", "T3", "T4"]
         # 包名进了事实层才算数：只写进 jobs 表的话，产物本身仍回答不了"这是哪套规则的产出"
         assert evaluation["skills"] is not None, "能力面留痕不许因为走 Web 就少一段"
+
+        # A4：报告详情要带上"这次引用了几路外部数据"，而且给的是**同一条投影**——
+        # 正文里那句话是给人读的，结构化这一格才是界面能标色的那一份；对账对的是投影后的形状，
+        # 不是原样转抄（原样转抄会把 path 与 reason 一起带出去）。
+        detail = client.get(f"/api/reports/{finished['run_id']}").json()
+        assert "external_evidence" in detail, "接口没这一格 ⇒ 界面上那一栏只能是编的"
+        listed = detail["external_evidence"]
+        assert listed == evidence_view(evaluation), "接口给的与产物里的不是同一份投影"
+        assert all("path" not in item and "reason" not in item for item in listed or []), listed
+        # 列表那一格与详情同源：同一个数在两个接口上不该算出两个结果
+        runs_row = next(
+            item for item in client.get("/api/runs").json()
+            if str(item["run_id"]) == str(finished["run_id"])
+        )
+        assert runs_row["external_count"] == (None if listed is None else len(listed))
 
         # 历史页那一格读的是 `/api/runs`：这里不带出包名，界面上"哪次跑的是分诊"就永远分不开
         # （前端 `ReportsView` 那一列直接依赖这条，所以断言写在后端这一侧）。

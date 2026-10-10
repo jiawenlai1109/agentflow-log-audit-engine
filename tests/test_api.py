@@ -1,5 +1,6 @@
 """后端 API 集成测试（FastAPI TestClient，mock 模式）。"""
 
+import json
 import time
 from pathlib import Path
 
@@ -124,6 +125,50 @@ def test_session_title_is_custom_readable_and_bounded():
 
         exact = client.post("/api/sessions", json={"title": "字" * 200})
         assert exact.status_code == 200, "正好 200 是可用的：上限与那一列同宽，不是随手写的数"
+
+
+def test_evidence_view_drops_the_path_and_keeps_the_three_states():
+    """外部证据的投影：白名单、以及"没读到"与"没引用"两种没有。
+
+    `path` 是服务器绝对路径（产物落在哪棵树上）——它与 #15 撤掉的 `report_path` 是同一件事，
+    而这条链的读者以前只有本机的运维。`reason` 同理：那是 `str(error)[:300]`，可能夹路径。
+    用白名单而不是黑名单，是为了让"将来新增字段默认不外泄"成立。
+    """
+    from app.routers.reports import _EVIDENCE_FIELDS, evidence_view
+
+    raw = {
+        "external_evidence": [
+            {
+                "server": "soc_intel",
+                "tool": "query",
+                "tool_name": "mcp:soc_intel:query",
+                "label": "外部威胁情报",
+                "untrusted": True,
+                "status": "ok",
+                "rows": 5,
+                "columns": ["host", "score"],
+                "sha256": "1b2d315f7a59",
+                "path": "D:\\somewhere\\private\\external_soc_intel_query.json",
+                "reason": "越权访问 D:\\somewhere\\private",
+            }
+        ]
+    }
+    projected = evidence_view(raw)
+    assert projected and len(projected) == 1
+    assert set(projected[0]) <= set(_EVIDENCE_FIELDS)
+    assert "path" not in projected[0] and "reason" not in projected[0]
+    # `ensure_ascii=False` 是这条断言的前提：默认 True 时中文会被转成 \uXXXX，
+    # 反斜杠来自转义而不是来自路径，那次红就红在量具自己头上（红要先看它红在哪一行）。
+    assert not any("\\" in json.dumps(item, ensure_ascii=False) for item in projected)
+    # 该留的都留着：值班要靠这几格判断"这条结论引了几分不可信的外部数据"
+    assert projected[0]["untrusted"] is True and projected[0]["sha256"] == "1b2d315f7a59"
+
+    assert evidence_view({"status": "success"}) is None, "缺字段是没读到，不是零路"
+    assert evidence_view({"external_evidence": []}) == [], "空列表是事实：这次确实没引用外部数据"
+    assert evidence_view({"external_evidence": "oops"}) is None, "坏形状不许当成空列表念"
+    assert evidence_view(None) is None
+    # 条目里混进非 dict（手改过的产物、将来格式漂移）：跳过它，不是整格作废
+    assert evidence_view({"external_evidence": [{"server": "s"}, "junk", 7]}) == [{"server": "s"}]
 
 
 def test_mock_profit_top3_report_and_image_link():

@@ -100,6 +100,8 @@ def test_progress_stream_does_not_read_the_clock_at_render_time():
         ("views/WorkbenchView.vue", "ui/readout"),
         ("views/WorkbenchView.vue", "ui/packChoice"),
         ("views/WorkbenchView.vue", "ui/analysisSource"),
+        ("views/WorkbenchView.vue", "ui/externalEvidence"),
+        ("views/ReportsView.vue", "ui/externalEvidence"),
     ],
 )
 def test_the_display_authorities_are_wired_in(rel: str, authority: str):
@@ -503,6 +505,82 @@ def test_the_pack_name_on_the_result_card_comes_from_the_server():
     """卡片上要写的是"跑的是什么"，不是"我当时想跑什么"：读 `JobOut.pack` 那一列。"""
     body = source_of("views/WorkbenchView.vue")
     assert "job.pack" in body, "结果卡的包名还来自本地状态：服务端那一份没被读过"
+
+
+# --- 外部（MCP）证据那一格（ui/externalEvidence.ts） --------------------------------
+
+
+@pytest.fixture(scope="module")
+def evidence_values() -> dict[str, object]:
+    return _run_node(
+        "ui/externalEvidence.ts",
+        ("countText", "evidenceSummary", "evidenceLine", "evidenceNeedsAttention"),
+        {
+            "count_missing": "countText(undefined) === '未取得'",
+            "count_null": "countText(null) === '未取得'",
+            "count_zero": "countText(0) === '0 路'",
+            "summary_missing": "evidenceSummary(null)",
+            "summary_empty": "evidenceSummary([])",
+            "summary_two": "evidenceSummary([{ server: 'soc_intel', tool: 'query', untrusted: true, status: 'ok', rows: 5, columns: ['a'], sha256: 'ab12' }, { server: 'x', untrusted: true, status: 'failed' }])",
+            "line_full": "evidenceLine({ server: 'soc_intel', tool: 'query', label: '外部威胁情报', untrusted: true, status: 'ok', rows: 5, columns: ['host', 'score'], sha256: '1b2d31' })",
+            "line_sparse": "evidenceLine({})",
+            "needs_attention_unmarked": "evidenceNeedsAttention([{ server: 'a' }])",
+            "needs_attention_marked": "!evidenceNeedsAttention([{ server: 'a', untrusted: true }])",
+            "needs_attention_none": "!evidenceNeedsAttention(null)",
+        },
+    )
+
+
+def test_two_kinds_of_absence_are_two_different_sentences(evidence_values):
+    """`null` 是没读到、`[]` 是没引用——印成同一句话就等于替这份产物撒了一次谎。"""
+    assert evidence_values["count_missing"] is True and evidence_values["count_null"] is True
+    assert evidence_values["count_zero"] is True
+    assert "未取得" in str(evidence_values["summary_missing"])
+    assert "没有引用外部数据" in str(evidence_values["summary_empty"])
+    assert str(evidence_values["summary_missing"]) != str(evidence_values["summary_empty"])
+
+
+def test_the_evidence_summary_counts_untrusted_and_failed(evidence_values):
+    summary = str(evidence_values["summary_two"])
+    assert "引用 2 路" in summary
+    assert "2 路标着不可信" in summary
+    assert "1 路取失败" in summary, "取失败那一路不许从计数里蒸发"
+
+
+def test_an_evidence_line_never_prints_a_missing_number_as_zero(evidence_values):
+    line = str(evidence_values["line_full"])
+    assert "外部威胁情报" in line and "5 行" in line and "2 列" in line and "1b2d31" in line
+    assert "不可信" in line
+    sparse = str(evidence_values["line_sparse"])
+    for phrase in ("行数未取得", "列数未取得", "指纹未取得", "来源未标注"):
+        assert phrase in sparse, f"缺字段时要说『{phrase}』，不许留空也不许印 0：{sparse}"
+    assert "未标注不可信" in sparse, "没标 untrusted 不等于可信"
+
+
+def test_unmarked_evidence_is_flagged_for_attention(evidence_values):
+    assert evidence_values["needs_attention_unmarked"] is True
+    assert evidence_values["needs_attention_marked"] is True
+    assert evidence_values["needs_attention_none"] is True
+
+
+def test_evidence_authority_is_wired_into_both_report_surfaces():
+    """接线：报告详情弹窗与工作台结果卡都用同一个渲染单点，且读的是接口那一格。"""
+    for rel, field in (("views/ReportsView.vue", "data.external_evidence"),
+                       ("views/WorkbenchView.vue", "report.external_evidence")):
+        body = source_of(rel)
+        assert 'from "../ui/externalEvidence"' in body, f"{rel} 没 import 证据渲染单点"
+        assert field in body, f"{rel} 没读接口的 external_evidence：那一栏是空的或编的"
+
+
+def test_no_view_renders_an_evidence_path():
+    """白名单投影已经把 `path` 摘掉了；界面这边也不许自己找它——找得到就是接口漏了。
+
+    这条是文本守卫，故意只守"点号取 path"这一个形状：它的价值在于接口哪天加回这个字段时
+    界面不会跟着把服务器绝对路径印出来（#15 撤 `report_path` 是同一件事的前半段）。
+    """
+    for rel in ("views/ReportsView.vue", "views/WorkbenchView.vue", "ui/externalEvidence.ts"):
+        body = source_of(rel)
+        assert not re.search(r"\b(item|row|line|evidence|entry)\.path\b", body), f"{rel} 在渲染证据里的 path"
 
 
 def test_a_run_row_exposes_which_pack_executed_it():

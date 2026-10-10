@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,6 +21,52 @@ router = APIRouter(prefix="/api", tags=["reports"])
 def _valid_run_id(run_id: str) -> str:
     """run_id 来自 URL，进文件路径前先按生成规则收紧，杜绝 `..` 与任意段。"""
     return paths.validate_run_id(run_id)
+
+
+# 外部证据往外给哪些字段是**白名单**，不是把产物里那条原样递出去：那条里有 `path`
+# （服务器绝对路径，产物落在哪棵树上），它与 #15 撤掉 `report_path` 是同一件事。
+# 白名单另一条好处是默认方向：将来条目里新增字段（新的存储位置、原始 query、失败原因），
+# 不点名就不外泄。`reason` 故意不在名单里——它是 `str(error)[:300]`，里面可能夹着路径。
+_EVIDENCE_FIELDS = (
+    "server",
+    "tool",
+    "tool_name",
+    "label",
+    "untrusted",
+    "status",
+    "rows",
+    "columns",
+    "sha256",
+)
+
+
+def evidence_view(evaluation: Any) -> list[dict[str, Any]] | None:
+    """把产物里的外部证据投影成接口能给的那一份。
+
+    两种"没有"必须分开：**None = 这份产物里没读到这个字段**（老产物、读失败、JSON 坏了），
+    **[] = 这次分析确实没引用任何外部数据**。把前者印成后者等于说"它没查外部情报"，
+    而真相是"这一份我们不知道"——与 `0` 和 `没量到` 是同一条账。
+    """
+    if not isinstance(evaluation, dict):
+        return None
+    raw = evaluation.get("external_evidence")
+    if not isinstance(raw, list):
+        return None
+    return [
+        {key: item[key] for key in _EVIDENCE_FIELDS if key in item}
+        for item in raw
+        if isinstance(item, dict)
+    ]
+
+
+def _read_evaluation(run_dir: Path) -> Any:
+    """读那一份 evaluation.json。大产物要付钱：1M 行那一跑的这文件实测 13,115,455 字节，
+    所以这一格只在"有人真打开这条 run 的报告"时读一次；列表侧复用 `_user_runs` 已经读过的那份。
+    """
+    try:
+        return json.loads((run_dir / "evaluation.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
@@ -48,6 +95,7 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
             evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
+        evidence = evidence_view(evaluation)
         runs.append(
             {
                 "run_id": evaluation.get("run_id", run_id),
@@ -63,6 +111,10 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
                 # 而缺一个时不许拿另一个补：这里的 null 是事实（这次运行确实没挂包），
                 # 因为 CLI 直跑产生的 run 没有作业行，本来就不在这张列表里。
                 "pack": row.get("pack"),
+                # 列表侧只给"几路外部数据"这一个数，不给整条证据：这一屏可能有几百行，
+                # 把每条的列名与 sha 都带出来就等于再造一个 13 MB。null 仍然是"没读到"，
+                # 不是"零路"——后者要等详情那一格（`/api/reports/{run_id}`）给完整列表时才算数。
+                "external_count": None if evidence is None else len(evidence),
                 "created_at": row.get("created_at"),
                 # 协作列表要能分清"我跑的"与"同事跑的"。这里给布尔而不是对方的 user_id：
                 # 列出别人的内部标识对使用者没有意义，却是一次信息外泄。
@@ -135,6 +187,9 @@ def get_report(run_id: str, user: dict = Depends(get_current_user)) -> dict:
         "run_id": run_id,
         "content": _normalize_report_links(run_id, content, token),
         "media_expires_in": MEDIA_TOKEN_TTL_SECONDS,
+        # 这一页引用了几路外部数据、各自可不可信——报告正文里那句话是给人读的，
+        # 结构化这一格才是界面能标色的那一份。null 是"这份产物里没读到"，不是"没引用"。
+        "external_evidence": evidence_view(_read_evaluation(report_path.parent)),
     }
 
 
