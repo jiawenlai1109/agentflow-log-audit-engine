@@ -41,16 +41,6 @@ export function packFacts(pack: PackInfo | undefined): string {
   return `${subject}必需列（判定以后端 preflight 为准）：${columns}`;
 }
 
-/** 带包就不挂会话：`pack` 与 `session_id` 一起发给后端是 422，不是"忽略其中一个"。
- *
- *  理由记在 `tests/test_packs_api.py:384`——会话只绑单文件数据集，而允许"带包的续轮"就等于
- *  第二轮静默丢掉场景口径（第一轮按包跑分诊、第二轮按自由分析跑，两轮的判据不是一件事）。
- *  所以这里不是"顺手不发会话"，是把一次会被拒的组合改成一次能跑的组合。
- */
-export function sessionForPack(selectedPack: string | undefined, session: string | undefined): string | undefined {
-  return selectedPack ? undefined : session;
-}
-
 /** 装载失败的目录：后端不静默隐藏（`packs.py:37` 那句理由），界面这一侧也不许把它蒸发掉。 */
 export function brokenPackNote(broken: unknown): string {
   if (!Array.isArray(broken) || broken.length === 0) return "";

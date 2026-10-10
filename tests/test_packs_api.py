@@ -202,6 +202,12 @@ def test_bundle_plus_pack_runs_the_triage_scenario_end_to_end(workspace, owner):
         # 包名进了事实层才算数：只写进 jobs 表的话，产物本身仍回答不了"这是哪套规则的产出"
         assert evaluation["skills"] is not None, "能力面留痕不许因为走 Web 就少一段"
 
+        # 历史页那一格读的是 `/api/runs`：这里不带出包名，界面上"哪次跑的是分诊"就永远分不开
+        # （前端 `ReportsView` 那一列直接依赖这条，所以断言写在后端这一侧）。
+        runs = client.get("/api/runs").json()
+        row = next(item for item in runs if str(item["run_id"]) == str(finished["run_id"]))
+        assert row["pack"] == "sigma_triage", f"runs 列表没带包名：{row}"
+
 
 def test_login_pack_runs_on_a_single_dataset(workspace, owner):
     """dataset 分支也通：包与单文件数据集的列匹配用的是同一套判据。"""
@@ -402,6 +408,34 @@ def test_pack_plus_session_is_rejected_with_a_reason(workspace, owner):
         assert response.status_code == 422, response.text
         # pydantic 的校验错误是结构化列表，要按原文找原因而不是猜 detail 的形状
         assert "会话" in json.dumps(response.json(), ensure_ascii=False)
+
+
+def test_bundle_plus_session_is_rejected_because_the_follow_up_would_switch_source(workspace, owner):
+    """多源包 + 会话 = 422。第一轮读三张表、第二轮在同一对话里读 `sessions.dataset_path`
+    那一个文件——**换掉的是数据源本身**，而界面看上去还是同一个会话。比直接拒危险，所以拒。
+    与上面那条 pack 的互斥是同一条形状，两条判据都只在 `app/schemas.py` 的校验器里写一次。
+    """
+    with TestClient(app) as client:
+        _login(client, "p_owner", "p-owner-pw-1")
+        bundle_id = _upload_triple(client)
+        dataset_id = _seed_dataset(client, LOGIN_CSV)
+        session_id = client.post(
+            "/api/sessions", json={"title": "t", "dataset_id": dataset_id}
+        ).json()["session_id"]
+        response = client.post(
+            "/api/analyze",
+            json={"question": "三源分诊", "bundle_id": bundle_id, "mode": "mock", "session_id": session_id},
+        )
+        assert response.status_code == 422, response.text
+        assert "会话" in json.dumps(response.json(), ensure_ascii=False)
+
+        # 同一个包 + 同一个多源包，不带会话就该被受理：这条防的是"互斥写过头"
+        # 把多源分析整条堵死（那等于用一条新闸门换掉整个主场景）。
+        ok = client.post(
+            "/api/analyze",
+            json={"question": "三源分诊", "bundle_id": bundle_id, "mode": "mock", "pack": "sigma_triage"},
+        )
+        assert ok.status_code == 200, ok.text
 
 
 def test_intruder_cannot_borrow_owners_bundle_with_a_pack(workspace, owner, intruder):

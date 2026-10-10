@@ -34,7 +34,7 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
     """
     sql, params = access.scope(user)
     rows = query(
-        "SELECT run_id, user_id, org_id, question, status, created_at FROM jobs "
+        "SELECT run_id, user_id, org_id, question, status, created_at, pack FROM jobs "
         f"WHERE 1{sql} AND run_id IS NOT NULL ORDER BY id DESC",
         params,
     )
@@ -58,6 +58,11 @@ def _user_runs(user: dict[str, Any]) -> list[dict[str, Any]]:
                 "chart_success": evaluation.get("chart_success"),
                 "critic_pass": evaluation.get("critic_pass"),
                 "degraded_reason": evaluation.get("degraded_reason"),
+                # 跑的是哪个场景：取**作业行**那一列，而不是 evaluation.json 里的 pack 对象——
+                # 前者是"受理时接受了什么"，后者是"引擎真装上了什么"。两个都在时它们应当相等，
+                # 而缺一个时不许拿另一个补：这里的 null 是事实（这次运行确实没挂包），
+                # 因为 CLI 直跑产生的 run 没有作业行，本来就不在这张列表里。
+                "pack": row.get("pack"),
                 "created_at": row.get("created_at"),
                 # 协作列表要能分清"我跑的"与"同事跑的"。这里给布尔而不是对方的 user_id：
                 # 列出别人的内部标识对使用者没有意义，却是一次信息外泄。

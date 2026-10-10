@@ -32,6 +32,14 @@
         </template>
       </el-table-column>
       <el-table-column prop="question" label="问题" min-width="180" />
+      <el-table-column label="场景包" min-width="120">
+        <template #default="{ row }">
+          <!-- null 在这里是事实而不是"没读到"：这张列表只来自 jobs 表，CLI 直跑的产物
+               压根不在列表里（默认拒绝），所以没有"其实是包但没记下来"那第三种状态。 -->
+          <el-tag v-if="row.pack" size="small" type="info">{{ row.pack }}</el-tag>
+          <span v-else class="scope-note">不挂包</span>
+        </template>
+      </el-table-column>
       <el-table-column label="状态" min-width="110">
         <template #default="{ row }">
           <el-tag :type="tone(row.status)" size="small" :title="tooltip(row.status)">

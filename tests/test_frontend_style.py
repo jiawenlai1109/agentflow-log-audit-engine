@@ -99,6 +99,7 @@ def test_progress_stream_does_not_read_the_clock_at_render_time():
         ("views/ReportsView.vue", "ui/status"),
         ("views/WorkbenchView.vue", "ui/readout"),
         ("views/WorkbenchView.vue", "ui/packChoice"),
+        ("views/WorkbenchView.vue", "ui/analysisSource"),
     ],
 )
 def test_the_display_authorities_are_wired_in(rel: str, authority: str):
@@ -365,7 +366,7 @@ def test_report_viewer_uses_the_demoting_authority():
 def pack_values() -> dict[str, object]:
     return _run_node(
         "ui/packChoice.ts",
-        ("NO_PACK", "packPayload", "packLabel", "packFacts", "brokenPackNote", "sessionForPack"),
+        ("NO_PACK", "packPayload", "packLabel", "packFacts", "brokenPackNote"),
         {
             "omitted_undefined": "packPayload(undefined) === undefined",
             "omitted_null": "packPayload(null) === undefined",
@@ -377,10 +378,6 @@ def pack_values() -> dict[str, object]:
             "label_unknown": "packLabel({ name: 'login_audit' })",
             "facts_none": "packFacts(undefined)",
             "facts_columns": "packFacts({ name: 'x', required_columns: ['time', 'src_ip'] })",
-            "pack_kills_session": "sessionForPack('login_audit', 's1') === undefined",
-            "no_pack_keeps_session": "sessionForPack(undefined, 's1') === 's1'",
-            "empty_pack_keeps_session": "sessionForPack('', 's1') === 's1'",
-            "no_session_stays_no_session": "sessionForPack(undefined, undefined) === undefined",
             "broken_none": "brokenPackNote([])",
             "broken_one": "brokenPackNote([{ dir: 'zz', reason: 'rules.yaml 少一行' }])",
             "broken_reasonless": "brokenPackNote([{}])",
@@ -428,19 +425,92 @@ def test_workbench_sends_the_chosen_pack(pack_values):
     body = source_of("views/WorkbenchView.vue")
     assert "packPayload(pack.value)" in body, "Workbench 没把选择器的值过一遍单点：空串会直接进载荷"
     assert "pack: usedPack," in body, "analyze 的载荷里没有 pack 这一格：选择器是个装饰"
-    assert "sessionForPack(usedPack" in body, "提交前没过互斥单点：pack + session_id 一起发是后端明令的 422"
+    assert "sessionPayload(sessionAllowedNow.value" in body, (
+        "提交前没过会话单点：pack/多源包 + session_id 一起发是后端明令的 422"
+    )
 
 
-def test_a_packed_run_never_carries_a_session(pack_values):
-    """`pack` 与 `session_id` 同时出现是 422（`tests/test_packs_api.py:384` 那条用例连着理由）。
+@pytest.fixture(scope="module")
+def source_values() -> dict[str, object]:
+    return _run_node(
+        "ui/analysisSource.ts",
+        ("SOURCE_KINDS", "sourcePayload", "bundleLabel", "bundleUsable", "bundleBlockedReason",
+         "sessionAllowed", "sessionPayload", "sessionBlockedReason"),
+        {
+            "kinds": "SOURCE_KINDS.map(k => k.value).join(',')",
+            "dataset_only": "JSON.stringify(sourcePayload('dataset', 7, 'bd_1'))",
+            "bundle_only": "JSON.stringify(sourcePayload('bundle', 7, 'bd_1'))",
+            "bundle_blank_id": "JSON.stringify(sourcePayload('bundle', 7, ''))",
+            "label_counts": "bundleLabel({ bundle_id: 'bd_1', name: '三源', table_count: 3, file_count: 3 })",
+            "label_unknown": "bundleLabel({ bundle_id: 'bd_2' })",
+            "ready_ok": "bundleUsable({ bundle_id: 'x', status: 'ready' })",
+            "parsing_blocked": "!bundleUsable({ bundle_id: 'x', status: 'parsing' })",
+            "failed_reason": "bundleBlockedReason({ bundle_id: 'x', status: 'failed' })",
+            "pack_blocks_session": "!sessionAllowed('dataset', true)",
+            "bundle_blocks_session": "!sessionAllowed('bundle', false)",
+            "plain_allows_session": "sessionAllowed('dataset', false)",
+            "session_dropped": "sessionPayload(false, 's1') === undefined",
+            "session_kept": "sessionPayload(true, 's1') === 's1'",
+            "reason_pack": "sessionBlockedReason('dataset', true)",
+            "reason_bundle": "sessionBlockedReason('bundle', false)",
+        },
+    )
 
-    界面上这条不是风格问题：工作台原本"没会话就顺手建一个"，配上包之后**每一次带包的提交都会被拒**，
-    而后端拒得很正确——会话只绑单文件数据集，允许带包的续轮等于第二轮静默换掉场景口径。
+
+def test_only_the_chosen_source_leaves_the_browser(source_values):
+    """切了数据源，另一种的残留值不许跟着发出去——后端的判据是"只许给一个"（`schemas.py`）。
+
+    留着旧 `dataset_id` 一起发是 422；更坏的一种是后端哪天改成"先到先得"，用户以为在跑三张表，
+    实际跑的是那张单文件。所以这里断言的是**出去的形状**，不是界面显示什么。
     """
-    assert pack_values["pack_kills_session"] is True
-    assert pack_values["no_pack_keeps_session"] is True
-    assert pack_values["empty_pack_keeps_session"] is True, "空串在载荷里等于不挂包，会话不该被它一起带走"
-    assert pack_values["no_session_stays_no_session"] is True
+    assert source_values["kinds"] == "dataset,bundle"
+    assert source_values["dataset_only"] == '{"dataset_id":7}'
+    assert source_values["bundle_only"] == '{"bundle_id":"bd_1"}'
+    assert source_values["bundle_blank_id"] == "{}", "空串不算一个 bundle id：宁可缺键，不要发一个查无此物的 id"
+
+
+def test_unready_bundles_are_named_but_not_selectable(source_values):
+    """还在解析/解析失败的包留在列表里说清楚，不许从界面上蒸发（蒸发＝"没有这个包"）。"""
+    assert source_values["ready_ok"] is True
+    assert source_values["parsing_blocked"] is True
+    assert "解析失败" in str(source_values["failed_reason"])
+    assert "表数未取得" in str(source_values["label_unknown"]), "没给的数不许印成 0"
+
+
+def test_a_packed_or_multitable_run_never_carries_a_session(source_values):
+    """两条互斥都在后端：pack + session（`test_packs_api.py:384`）、bundle + session（本轮新加）。
+
+    共同的理由是会话续轮读 `sessions.dataset_path`：带包的第二轮换掉**场景口径**，
+    带多源包的第二轮换掉**数据源本身**，而界面看上去还是同一个对话。
+    """
+    assert source_values["pack_blocks_session"] is True
+    assert source_values["bundle_blocks_session"] is True
+    assert source_values["plain_allows_session"] is True
+    assert source_values["session_dropped"] is True
+    assert source_values["session_kept"] is True
+    assert "不挂会话" in str(source_values["reason_pack"])
+    assert "数据源" in str(source_values["reason_bundle"])
+
+
+def test_the_session_rule_is_computed_in_one_place():
+    """判据只许有一份：视图里只准调一次 `sessionAllowed`，别处再算就是第二套口径。"""
+    body = source_of("views/WorkbenchView.vue")
+    assert body.count("sessionAllowed(") == 1, "视图里自己算了一遍会话能不能挂：两处迟早分叉"
+    assert ':disabled="!sessionAllowedNow"' in body, "会话那一格没接单点的结论（灰不灰由界面自己瞎判）"
+
+
+def test_the_pack_name_on_the_result_card_comes_from_the_server():
+    """卡片上要写的是"跑的是什么"，不是"我当时想跑什么"：读 `JobOut.pack` 那一列。"""
+    body = source_of("views/WorkbenchView.vue")
+    assert "job.pack" in body, "结果卡的包名还来自本地状态：服务端那一份没被读过"
+
+
+def test_a_run_row_exposes_which_pack_executed_it():
+    """后端那一格：`/api/runs` 不带 pack 的话，历史页永远分不开"普通分析"与"分诊"。"""
+    source = (ROOT / "app" / "routers" / "reports.py").read_text(encoding="utf-8")
+    assert "run_id, user_id, org_id, question, status, created_at, pack FROM jobs" in source, (
+        "runs 那条 SELECT 没取 pack：列表里的 pack 只能是编的"
+    )
 
 
 @pytest.mark.parametrize("rel", VIEW_FILES)

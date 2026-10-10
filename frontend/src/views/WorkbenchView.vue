@@ -2,9 +2,25 @@
   <div>
     <h1 class="page-title">分析工作台</h1>
     <el-form inline class="submit-form">
-      <el-form-item label="数据集">
-        <el-select v-model="dataset_id" placeholder="选择数据集" class="f-dataset">
+      <el-form-item label="数据源">
+        <el-radio-group v-model="sourceKind" size="small" aria-label="数据源类型">
+          <el-radio-button v-for="kind in SOURCE_KINDS" :key="kind.value" :value="kind.value">
+            {{ kind.label }}
+          </el-radio-button>
+        </el-radio-group>
+      </el-form-item>
+      <el-form-item :label="sourceKind === 'bundle' ? '多源包' : '数据集'">
+        <el-select v-if="sourceKind === 'dataset'" v-model="dataset_id" placeholder="选择数据集" class="f-dataset">
           <el-option v-for="d in datasets" :key="d.id" :label="`${d.filename}（${d.row_count}行）`" :value="d.id" />
+        </el-select>
+        <el-select v-else v-model="bundle_id" placeholder="选择多源包" class="f-dataset">
+          <el-option
+            v-for="b in bundles"
+            :key="b.bundle_id"
+            :label="`${bundleLabel(b)}${bundleUsable(b) ? '' : '・' + bundleBlockedReason(b)}`"
+            :value="b.bundle_id"
+            :disabled="!bundleUsable(b)"
+          />
         </el-select>
       </el-form-item>
       <el-form-item label="场景包">
@@ -16,10 +32,10 @@
       <el-form-item label="会话">
         <el-select
           v-model="session_id"
-          :placeholder="pack !== NO_PACK ? '带包时不挂会话' : '选择会话（默认新建）'"
+          :placeholder="sessionAllowedNow ? '选择会话（默认新建）' : '这一轮不挂会话'"
           clearable
           class="f-session"
-          :disabled="pack !== NO_PACK"
+          :disabled="!sessionAllowedNow"
         >
           <el-option v-for="s in sessions" :key="s.session_id" :label="s.title" :value="s.session_id" />
         </el-select>
@@ -45,12 +61,14 @@
       </el-form-item>
     </el-form>
     <div class="pack-facts" role="note">
+      <span v-if="sourceNote">｜{{ sourceNote }}</span>
       <span>{{ packFactsText }}</span>
       <span v-if="packBroken">｜{{ packBroken }}</span>
-      <!-- 包与会话在后端是互斥的（`tests/test_packs_api.py:384` 记着理由），所以这句话
-           不是提示而是解释"会话那一格为什么灰了"——不说，用户以为自己选错了什么。 -->
-      <span v-if="packSessionNote">｜{{ packSessionNote }}</span>
-      <!-- 这一格只在"这一次会建新会话"时出现。选了已有会话或带包（不建会话）时它是装饰——
+      <!-- 包与会话、多源包与会话在后端都是互斥的（`tests/test_packs_api.py:384`、
+           `app/schemas.py` 的 `_exactly_one_source`），所以这句话不是提示，
+           是解释"会话那一格为什么灰了"——不说，用户以为自己选错了什么。 -->
+      <span v-if="sessionBlockedNote">｜{{ sessionBlockedNote }}</span>
+      <!-- 这一格只在"这一次会建新会话"时出现。选了已有会话、或这一轮根本不建会话时它是装饰——
            装一个不生效的输入框，比不装更难发现。 -->
       <span v-if="creatingSession">｜会话名字：{{ sessionTitleHint }}</span>
     </div>
@@ -146,13 +164,31 @@ import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
 import { num } from "../ui/readout";
-import { NO_PACK, brokenPackNote, packFacts, packLabel, packPayload, sessionForPack } from "../ui/packChoice";
+import { NO_PACK, brokenPackNote, packFacts, packLabel, packPayload } from "../ui/packChoice";
+import {
+  SOURCE_KINDS,
+  bundleBlockedReason,
+  bundleLabel,
+  bundleUsable,
+  sessionAllowed,
+  sessionBlockedReason,
+  sessionPayload,
+  sourcePayload,
+  type SourceKind,
+} from "../ui/analysisSource";
 import { TITLE_LIMIT, sessionTitle, titleHint } from "../ui/sessionTitle";
 
 const route = useRoute();
 const datasets = ref<any[]>([]);
 const sessions = ref<any[]>([]);
 const dataset_id = ref<number | undefined>(undefined);
+// 数据源两种：单文件数据集（datasets 表）与多源包（bundles 表，三源分诊要的就是这个）。
+// 后端只许给一个（`schemas.py:_exactly_one_source`），所以两者各存自己的 id，
+// 发出去之前过 `sourcePayload`——换了源另一边必须留 undefined，不许把 0 或空串带进载荷。
+const sourceKind = ref<SourceKind>("dataset");
+const bundles = ref<any[]>([]);
+const bundlesLoaded = ref(false);
+const bundle_id = ref<string | undefined>(undefined);
 const session_id = ref<string | undefined>((route.query.session as string) || undefined);
 const mode = ref("mock");
 const question = ref("");
@@ -172,13 +208,21 @@ const selectedPack = computed(() => packs.value.find((p: any) => p.name === pack
 const packFactsText = computed(() =>
   packLoaded.value ? packFacts(selectedPack.value) : "场景包名单未取得（接口不可用或未登录）",
 );
-const packSessionNote = computed(() =>
-  pack.value !== NO_PACK ? "带包时这一轮不挂会话：结果照样进本页与历史页，但不进会话树" : "",
-);
+// 会话这一格什么时候真的能用：单文件数据集 + 不带包。判据不在这里重写，读 `ui/analysisSource`。
+const sessionAllowedNow = computed(() => sessionAllowed(sourceKind.value, pack.value !== NO_PACK));
+const sessionBlockedNote = computed(() => sessionBlockedReason(sourceKind.value, pack.value !== NO_PACK));
+// 源没读到时不许显示成"一个包都没有"；读到了但确实是空的，才说"还没上传过"。
+const sourceNote = computed(() => {
+  if (sourceKind.value !== "bundle") return "";
+  if (!bundlesLoaded.value) return "多源包名单未取得（接口不可用或未登录）";
+  if (bundles.value.length === 0) return "还没有多源包：到「数据管理」页一次上传几张表（如 auth + assets + edr）";
+  const ready = bundles.value.filter((b: any) => bundleUsable(b)).length;
+  return ready === 0 ? `这 ${bundles.value.length} 个包现在都不能跑（还在解析或解析失败）` : "";
+});
 
 // 会话名字：只在会真的建出会话的那一刻用（选了已有会话、或带包不建会话时这一格根本不出现）。
 const sessionTitleDraft = ref("");
-const creatingSession = computed(() => !session_id.value && pack.value === NO_PACK);
+const creatingSession = computed(() => !session_id.value && sessionAllowedNow.value);
 const sessionTitleHint = computed(() => titleHint(sessionTitleDraft.value, { question: question.value }));
 
 async function loadPacks() {
@@ -191,6 +235,17 @@ async function loadPacks() {
     packs.value = [];
     packBroken.value = "";
     packLoaded.value = false; // 读不到就是读不到，别让它显示成"一个包都没有"
+  }
+}
+
+async function loadBundles() {
+  try {
+    const { data } = await api.listBundles();
+    bundles.value = data;
+    bundlesLoaded.value = true;
+  } catch {
+    bundles.value = [];
+    bundlesLoaded.value = false;
   }
 }
 
@@ -327,18 +382,23 @@ async function loadHistory() {
 
 async function showResult(entry: any, jobId: string) {
   const { data: job } = await api.getJob(jobId);
+  // 包名读**服务端那一份**（`JobOut.pack`，就是作业行上的那一列），不读我提交时记的本地值：
+  // 本地那份是"我要什么"，这一格要的是"跑的是什么"。两者不等时该被看见的是后者。
+  const ran = { pack: job.pack ?? null, packKnown: true };
   if (job.run_id) {
     const { data: report } = await api.getReport(job.run_id);
-    messages.value.push({ ...entry, run_id: job.run_id, answer_summary: "", report: report.content });
+    messages.value.push({ ...entry, ...ran, run_id: job.run_id, answer_summary: "", report: report.content });
     return job.status;
   }
-  messages.value.push({ ...entry, error: job.error || "分析失败（无详细信息）" });
+  messages.value.push({ ...entry, ...ran, error: job.error || "分析失败（无详细信息）" });
   return job.status;
 }
 
 async function submit() {
-  if (!dataset_id.value) {
-    ElMessage.warning("请先选择数据集");
+  // 数据源在提交这一刻才算一次，两个 id 里只留当前那种（后端的判据是"只许给一个"）
+  const source = sourcePayload(sourceKind.value, dataset_id.value, bundle_id.value);
+  if (!source.dataset_id && !source.bundle_id) {
+    ElMessage.warning(sourceKind.value === "bundle" ? "请先选择多源包" : "请先选择数据集");
     return;
   }
   if (!question.value.trim()) {
@@ -358,10 +418,9 @@ async function submit() {
   // 网络抖一下由 api 重试，还是这个按钮被连点两次，对后端来说形状一样，对你是不是同一个作业不一样。
   const submissionKey = newIdempotencyKey();
   try {
-    // 带包时不再自动建会话：原先这条链是"没会话就顺手建一个，然后把 session_id 发出去"，
-    // 配上包就成了"pack + session_id 一起发"——那是后端明令 422 的组合。
-    // 这一轮的结果照样进本页与历史页，只是不进会话树。
-    if (!session_id.value && !usedPack) {
+    // 这一轮真会建会话时才建：带包或带多源包时后端都不要 session_id（两条互斥都写在
+    // `app/schemas.py` 的校验器里），而会话本身只绑单文件数据集，没有 bundle 可绑。
+    if (!session_id.value && sessionAllowedNow.value) {
       // 名字的优先级收在单点里：自己写的 > 问题前 20 字 > 默认（原先只有第二种）
       const { data } = await api.createSession({
         title: sessionTitle(sessionTitleDraft.value, { question: asked, at: new Date() }),
@@ -370,11 +429,12 @@ async function submit() {
       session_id.value = data.session_id;
       loadSessions();
     }
-    const usedSession = sessionForPack(usedPack, session_id.value);
+    const usedSession = sessionPayload(sessionAllowedNow.value, session_id.value);
     const { data } = await api.analyze(
       {
         question: asked,
-        dataset_id: dataset_id.value,
+        // 当前是哪种源就只给那一个 id，另一个整个键不发
+        ...source,
         mode: usedMode,
         session_id: usedSession,
         // 不挂包时这个键整个不发（undefined 会被 axios 丢掉）——发空串会被后端判成 422
@@ -411,7 +471,7 @@ async function submit() {
         },
       },
     );
-    const status = await showResult({ question: asked, mode: usedMode, pack: usedPack ?? null, packKnown: true }, jobId);
+    const status = await showResult({ question: asked, mode: usedMode, kind: sourceKind.value, pack: usedPack ?? null, packKnown: true }, jobId);
     // 只有真跑完才清问题输入。原先是无条件清：失败那一支把用户刚打的问法一起抹掉，
     // 而错误卡上又没有任何重跑入口——等于"失败了，我把你的现场也收走了"。
     if (status === "success") question.value = "";
@@ -437,7 +497,7 @@ async function submit() {
       // 429 是一种**结果**，不是崩溃：走到这里说明客户端已按服务端的 Retry-After 重试过还是被拒。
       // 混进"提交失败"里，值班看到的是一处故障，而实际是配额或入口限流在起作用。
       const label = status === 429 ? `被拦下（配额或入口限流，已按建议重试过）：${reason}` : reason;
-      messages.value.push({ question: asked, mode: usedMode, pack: usedPack ?? null, packKnown: true, error: label });
+      messages.value.push({ question: asked, mode: usedMode, kind: sourceKind.value, pack: usedPack ?? null, packKnown: true, error: label });
       if (status === 429) ElMessage.warning(label);
       else ElMessage.error(label);
       loadPlatform(); // 被拦下时顺便回读一次平台读数：是排队满了还是闸门满了，界面要能说得出
@@ -462,6 +522,9 @@ function rerun(item: any) {
   // 只有这一条记录**知道**自己带的什么包才还原它：历史条目里 `"pack" in item` 不成立，
   // 那时把选择器改成"不挂包"就是拿一个unknown当结论。
   if ("pack" in item) pack.value = item.pack || NO_PACK;
+  // 重跑要连"这一轮用的是哪种数据源"一起还原：只还原问法而把源切回单文件，
+  // 用户看到的是一次一模一样的重跑，实际喂进去的是另一份数据。
+  if (item.kind) sourceKind.value = item.kind;
   submit();
 }
 
@@ -470,6 +533,7 @@ onMounted(async () => {
   datasets.value = data;
   if (data.length > 0) dataset_id.value = data[0].id;
   await loadPacks();
+  await loadBundles();
   await loadLlmStatus();
   await loadPlatform();
   await loadSessions();

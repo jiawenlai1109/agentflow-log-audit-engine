@@ -100,6 +100,14 @@ class AnalyzeRequest(BaseModel):
                 "场景包运行暂不支持会话续轮：会话只绑定单文件数据集（sessions.dataset_path），"
                 "请先不带 session_id 跑包分析"
             )
+        if self.bundle_id and self.session_id:
+            # 与上面那条同一个形状：会话续轮读的是 `sessions.dataset_path`（单文件），
+            # 所以"这一轮用多源包、下一轮还在同一个会话里"会让**数据源本身**被换掉——
+            # 第二轮拿的是另一个文件，而界面看上去像是同一个对话。拒掉比放行安全。
+            raise ValueError(
+                "多源包运行暂不支持会话续轮：会话只绑定单文件数据集（sessions.dataset_path），"
+                "请先不带 session_id 跑多源分析"
+            )
         return self
 
 
