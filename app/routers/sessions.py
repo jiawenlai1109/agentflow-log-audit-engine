@@ -42,6 +42,10 @@ def _owned_session(session_id: str, user: dict) -> dict:
 @router.post("", response_model=SessionOut)
 def create_session(payload: SessionCreateRequest, user: dict = Depends(get_current_user)) -> dict:
     session_id = f"session_{uuid.uuid4().hex[:10]}"
+    # 只敲空格不算名字：照原样入库，列表里就是一个"看不见名字"的会话，而删除确认那一句会念成
+    # 「删除会话“”？」。空白一律退回默认名，且**响应里回的是真正存进库里的那一个**——
+    # 回原文就等于对着用户说"你存的就是这个"，而库里存的不是。
+    title = payload.title.strip() or "新会话"
     dataset_path = None
     if payload.dataset_id:
         # 数据集可以是同企业别人的（SHARED），会话本身仍是私有的
@@ -51,11 +55,11 @@ def create_session(payload: SessionCreateRequest, user: dict = Depends(get_curre
         dataset_path = dataset["path"]
     execute(
         "INSERT INTO sessions (session_id, user_id, org_id, title, dataset_path) VALUES (?, ?, ?, ?, ?)",
-        (session_id, user["id"], access.primary_org(user), payload.title, dataset_path),
+        (session_id, user["id"], access.primary_org(user), title, dataset_path),
     )
     return {
         "session_id": session_id,
-        "title": payload.title,
+        "title": title,
         "turn_count": 0,
     }
 

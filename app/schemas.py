@@ -104,7 +104,14 @@ class AnalyzeRequest(BaseModel):
 
 
 class SessionCreateRequest(BaseModel):
-    title: str = "新会话"
+    """建会话。`title` 的上限与库里那一列一致（`sessions.title` = String(200)）。
+
+    SQLite 不会因为超长报错，所以**这条界不在数据库上**：不在这里拦，超长名字会照样入库，
+    然后在会话下拉、历史页、工作台被各自截断成三种样子。`frontend/src/ui/sessionTitle.ts`
+    的 `TITLE_LIMIT` 是同一个数——两处同判据，改一处要改两处（这条注释就是防止只改一处）。
+    """
+
+    title: str = Field(default="新会话", max_length=200)
     dataset_id: int | None = None
 
 

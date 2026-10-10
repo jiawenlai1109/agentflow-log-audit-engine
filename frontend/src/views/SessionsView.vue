@@ -1,7 +1,18 @@
 <template>
   <div>
     <h1 class="page-title">会话管理</h1>
-    <el-button type="primary" :loading="creating" @click="create">新建会话</el-button>
+    <div class="create-row">
+      <el-input
+        v-model="titleDraft"
+        class="f-title"
+        :maxlength="TITLE_LIMIT"
+        show-word-limit
+        aria-label="会话名称"
+        placeholder="给这个会话起个名字（可留空）"
+      />
+      <el-button type="primary" :loading="creating" @click="create">新建会话</el-button>
+    </div>
+    <div class="title-hint" role="note">{{ titleHint(titleDraft) }}</div>
     <el-table :data="sessions" style="margin-top: 16px">
       <el-table-column prop="session_id" label="session_id" min-width="200" />
       <el-table-column prop="title" label="标题" min-width="160" />
@@ -32,12 +43,14 @@ import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "../api";
+import { TITLE_LIMIT, sessionTitle, titleHint } from "../ui/sessionTitle";
 
 const sessions = ref<any[]>([]);
 const messages = ref<any[]>([]);
 const messagesVisible = ref(false);
 const current = ref<any>(null);
 const creating = ref(false);
+const titleDraft = ref("");
 const router = useRouter();
 
 async function refresh() {
@@ -48,13 +61,14 @@ async function refresh() {
 async function create() {
   creating.value = true;
   try {
-    // 标题原先是 `会话 ${Date.now()}`：把一串 epoch 当名字存进库里，之后在会话下拉、
-    // 历史页、工作台每一处都要读"会话 1759... "。名字给人看，就按人读得懂的方式给。
-    const { data } = await api.createSession({ title: `未命名会话（${new Date().toLocaleString("zh-CN", { hour12: false })}）` });
-    ElMessage.success("已创建，前往工作台提问");
+    // 名字的单点在 `ui/sessionTitle`：留空不等于发空串（后端会原样存成一个看不见的名字），
+    // 它有明确的回退。时间戳在**建的那一刻**读一次——这是"这件事何时发生"，不是渲染期取"现在"。
+    const { data } = await api.createSession({ title: sessionTitle(titleDraft.value, { at: new Date() }) });
+    titleDraft.value = "";
+    ElMessage.success(`已创建「${data.title}」，前往工作台提问`);
     router.push({ path: "/", query: { session: data.session_id } });
   } catch (caught: any) {
-    ElMessage.error(caught?.message || "新建会话失败");
+    ElMessage.error(caught?.response?.data?.detail || caught?.message || "新建会话失败");
   } finally {
     creating.value = false;
   }
@@ -89,3 +103,21 @@ async function remove(row: any) {
 
 onMounted(refresh);
 </script>
+
+<style scoped>
+.create-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.f-title {
+  width: min(360px, 100%);
+  min-width: 12rem;
+}
+.title-hint {
+  margin: 6px 0 0;
+  font-size: var(--el-font-size-extra-small);
+  color: var(--af-text-secondary);
+}
+</style>

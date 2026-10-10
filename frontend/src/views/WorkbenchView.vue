@@ -24,6 +24,15 @@
           <el-option v-for="s in sessions" :key="s.session_id" :label="s.title" :value="s.session_id" />
         </el-select>
       </el-form-item>
+      <el-form-item v-if="creatingSession" label="会话名称">
+        <el-input
+          v-model="sessionTitleDraft"
+          class="f-title"
+          :maxlength="TITLE_LIMIT"
+          aria-label="会话名称"
+          placeholder="留空则用问题前 20 字"
+        />
+      </el-form-item>
       <el-form-item label="模式">
         <el-select v-model="mode" class="f-mode">
           <el-option label="mock" value="mock" />
@@ -41,6 +50,9 @@
       <!-- 包与会话在后端是互斥的（`tests/test_packs_api.py:384` 记着理由），所以这句话
            不是提示而是解释"会话那一格为什么灰了"——不说，用户以为自己选错了什么。 -->
       <span v-if="packSessionNote">｜{{ packSessionNote }}</span>
+      <!-- 这一格只在"这一次会建新会话"时出现。选了已有会话或带包（不建会话）时它是装饰——
+           装一个不生效的输入框，比不装更难发现。 -->
+      <span v-if="creatingSession">｜会话名字：{{ sessionTitleHint }}</span>
     </div>
     <el-alert
       v-if="llmWarns"
@@ -135,6 +147,7 @@ import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
 import { num } from "../ui/readout";
 import { NO_PACK, brokenPackNote, packFacts, packLabel, packPayload, sessionForPack } from "../ui/packChoice";
+import { TITLE_LIMIT, sessionTitle, titleHint } from "../ui/sessionTitle";
 
 const route = useRoute();
 const datasets = ref<any[]>([]);
@@ -162,6 +175,11 @@ const packFactsText = computed(() =>
 const packSessionNote = computed(() =>
   pack.value !== NO_PACK ? "带包时这一轮不挂会话：结果照样进本页与历史页，但不进会话树" : "",
 );
+
+// 会话名字：只在会真的建出会话的那一刻用（选了已有会话、或带包不建会话时这一格根本不出现）。
+const sessionTitleDraft = ref("");
+const creatingSession = computed(() => !session_id.value && pack.value === NO_PACK);
+const sessionTitleHint = computed(() => titleHint(sessionTitleDraft.value, { question: question.value }));
 
 async function loadPacks() {
   try {
@@ -344,7 +362,11 @@ async function submit() {
     // 配上包就成了"pack + session_id 一起发"——那是后端明令 422 的组合。
     // 这一轮的结果照样进本页与历史页，只是不进会话树。
     if (!session_id.value && !usedPack) {
-      const { data } = await api.createSession({ title: asked.slice(0, 20), dataset_id: dataset_id.value });
+      // 名字的优先级收在单点里：自己写的 > 问题前 20 字 > 默认（原先只有第二种）
+      const { data } = await api.createSession({
+        title: sessionTitle(sessionTitleDraft.value, { question: asked, at: new Date() }),
+        dataset_id: dataset_id.value,
+      });
       session_id.value = data.session_id;
       loadSessions();
     }
@@ -470,6 +492,10 @@ onBeforeUnmount(() => streamController?.abort());
 .f-session {
   width: min(260px, 100%);
   min-width: 10rem;
+}
+.f-title {
+  width: min(220px, 100%);
+  min-width: 9rem;
 }
 .f-mode {
   width: 7rem;

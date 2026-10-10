@@ -96,6 +96,36 @@ def test_full_flow(tmp_path):
         assert len(history.json()) >= 1
 
 
+def test_session_title_is_custom_readable_and_bounded():
+    """会话名字：用户写的要用他的，空白退回默认名，超长在受理层就拒。
+
+    三条各有各的坏法：不 trim 就存进一串带空白的名字；空白照原样入库就是"看不见的会话名"
+    （删除确认会念成「删除会话“”？」）；而 SQLite **不认 VARCHAR 长度**——上限不在这里守，
+    超长名字会照样入库，然后在会话下拉、历史页、工作台被截成三种样子。
+    响应还必须是**真正存进库里的那一个**：回原文等于对用户说"你存的就是这个"而库里不是。
+    """
+    with TestClient(app) as client:
+        _login(client)
+
+        named = client.post("/api/sessions", json={"title": " 生产域三源分诊 "})
+        assert named.status_code == 200, named.text
+        assert named.json()["title"] == "生产域三源分诊"
+
+        blank = client.post("/api/sessions", json={"title": "   "})
+        assert blank.status_code == 200, blank.text
+        assert blank.json()["title"] == "新会话", "空白名字不许原样入库"
+
+        overlong = client.post("/api/sessions", json={"title": "超" * 201})
+        assert overlong.status_code == 422, overlong.text
+
+        listed = {row["session_id"]: row["title"] for row in client.get("/api/sessions").json()}
+        assert listed[named.json()["session_id"]] == "生产域三源分诊"
+        assert listed[blank.json()["session_id"]] == "新会话"
+
+        exact = client.post("/api/sessions", json={"title": "字" * 200})
+        assert exact.status_code == 200, "正好 200 是可用的：上限与那一列同宽，不是随手写的数"
+
+
 def test_mock_profit_top3_report_and_image_link():
     """利润Top3 问题：mock 报告含利润指标，图片链接转为 /outputs/ URL。"""
     with TestClient(app) as client:

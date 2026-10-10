@@ -533,3 +533,62 @@ def test_an_undefined_template_binding_goes_red():
     assert _template_bindings(template) - _script_declarations(script) == {"packBrokenNote"}, (
         "这条下限看不见自己那一族的形状 ⇒ 上面那条是空的"
     )
+
+
+# --- 会话名字（ui/sessionTitle.ts）：优先级、空白、以及那条 200 的字界 ------------------
+
+
+@pytest.fixture(scope="module")
+def title_values() -> dict[str, object]:
+    return _run_node(
+        "ui/sessionTitle.ts",
+        ("TITLE_LIMIT", "sessionTitle", "titleHint"),
+        {
+            "limit": "TITLE_LIMIT",
+            "typed_wins": "sessionTitle('  我的分诊  ') === '我的分诊'",
+            "blank_uses_question": "sessionTitle('   ', { question: '过去7天失败登录最多的源IP是谁？' }) === '过去7天失败登录最多的源IP是谁？'",
+            "question_cut_at_20": "sessionTitle('', { question: 'x'.repeat(40) }).length === 20",
+            "nothing_gives_readable_default": "sessionTitle('', { question: '   ', at: new Date(2026, 9, 10, 8, 9, 10) }).startsWith('未命名会话（')",
+            "overlong_is_cut_to_the_limit": "sessionTitle('y'.repeat(250)).length === TITLE_LIMIT",
+            "hint_typed": "titleHint('甲').includes('你写的这个名字')",
+            "hint_fallback": "titleHint('', { question: '生产域主机的异常告警有哪些？' }).includes('留空则用问题前')",
+            "hint_no_question": "titleHint('', { question: '' }).includes('未命名会话')",
+        },
+    )
+
+
+def test_a_typed_session_name_wins_and_a_blank_one_never_ships(title_values):
+    """空白不算名字：直接发空串，后端会照原样入库，列表里就是一个看不见的会话名。"""
+    assert title_values["typed_wins"] is True
+    assert title_values["blank_uses_question"] is True
+    assert title_values["question_cut_at_20"] is True
+    assert title_values["nothing_gives_readable_default"] is True, "连问题都没有时要给人话，不是发空串也不是 epoch"
+
+
+def test_the_session_name_limit_is_the_same_number_in_three_places(title_values):
+    """界面 maxlength、pydantic 的 max_length、库里那一列的宽度——三个读者一个数。
+
+    SQLite 不认 VARCHAR 长度，超长照样存；真到那一步就是"能输入但存不下"的下一版：
+    同一个名字在下拉、历史页、工作台被截成三种样子。所以这条界必须在受理层就守住。
+    """
+    limit = int(title_values["limit"])
+    assert limit == 200
+    schema = (ROOT / "app" / "schemas.py").read_text(encoding="utf-8")
+    block = schema.split("class SessionCreateRequest", 1)[1].split("class ", 1)[0]
+    assert f"max_length={limit}" in block, f"SessionCreateRequest 的 title 上限不是 {limit}：界面上的字数限制是假的"
+    model = (ROOT / "app" / "models.py").read_text(encoding="utf-8")
+    assert "title: Mapped[str | None] = mapped_column(String(200))" in model, "sessions.title 那一列不是 200 宽"
+
+
+def test_session_title_authority_is_wired_in_both_entry_points(title_values):
+    """建会话有两个入口（工作台顺手建、会话页显式建），单点必须两处都接上。"""
+    for rel in ("views/WorkbenchView.vue", "views/SessionsView.vue"):
+        body = source_of(rel)
+        assert 'from "../ui/sessionTitle"' in body, f"{rel} 没 import 名字单点：优先级会在这里各写一份"
+        assert "sessionTitle(" in body, f"{rel} 建会话时没调用名字单点"
+
+
+def test_session_name_hint_is_told_to_the_user(title_values):
+    assert title_values["hint_typed"] is True
+    assert title_values["hint_fallback"] is True
+    assert title_values["hint_no_question"] is True
