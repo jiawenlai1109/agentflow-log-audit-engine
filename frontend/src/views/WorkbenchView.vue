@@ -7,8 +7,20 @@
           <el-option v-for="d in datasets" :key="d.id" :label="`${d.filename}（${d.row_count}行）`" :value="d.id" />
         </el-select>
       </el-form-item>
+      <el-form-item label="场景包">
+        <el-select v-model="pack" class="f-pack">
+          <el-option label="不挂包（自由分析）" :value="NO_PACK" />
+          <el-option v-for="p in packs" :key="p.name" :label="packLabel(p)" :value="p.name" />
+        </el-select>
+      </el-form-item>
       <el-form-item label="会话">
-        <el-select v-model="session_id" placeholder="选择会话（默认新建）" clearable class="f-session">
+        <el-select
+          v-model="session_id"
+          :placeholder="pack !== NO_PACK ? '带包时不挂会话' : '选择会话（默认新建）'"
+          clearable
+          class="f-session"
+          :disabled="pack !== NO_PACK"
+        >
           <el-option v-for="s in sessions" :key="s.session_id" :label="s.title" :value="s.session_id" />
         </el-select>
       </el-form-item>
@@ -23,6 +35,13 @@
         <el-tag :type="llmTagType" size="small" :title="llmDetail">{{ llmSummary }}</el-tag>
       </el-form-item>
     </el-form>
+    <div class="pack-facts" role="note">
+      <span>{{ packFactsText }}</span>
+      <span v-if="packBroken">｜{{ packBroken }}</span>
+      <!-- 包与会话在后端是互斥的（`tests/test_packs_api.py:384` 记着理由），所以这句话
+           不是提示而是解释"会话那一格为什么灰了"——不说，用户以为自己选错了什么。 -->
+      <span v-if="packSessionNote">｜{{ packSessionNote }}</span>
+    </div>
     <el-alert
       v-if="llmWarns"
       type="warning"
@@ -70,7 +89,13 @@
 
     <div v-for="(item, index) in messages" :key="index" class="message-card">
       <el-card>
-        <div class="message-q">问：{{ item.question }}</div>
+        <div class="message-q">
+          问：{{ item.question }}
+          <el-tag v-if="item.pack" size="small" type="info" class="meta">带包 {{ item.pack }}</el-tag>
+          <span v-else-if="item.packKnown" class="meta">不挂包</span>
+          <!-- 历史条目里两个都没有：`/api/sessions/{id}/messages` 不返回包名，
+               所以那一轮到底带没带包这一页不知道。不知道就两个都不印，别补一个"不挂包"。 -->
+        </div>
         <el-alert
           v-if="item.error"
           type="error"
@@ -109,6 +134,7 @@ import { streamJobEvents } from "../api/sse";
 import AgentProgress from "../components/AgentProgress.vue";
 import ReportViewer from "../components/ReportViewer.vue";
 import { num } from "../ui/readout";
+import { NO_PACK, brokenPackNote, packFacts, packLabel, packPayload, sessionForPack } from "../ui/packChoice";
 
 const route = useRoute();
 const datasets = ref<any[]>([]);
@@ -120,6 +146,35 @@ const question = ref("");
 const running = ref(false);
 const events = ref<any[]>([]);
 const messages = ref<any[]>([]);
+
+// 场景包：名单来自 `GET /api/packs`，界面不自己拼一份（`_available_pack_names()` 在引擎里算，
+// Web 层不另立权威——`app/routers/jobs.py:80` 那句理由同样适用于前端）。
+// `packsLoaded` 这一格是必须的：接口挂了的时候下拉里只剩"不挂包"，那读起来就是"这台系统没有场景包"，
+// 而实际上是"这次没读到"。两者必须长得不一样。
+const packs = ref<any[]>([]);
+const packBroken = ref("");
+const packLoaded = ref(false);
+const pack = ref<string>(NO_PACK);
+const selectedPack = computed(() => packs.value.find((p: any) => p.name === pack.value));
+const packFactsText = computed(() =>
+  packLoaded.value ? packFacts(selectedPack.value) : "场景包名单未取得（接口不可用或未登录）",
+);
+const packSessionNote = computed(() =>
+  pack.value !== NO_PACK ? "带包时这一轮不挂会话：结果照样进本页与历史页，但不进会话树" : "",
+);
+
+async function loadPacks() {
+  try {
+    const { data } = await api.listPacks();
+    packs.value = data.packs || [];
+    packBroken.value = brokenPackNote(data.broken);
+    packLoaded.value = true;
+  } catch {
+    packs.value = [];
+    packBroken.value = "";
+    packLoaded.value = false; // 读不到就是读不到，别让它显示成"一个包都没有"
+  }
+}
 
 // 上游型号的预检结论（只读）。判据来自 scripts/preflight_llm.py 打的那次真实调用，
 // 页面自己不发起调用——一个 GET 请求就烧钱是本项目不接受的形状（缺陷 #14 同一类）。
@@ -274,6 +329,9 @@ async function submit() {
   }
   const asked = question.value;
   const usedMode = mode.value;
+  // 在选择器被用户改动之前就把这一次的值定下来：结果卡上写的包名必须是**那次提交**带的包，
+  // 不是我等我看结果期间顺手换了另一个包。
+  const usedPack = packPayload(pack.value);
   streamController?.abort();
   streamController = new AbortController();
   running.value = true;
@@ -282,17 +340,23 @@ async function submit() {
   // 网络抖一下由 api 重试，还是这个按钮被连点两次，对后端来说形状一样，对你是不是同一个作业不一样。
   const submissionKey = newIdempotencyKey();
   try {
-    if (!session_id.value) {
+    // 带包时不再自动建会话：原先这条链是"没会话就顺手建一个，然后把 session_id 发出去"，
+    // 配上包就成了"pack + session_id 一起发"——那是后端明令 422 的组合。
+    // 这一轮的结果照样进本页与历史页，只是不进会话树。
+    if (!session_id.value && !usedPack) {
       const { data } = await api.createSession({ title: asked.slice(0, 20), dataset_id: dataset_id.value });
       session_id.value = data.session_id;
       loadSessions();
     }
+    const usedSession = sessionForPack(usedPack, session_id.value);
     const { data } = await api.analyze(
       {
         question: asked,
         dataset_id: dataset_id.value,
         mode: usedMode,
-        session_id: session_id.value,
+        session_id: usedSession,
+        // 不挂包时这个键整个不发（undefined 会被 axios 丢掉）——发空串会被后端判成 422
+        pack: usedPack,
       },
       { idempotencyKey: submissionKey, signal: streamController.signal }
     );
@@ -325,7 +389,7 @@ async function submit() {
         },
       },
     );
-    const status = await showResult({ question: asked, mode: usedMode }, jobId);
+    const status = await showResult({ question: asked, mode: usedMode, pack: usedPack ?? null, packKnown: true }, jobId);
     // 只有真跑完才清问题输入。原先是无条件清：失败那一支把用户刚打的问法一起抹掉，
     // 而错误卡上又没有任何重跑入口——等于"失败了，我把你的现场也收走了"。
     if (status === "success") question.value = "";
@@ -343,11 +407,15 @@ async function submit() {
   } catch (err: any) {
     if (err?.name !== "CanceledError" && err?.name !== "AbortError") {
       const status = err?.response?.status;
-      const reason = err?.message || "提交失败";
+      // 后端在 422 的 detail 里说的是"缺哪几列 / 可用的包有哪些 / 需要去哪看约定"
+      // （`jobs.py:98`、`jobs.py:160`）。原先只取 `err.message`，那是 axios 的
+      // "Request failed with status code 422"——等于把最有用的那句话丢了，
+      // 而这条页面上的错误卡本来就该是"当场知道该改什么"（validate_pack 写在派发前就是为了这句）。
+      const reason = err?.response?.data?.detail || err?.message || "提交失败";
       // 429 是一种**结果**，不是崩溃：走到这里说明客户端已按服务端的 Retry-After 重试过还是被拒。
       // 混进"提交失败"里，值班看到的是一处故障，而实际是配额或入口限流在起作用。
       const label = status === 429 ? `被拦下（配额或入口限流，已按建议重试过）：${reason}` : reason;
-      messages.value.push({ question: asked, mode: usedMode, error: label });
+      messages.value.push({ question: asked, mode: usedMode, pack: usedPack ?? null, packKnown: true, error: label });
       if (status === 429) ElMessage.warning(label);
       else ElMessage.error(label);
       loadPlatform(); // 被拦下时顺便回读一次平台读数：是排队满了还是闸门满了，界面要能说得出
@@ -369,6 +437,9 @@ function stopWatching() {
 function rerun(item: any) {
   question.value = item.question;
   if (item.mode) mode.value = item.mode;
+  // 只有这一条记录**知道**自己带的什么包才还原它：历史条目里 `"pack" in item` 不成立，
+  // 那时把选择器改成"不挂包"就是拿一个unknown当结论。
+  if ("pack" in item) pack.value = item.pack || NO_PACK;
   submit();
 }
 
@@ -376,6 +447,7 @@ onMounted(async () => {
   const { data } = await api.listDatasets();
   datasets.value = data;
   if (data.length > 0) dataset_id.value = data[0].id;
+  await loadPacks();
   await loadLlmStatus();
   await loadPlatform();
   await loadSessions();
@@ -386,7 +458,7 @@ onBeforeUnmount(() => streamController?.abort());
 </script>
 
 <style scoped>
-/* 提交区四个下拉原先是 `style="width: 260px"` 这类固定宽度：窄屏上它们不换行、
+/* 提交区这几个下拉原先是 `style="width: 260px"` 这类固定宽度：窄屏上它们不换行、
  * 也压不下长文件名，于是横向溢出。改成 min/max 之间自适应。
  * 深度选择器只用于 el-form-item 的直接控件容器，不越过一层。 */
 .submit-form :deep(.el-form-item) {
@@ -394,6 +466,7 @@ onBeforeUnmount(() => streamController?.abort());
   margin-bottom: 8px;
 }
 .f-dataset,
+.f-pack,
 .f-session {
   width: min(260px, 100%);
   min-width: 10rem;
@@ -426,5 +499,18 @@ onBeforeUnmount(() => streamController?.abort());
 .message-q {
   font-weight: 600;
   margin-bottom: 8px;
+}
+.pack-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 12px;
+  font-size: var(--el-font-size-extra-small);
+  color: var(--af-text-secondary);
+}
+.meta {
+  font-size: var(--el-font-size-extra-small);
+  color: var(--af-text-secondary);
+  font-weight: 400;
 }
 </style>

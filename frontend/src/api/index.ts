@@ -52,6 +52,10 @@ export const api = {
   deleteDataset: (id: number) => client.delete(`/api/datasets/${id}`),
 
   listBundles: () => client.get("/api/bundles"),
+  /** 场景包目录（可用的 + 装载失败的）。只读：运行仍然只有 `/api/analyze` 那一条门，
+   *  这里不开第二条运行通道——两条入口的运行语义迟早分叉（`DatasetsView` 那条写死 mock 的
+   *  "追问"就是这条学费的原件，`app/routers/packs.py:4` 记着同一句话）。 */
+  listPacks: () => client.get("/api/packs"),
   getBundle: (bundleId: string) => client.get(`/api/bundles/${bundleId}`),
   previewBundle: (bundleId: string, tableRef = "t1", rows = 20) =>
     client.get(`/api/bundles/${bundleId}/preview`, { params: { table_ref: tableRef, rows } }),

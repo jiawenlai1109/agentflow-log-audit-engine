@@ -98,6 +98,7 @@ def test_progress_stream_does_not_read_the_clock_at_render_time():
         ("views/DatasetsView.vue", "ui/status"),
         ("views/ReportsView.vue", "ui/status"),
         ("views/WorkbenchView.vue", "ui/readout"),
+        ("views/WorkbenchView.vue", "ui/packChoice"),
     ],
 )
 def test_the_display_authorities_are_wired_in(rel: str, authority: str):
@@ -355,3 +356,180 @@ def test_report_viewer_uses_the_demoting_authority():
     """同"接线"那条：函数存在 ≠ 调用点用了它。"""
     body = source_of("components/ReportViewer.vue")
     assert 'from "../ui/reportHtml"' in body
+
+
+# --- 场景包那一格（ui/packChoice.ts + Workbench 的接线） ----------------------------
+
+
+@pytest.fixture(scope="module")
+def pack_values() -> dict[str, object]:
+    return _run_node(
+        "ui/packChoice.ts",
+        ("NO_PACK", "packPayload", "packLabel", "packFacts", "brokenPackNote", "sessionForPack"),
+        {
+            "omitted_undefined": "packPayload(undefined) === undefined",
+            "omitted_null": "packPayload(null) === undefined",
+            "omitted_empty": "packPayload('') === undefined",
+            "omitted_no_pack": "packPayload(NO_PACK) === undefined",
+            "kept_name": "packPayload('sigma_triage')",
+            "label_with_count": "packLabel({ name: 'login_audit', rule_count: 4 })",
+            "label_zero": "packLabel({ name: 'login_audit', rule_count: 0 })",
+            "label_unknown": "packLabel({ name: 'login_audit' })",
+            "facts_none": "packFacts(undefined)",
+            "facts_columns": "packFacts({ name: 'x', required_columns: ['time', 'src_ip'] })",
+            "pack_kills_session": "sessionForPack('login_audit', 's1') === undefined",
+            "no_pack_keeps_session": "sessionForPack(undefined, 's1') === 's1'",
+            "empty_pack_keeps_session": "sessionForPack('', 's1') === 's1'",
+            "no_session_stays_no_session": "sessionForPack(undefined, undefined) === undefined",
+            "broken_none": "brokenPackNote([])",
+            "broken_one": "brokenPackNote([{ dir: 'zz', reason: 'rules.yaml 少一行' }])",
+            "broken_reasonless": "brokenPackNote([{}])",
+        },
+    )
+
+
+def test_no_selection_ever_leaves_the_building_as_an_empty_pack(pack_values):
+    """`pack: ""` 在**后端**是 422 不是"没选包"（`app/routers/jobs.py:93` 明写这句）。
+
+    所以界面上"不挂包"这个选项出去时必须整个键都不发；空串、null、哨兵值三种写法都算违约。
+    """
+    assert pack_values["omitted_undefined"] is True
+    assert pack_values["omitted_null"] is True
+    assert pack_values["omitted_empty"] is True, "空串被当成'不挂包'发出去 ⇒ 后端判 422，用户看到的是提交失败"
+    assert pack_values["omitted_no_pack"] is True
+    assert pack_values["kept_name"] == "sigma_triage"
+
+
+def test_pack_label_keeps_zero_rules_and_unknown_rules_apart(pack_values):
+    """0 条规则是包自己声明的事实，"没给条数"是这次没读到——两句话不许长成一个数。"""
+    assert pack_values["label_with_count"] == "login_audit（4 条规则）"
+    assert "0 条规则" in str(pack_values["label_zero"])
+    assert "未取得" in str(pack_values["label_unknown"])
+
+
+def test_pack_facts_show_the_columns_without_ruling_on_them(pack_values):
+    assert "不挂包" in str(pack_values["facts_none"])
+    assert "time、src_ip" in str(pack_values["facts_columns"])
+
+
+def test_broken_pack_directories_are_named_not_evaporated(pack_values):
+    """后端故意把坏目录一起返回（`packs.py:37`：藏起来用户就以为"没有这个场景"）。
+
+    界面这一侧如果只渲染可选项、把坏目录丢掉，那句诚实就死在最后一公里。
+    """
+    assert pack_values["broken_none"] == ""
+    assert str(pack_values["broken_one"]).startswith("1 个")
+    assert "zz" in str(pack_values["broken_one"]) and "rules.yaml 少一行" in str(pack_values["broken_one"])
+    assert "原因未给出" in str(pack_values["broken_reasonless"])
+
+
+def test_workbench_sends_the_chosen_pack(pack_values):
+    """接线守卫：单点存在 ≠ 提交那行用了它。"""
+    body = source_of("views/WorkbenchView.vue")
+    assert "packPayload(pack.value)" in body, "Workbench 没把选择器的值过一遍单点：空串会直接进载荷"
+    assert "pack: usedPack," in body, "analyze 的载荷里没有 pack 这一格：选择器是个装饰"
+    assert "sessionForPack(usedPack" in body, "提交前没过互斥单点：pack + session_id 一起发是后端明令的 422"
+
+
+def test_a_packed_run_never_carries_a_session(pack_values):
+    """`pack` 与 `session_id` 同时出现是 422（`tests/test_packs_api.py:384` 那条用例连着理由）。
+
+    界面上这条不是风格问题：工作台原本"没会话就顺手建一个"，配上包之后**每一次带包的提交都会被拒**，
+    而后端拒得很正确——会话只绑单文件数据集，允许带包的续轮等于第二轮静默换掉场景口径。
+    """
+    assert pack_values["pack_kills_session"] is True
+    assert pack_values["no_pack_keeps_session"] is True
+    assert pack_values["empty_pack_keeps_session"] is True, "空串在载荷里等于不挂包，会话不该被它一起带走"
+    assert pack_values["no_session_stays_no_session"] is True
+
+
+@pytest.mark.parametrize("rel", VIEW_FILES)
+def test_no_view_prejudges_missing_columns(rel: str):
+    """界面不许自己算"你的数据缺哪几列"。
+
+    后端 preflight 比的是**归一化之后**的列（`jobs.py:139` 那条注释记着它曾用原始表头
+    误拒 `login_audit` 配 `login_auth.csv`），而界面手里只有原始表头——
+    在拿不到正确输入的位置下结论，就是给自己造假红。
+    """
+    body = source_of(f"views/{rel}")
+    assert "required_columns" not in body, f"{rel} 在视图层碰了 required_columns：那里没有归一化后的列"
+
+
+def test_a_view_that_guesses_columns_goes_red():
+    sample = '<span>{{ pack.required_columns.join("、") }}</span>'
+    assert "required_columns" in sample, "这条下限自己看不见缺列预判的形状"
+
+
+# --- 模板里念到的名字，脚本里必须真的声明过 ------------------------------------------
+# vite build 不检查这一条：模板里写 `{{ undefinedName }}` 编译照过、页面照渲染，那一格永远是空的。
+# 本轮就撞上一次——模板写 `packBrokenNote`、脚本声明的是 `packBroken`，"装载失败的包"那行
+# 永远不会出现，而 build 与 49 条下限全绿。**"代码就位 ≠ 生效"在这一族里第三次。**
+
+_SCRIPT_WORDS = {
+    "true", "false", "null", "undefined", "in", "of", "typeof", "new", "return", "void",
+    "Math", "Date", "Number", "String", "Boolean", "Object", "Array", "JSON", "Infinity", "NaN",
+}
+
+
+def _template_bindings(template: str) -> set[str]:
+    """绑定表达式里的**根**标识符：`{{ }}`、v-if/v-show/v-model/v-for 的值、`:prop` 与 `@evt`。"""
+    chunks = re.findall(r"\{\{(.*?)\}\}", template, flags=re.S)
+    chunks += re.findall(
+        r"\b(?:v-(?:if|else-if|show|model|for)|:[\w.-]+|v-bind:[\w.-]+|@[\w.-]+)=\"([^\"]*)\"", template
+    )
+    names: set[str] = set()
+    for chunk in chunks:
+        stripped = re.sub(r"'[^']*'|\"[^\"]*\"", " ", chunk)
+        for match in re.finditer(r"(?<![\w$.])([A-Za-z_$][\w$]*)", stripped):
+            names.add(match.group(1))
+    # v-for 的别名是模板作用域里的局部量，不是脚本声明
+    for aliases in re.findall(r'v-for="\s*\(?([^)]*?)\)?\s+(?:in|of)\s+', template):
+        for part in aliases.split(","):
+            if part.strip():
+                names.discard(part.strip())
+    # 作用域插槽的解构同样是模板局部量：`#default="{ row }"`、`v-slot:default="{ a, b }"`
+    for group in re.findall(r'(?:#\w[\w-]*|v-slot(?::[\w-]+)?)="\s*\{([^}]*)\}', template):
+        for part in group.split(","):
+            token = part.strip().split(":")[-1].strip()
+            if token:
+                names.discard(token)
+    for single in re.findall(r'(?:#\w[\w-]*|v-slot(?::[\w-]+)?)="\s*([A-Za-z_$][\w$]*)\s*"', template):
+        names.discard(single)
+    return {n for n in names if n not in _SCRIPT_WORDS and not n.startswith("$")}
+
+
+def _script_declarations(script: str) -> set[str]:
+    declared = set(re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", script))
+    declared |= set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)", script))
+    groups = re.findall(r"import\s*\{([^}]*)\}\s*from", script) + re.findall(r"import\s+([\w$]+)\s*from", script)
+    for group in groups:
+        for part in group.split(","):
+            token = part.strip().removeprefix("type ").split(" as ")[-1].strip()
+            if token:
+                declared.add(token)
+    for props in re.findall(r"defineProps<\{([^}]*)\}>", script):
+        declared |= set(re.findall(r"(?m)^\s*([A-Za-z_$][\w$]*)\??\s*:", props))
+    return declared
+
+
+@pytest.mark.parametrize("rel", sorted(
+    [f"views/{p.name}" for p in (SRC / "views").glob("*.vue")]
+    + [f"components/{p.name}" for p in (SRC / "components").glob("*.vue")]
+    + ["App.vue"]
+))
+def test_every_name_the_template_reads_is_declared_in_the_script(rel: str):
+    """模板里每个绑定都得有脚本里的声明撑着：编译器和 build 都不会替你发现它不存在。"""
+    text = strip_comments((SRC / rel).read_text(encoding="utf-8"))
+    template = "".join(re.findall(r"<template>(.*?)</template>", text, flags=re.S))
+    script = "".join(re.findall(r"<script\b[^>]*>(.*?)</script>", text, flags=re.S))
+    missing = _template_bindings(template) - _script_declarations(script)
+    assert not missing, f"{rel} 的模板念了脚本里没有的名字：{sorted(missing)}（那一格会安静地永远是空的）"
+
+
+def test_an_undefined_template_binding_goes_red():
+    sample = "<template><p>{{ packBrokenNote }}</p></template><script setup>const packBroken = 1;</script>"
+    template = re.findall(r"<template>(.*?)</template>", sample, flags=re.S)[0]
+    script = re.findall(r"<script\b[^>]*>(.*?)</script>", sample, flags=re.S)[0]
+    assert _template_bindings(template) - _script_declarations(script) == {"packBrokenNote"}, (
+        "这条下限看不见自己那一族的形状 ⇒ 上面那条是空的"
+    )
