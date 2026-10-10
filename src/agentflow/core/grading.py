@@ -1019,8 +1019,8 @@ def numbers_traceable(evidence: dict[str, Any]) -> tuple[float, list[str]]:
     pool |= _flatten_numbers(evaluation.get("dataset_tables") or [])
     pool |= _flatten_numbers(evidence.get("plan") or {})
     cleaned = _DOTTED_QUAD_RE.sub(" ", report)
-    for token in _META_NUMBER_RE.findall(cleaned):
-        cleaned = cleaned.replace(token, " ")
+    # 与 core/report_lint.scan_numbers 同步（两处同判据）：一次 sub，不逐 token replace。
+    cleaned = _META_NUMBER_RE.sub(" ", cleaned)
     cleaned = _THOUSANDS_RE.sub("", cleaned)
     tokens = [t for t in _NUMBER_RE.findall(cleaned) if _is_claim(t)]
     unexplained = [t for t in tokens if not any(_close(float(t), known, 0.01) for known in pool)]

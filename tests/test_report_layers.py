@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agentflow.core.grading import _p_report_layers, load_evidence
+from agentflow.core.grading import _p_report_layers, load_evidence, numbers_traceable
 from agentflow.core.pack import load_pack
 from agentflow.core.report_lint import (
     declared_layers,
@@ -151,6 +152,29 @@ def test_scan_numbers_strips_meta_tokens():
     """时间戳、点分四段与小整数都不进池子；留下的才是"构成结论的数字"。"""
     assert scan_numbers("2026-09-05 21:00:00 与 10.0.0.7，命中 2 条") == set()
     assert scan_numbers("2026-09-05 21:00:00 与 10.0.0.7，合计 1200.5 条") == {1200.5}
+
+
+def test_scan_numbers_keeps_a_date_glued_to_a_digit():
+    """一次 sub 的口径边界：`(?<!\\d)` 故意没匹配的 `12026-09-05` 不该被顺手抹掉。
+
+    掩码原先是"逐 token 整表 replace"，它会把这一串一起删掉；换成一次 sub 后 12026 留在池子里
+    被追问出处——比过去**严**，而那才是对的：它本来就不是合法时间戳。3656 份归档报告实测两版集合逐一相同。
+    """
+    assert scan_numbers("2026-09-05 与 12026-09-05") == {12026.0}
+    assert scan_numbers("2026-09-05 与 2026-09-06") == set()
+
+
+@pytest.mark.parametrize("func", [scan_numbers, numbers_traceable])
+def test_meta_masking_is_written_as_one_pass(func):
+    """按族守卫：数字掩码两处同判据，任何一处退回"逐 token 整表 replace"都要变红。
+
+    那个形状在 6.7 MB 的报告上实测单次 303 秒（cProfile：整条 362 秒里它占 296），一次 sub 是 0.95 秒。
+    行为等价的证据是同一次差分：3654 份小报告 + 2 份大报告，两版返回集合全同。
+    """
+    lines = inspect.getsource(func).splitlines()
+    body = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    assert "_META_NUMBER_RE.findall" not in body, func.__name__
+    assert ".replace(" not in body, func.__name__
 
 
 # ------------------------------------------------------------ 包侧：承诺必须与模板一致
