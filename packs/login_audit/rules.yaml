@@ -49,20 +49,34 @@ rules:
       df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
       df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
       fail = df[df["auth_result"] == "failure"].sort_values("time")
+      WINDOW = pd.Timedelta(minutes=5)
+
+      # 窗口计数一次算完：所有 (src_ip, account) 组的 5 分钟滚动计数在同一次调用里出，
+      # 成本随行数走。逐组 set_index + 逐组 rolling 的写法成本随"组数 × 组内行数"走，
+      # 100 万行（几万个组）在 30 秒的任务租约里算不完。
+      roll = fail.set_index("time").groupby(["src_ip", "account"]).rolling("5min")["auth_result"].count()
+      windowed = roll.to_frame("n").reset_index()          # 行序 = 组键有序、组内按时间
+      peak = windowed.groupby(["src_ip", "account"])["n"].transform("max")
+      tied = windowed[windowed["n"] == peak]
+      hits = tied.drop_duplicates(subset=["src_ip", "account"], keep="first")  # 并列峰值取最早那条
+      hits = hits[hits["n"] >= 10].sort_values(["src_ip", "account"], kind="mergesort").reset_index(drop=True)
+
+      # 证据行仍逐组取，但只在命中组上取（命中组是少数），排序口径与逐组实现完全一致
+      slices = {key: group for key, group in
+                fail.merge(hits[["src_ip", "account"]], on=["src_ip", "account"], how="inner")
+                .groupby(["src_ip", "account"], sort=False)}
       findings = []
-      for (ip, acc), sub in fail.groupby(["src_ip", "account"]):
-          series = sub.set_index("time")["auth_result"].rolling("5min").count()
-          peak = int(series.max()) if len(series) else 0
-          if peak >= 10:
-              wend = series.idxmax()
-              wstart = wend - pd.Timedelta(minutes=5)
-              ev = sub[(sub["time"] > wstart) & (sub["time"] <= wend)].tail(5)
-              findings.append({
-                  "rule_id": "R1", "subject": f"{ip}->{acc}",
-                  "window_start": str(wstart), "window_end": str(wend),
-                  "metric": "5分钟失败次数", "value": peak,
-                  "evidence": ev.assign(time=ev["time"].astype(str)).to_dict("records"),
-              })
+      for row in hits.itertuples():
+          sub = slices[(row.src_ip, row.account)]
+          wend = row.time
+          wstart = wend - WINDOW
+          ev = sub[(sub["time"] > wstart) & (sub["time"] <= wend)].tail(5)
+          findings.append({
+              "rule_id": "R1", "subject": f"{row.src_ip}->{row.account}",
+              "window_start": str(wstart), "window_end": str(wend),
+              "metric": "5分钟失败次数", "value": int(row.n),
+              "evidence": ev.assign(time=ev["time"].astype(str)).to_dict("records"),
+          })
       out = {"rows": len(findings), "columns": ["rule_id", "subject", "value"],
              "head": [{"rule_id": x["rule_id"], "subject": x["subject"], "value": x["value"]} for x in findings],
              "aggregate": {"规则R1命中数": len(findings)}, "findings": findings}
@@ -110,20 +124,41 @@ rules:
       import pandas as pd
       df = pd.read_csv(os.environ["DATA_PATH"], encoding="utf-8-sig")
       df["time"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M:%S")
+      fail = df[df["auth_result"] == "failure"].sort_values("time")
+      succ = df[df["auth_result"] == "success"].sort_values("time")
+      SUCC_WINDOW = pd.Timedelta(minutes=10)
+
+      # 组统计一次聚合 + 命中成功一次 merge_asof：旧写法对每个 (src_ip, account) 都切两份子表
+      # 再各自排序，成本随组数走（100 万行实测 541 秒）。allow_exact_matches=False 是
+      # "严格晚于最后一次失败"的精确写法。
+      stats = (fail.groupby(["src_ip", "account"], sort=True)
+               .agg(first_fail=("time", "min"), last_fail=("time", "max"), fails=("time", "size"))
+               .reset_index())
+      cand = stats[stats["fails"] >= 5].sort_values("last_fail", kind="mergesort")
+      matched = pd.merge_asof(cand, succ[["src_ip", "account", "time"]].sort_values("time", kind="mergesort"),
+                              left_on="last_fail", right_on="time", by=["src_ip", "account"],
+                              direction="forward", allow_exact_matches=False)
+      hits = matched[matched["time"].notna() & (matched["time"] <= matched["last_fail"] + SUCC_WINDOW)]
+      hits = hits.sort_values(["src_ip", "account"], kind="mergesort").reset_index(drop=True)
+
+      # 证据行仍逐组取，但只在命中组上取；时间窗与数值以这里的严格重算为准
+      fail_by = {key: group for key, group in
+                 fail.merge(hits[["src_ip", "account"]].drop_duplicates(), on=["src_ip", "account"], how="inner")
+                 .groupby(["src_ip", "account"], sort=False)}
+      succ_by = {key: group for key, group in
+                 succ.merge(hits[["src_ip", "account"]].drop_duplicates(), on=["src_ip", "account"], how="inner")
+                 .groupby(["src_ip", "account"], sort=False)}
       findings = []
-      for (ip, acc), sub in df.groupby(["src_ip", "account"]):
-          f = sub[sub["auth_result"] == "failure"].sort_values("time")
-          s = sub[sub["auth_result"] == "success"].sort_values("time")
-          if len(f) < 5 or len(s) == 0:
-              continue
-          last_fail = f["time"].iloc[-1]
-          hit = s[(s["time"] > last_fail) & (s["time"] <= last_fail + pd.Timedelta(minutes=10))]
+      for row in hits.itertuples():
+          f = fail_by[(row.src_ip, row.account)]
+          s_all = succ_by[(row.src_ip, row.account)]
+          hit = s_all[(s_all["time"] > row.last_fail) & (s_all["time"] <= row.last_fail + SUCC_WINDOW)]
           if len(hit) == 0:
               continue
           succ_t = hit["time"].iloc[0]
           ev = pd.concat([f.tail(3), hit.head(2)]).sort_values("time").tail(5)
           findings.append({
-              "rule_id": "R2", "subject": f"{ip}->{acc}",
+              "rule_id": "R2", "subject": f"{row.src_ip}->{row.account}",
               "window_start": str(f["time"].iloc[0]), "window_end": str(succ_t),
               "metric": "失败次数", "value": int(len(f)),
               "evidence": ev.assign(time=ev["time"].astype(str)).to_dict("records"),

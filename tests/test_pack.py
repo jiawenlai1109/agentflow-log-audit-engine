@@ -66,6 +66,38 @@ def test_pack_missing_raises():
         load_pack("no_such_pack")
 
 
+def _code_only(text: str) -> str:
+    """剥掉注释行：文本守卫扫到自己写的解释性注释是已知坏法（`#31` 那一族）。"""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def test_login_audit_reference_and_verify_are_heterogeneous():
+    """两个包都守"生产 ≠ 校验"——此前这条只写在 sigma_triage 那侧，login_audit 没有。
+
+    库不相交（参考实现用 pandas、校验器用 stdlib csv）是现有口径；它拦的是"把校验器抄成
+    参考实现"那种最省事的改法：那种绿是同源性造假，三方等值会退化成自己对自己核。
+    """
+    for rule in load_pack("login_audit").rules:
+        body_ref, body_verify = _code_only(rule.reference_code), _code_only(rule.verify_code)
+        assert "pandas" in body_ref, rule.id
+        assert "csv.DictReader" in body_verify, rule.id
+        assert "pandas" not in body_verify, rule.id
+        assert body_ref != body_verify, rule.id
+
+
+def test_r1_window_count_is_one_vectorized_call():
+    """R1 的 5 分钟窗口必须是**一次**向量化滚动，不许退回逐组 rolling（缺陷 #62 的守卫）。
+
+    逐组写法在 1M 行上实测 41.69 秒、R2 那族 541.51 秒，都在 30 秒任务租约里被杀；
+    一次算完之后是 4.41 / 2.73 秒。判据用"rolling 只出现一次 + 没有逐组 for"，
+    因为"跑得快不快"没法在单测里稳定断言。
+    """
+    body = _code_only(load_pack("login_audit").rule("R1").reference_code)
+    assert body.count('.rolling("5min")') == 1, body
+    assert 'for (ip, acc)' not in body and "for (ip,acc)" not in body
+    assert ".groupby([\"src_ip\", \"account\"]).rolling" in body
+
+
 def test_pack_plan_tasks_deterministic():
     pack = load_pack("login_audit")
     tasks = pack_plan_tasks(pack)
